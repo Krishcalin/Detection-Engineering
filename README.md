@@ -1,2 +1,2 @@
-# Detection-Engineering-Using-Splunk
-Security Operation Center (SOC) attack detection and response
+# Detection-Engineering
+Security Operation Center (SOC) Attack Detection and Response
