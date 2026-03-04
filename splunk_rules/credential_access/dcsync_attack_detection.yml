@@ -1,0 +1,714 @@
+# ==============================================================================
+#  DCSync Attack Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for DCSync credential dumping attacks.
+#                Correlates Windows Security Event 4662 (Directory Service Access),
+#                Event 4624 (Logon), and Event 5136 (DS Object Modification) to
+#                detect unauthorized Active Directory replication requests.
+#  MITRE ATT&CK: T1003.006 — OS Credential Dumping: DCSync
+#  Kill Chain   : Credential Access → Lateral Movement → Domain Dominance
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-03
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES (must be configured BEFORE these rules will generate detections):
+#
+#  1. Enable Audit Policy on all Domain Controllers:
+#     Computer Configuration > Windows Settings > Security Settings >
+#       Advanced Audit Policy Configuration > Audit Policies > DS Access >
+#         "Audit Directory Service Access" → Enable SUCCESS only
+#         "Audit Directory Service Changes" → Enable SUCCESS only
+#
+#  2. Configure SACLs on the AD Domain Root Object:
+#     Active Directory Users and Computers > right-click domain root >
+#       Properties > Security > Advanced > Auditing > Add:
+#       Principal: Everyone
+#       Type: Success
+#       Applies to: This object only
+#       Permissions: "Replicating Directory Changes",
+#                    "Replicating Directory Changes All",
+#                    "Replicating Directory Changes In Filtered Set"
+#
+#  3. Ensure Domain Controllers forward Security event logs to Splunk
+#     via Universal Forwarder with sourcetype=XmlWinEventLog:Security
+#
+#  4. Do NOT enable Failure auditing for DS Access — it generates millions
+#     of noise events per incident and provides no detection value.
+#
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+#  Reference: DCSync Replication GUIDs (Extended Rights)
+# ------------------------------------------------------------------------------
+#
+#  GUID                                      | Extended Right Name
+#  ----------------------------------------- | ----------------------------------------
+#  {1131f6aa-9c07-11d1-f79f-00c04fc2dcd2}   | DS-Replication-Get-Changes
+#  {1131f6ad-9c07-11d1-f79f-00c04fc2dcd2}   | DS-Replication-Get-Changes-All
+#  {89e95b76-444d-4c62-991a-0facbeda640c}   | DS-Replication-Get-Changes-In-Filtered-Set
+#  {9923a32a-3607-11d2-b9be-0000f87a36b2}   | DS-Install-Replica (rogue DC promotion)
+#
+#  ObjectType GUID for domainDNS class:
+#  {19195a5b-6da0-11d0-afd3-00c04fd930c9}
+#
+#  AccessMask 0x100 = "Control Access" — the permission tier for extended rights
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: DCSync — User Account Performing Directory Replication
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Highest-confidence detection. Fires when a NON-machine account (human user)
+#  exercises DS-Replication-Get-Changes or DS-Replication-Get-Changes-All on
+#  the domain root object. Enriches with Event 4624 for source IP attribution.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Low — exclude Azure AD Connect (MSOL_*) and dcdiag if needed
+#  Tools caught: Mimikatz, Impacket secretsdump, SharpKatz, DSInternals
+
+rule_1_dcsync_by_user_account:
+  name: "DCSync Attack — User Account Initiated Replication"
+  description: >
+    Detects a non-machine (human) user account exercising Active Directory
+    replication extended rights (DS-Replication-Get-Changes-All). This is the
+    primary indicator of a DCSync credential dumping attack. Legitimate
+    replication is performed by DC machine accounts (ending in $) or SYSTEM.
+    A human user account requesting replication data is almost always malicious.
+  mitre:
+    tactic: Credential Access
+    technique: T1003.006
+    technique_name: "OS Credential Dumping: DCSync"
+  severity: critical
+  confidence: 90
+  risk_score: 95
+  kill_chain_phase: "Actions on Objectives"
+  data_sources:
+    - "Windows Security Event Log (Event ID 4662)"
+    - "Windows Security Event Log (Event ID 4624)"
+  prerequisites:
+    - "Audit Directory Service Access — Success enabled on all DCs"
+    - "SACL on domain root for Replicating Directory Changes rights"
+    - "Security event logs forwarded to Splunk from all DCs"
+
+  # --- Splunk SPL Query ---
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4662
+        Access_Mask=0x100
+        (
+            Properties="*{1131f6ad-9c07-11d1-f79f-00c04fc2dcd2}*"
+            OR Properties="*{1131f6aa-9c07-11d1-f79f-00c04fc2dcd2}*"
+            OR Properties="*{89e95b76-444d-4c62-991a-0facbeda640c}*"
+        )
+    ```Filter out machine accounts, SYSTEM, and Window Manager```
+    | where NOT match(Account_Name, "\$$")
+        AND NOT match(Account_Name, "^(SYSTEM|LOCAL SERVICE|NETWORK SERVICE)$")
+        AND Account_Domain!="Window Manager"
+        AND Security_ID!="S-1-5-18"
+    ```Exclude known legitimate service accounts (customize per environment)```
+    | search NOT Account_Name IN ("YOURDC01$", "YOURDC02$")
+    | search NOT Account_Name="MSOL_*"
+    ```Aggregate replication events per session```
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as replication_request_count,
+        values(Properties) as replication_rights_used,
+        values(Object_Name) as target_object
+        by Account_Name, Account_Domain, Logon_ID, ComputerName
+    ```Enrich with logon event to get source IP```
+    | join type=left Logon_ID
+        [
+            search index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4624
+            | rename Target_User_Name as Account_Name, Logon_ID as Logon_ID
+            | fields Logon_ID, Source_Network_Address, Logon_Type, Authentication_Package
+        ]
+    ```Check if replication includes the critical "Get-Changes-All" GUID```
+    | eval has_get_changes_all=if(
+        like(replication_rights_used, "%1131f6ad-9c07-11d1-f79f-00c04fc2dcd2%"), "YES", "NO"
+      )
+    | eval attack_confidence=case(
+        has_get_changes_all=="YES" AND replication_request_count>=2, "CRITICAL",
+        has_get_changes_all=="YES", "HIGH",
+        1==1, "MEDIUM"
+      )
+    | eval mitre_technique="T1003.006"
+    | eval mitre_tactic="Credential Access"
+    | eval alert_name="DCSync Attack — User Account Initiated Replication"
+    | table first_seen, last_seen, Account_Name, Account_Domain, ComputerName,
+            Source_Network_Address, Logon_Type, Authentication_Package,
+            replication_request_count, has_get_changes_all, attack_confidence,
+            replication_rights_used, target_object, mitre_technique, mitre_tactic,
+            alert_name
+
+  # --- Correlation Search Settings (Splunk ES) ---
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "Account_Name"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "DCSync Attack — $Account_Name$ from $Source_Network_Address$"
+        rule_description: >
+          User account $Account_Name$ from domain $Account_Domain$ performed
+          Active Directory replication from $Source_Network_Address$ targeting
+          $ComputerName$. This is consistent with a DCSync credential dumping
+          attack using tools like Mimikatz or Impacket secretsdump.
+        severity: critical
+        drilldown_search: >
+          index=wineventlog EventCode IN (4662, 4624)
+          Account_Name="$Account_Name$" Logon_ID="$Logon_ID$"
+    - risk:
+        risk_object: "Account_Name"
+        risk_object_type: "user"
+        risk_score: 95
+    - risk:
+        risk_object: "Source_Network_Address"
+        risk_object_type: "system"
+        risk_score: 80
+
+  # --- False Positive Tuning ---
+  known_false_positives:
+    - "Azure AD Connect (Entra Connect) using MSOL_* service accounts — add to exclusion list"
+    - "dcdiag.exe /Test:Replications run by administrators — correlate with admin activity logs"
+    - "New domain controller promotion (dcpromo) — temporary, verify with change management"
+    - "Third-party AD backup tools (Veeam, Commvault) — add service accounts to exclusion"
+  tuning_guidance: |
+    1. Replace YOURDC01$, YOURDC02$ with your actual DC machine account names
+    2. If using Azure AD Connect, verify MSOL_* account name and add to exclusion
+    3. Add any legitimate service accounts that perform AD replication
+    4. Adjust the schedule frequency based on your environment's log volume
+    5. If dcdiag is run frequently by admins, correlate with a scheduled task lookup
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: DCSync — Replication from Non-Domain-Controller Source
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Catches DCSync even from compromised machine accounts by correlating with
+#  Event 4624 to verify the source IP is NOT a known Domain Controller.
+#  This detects scenarios where an attacker uses a compromised DC account
+#  from a non-DC workstation or server.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Low — requires DC IP asset list in Splunk
+
+rule_2_dcsync_from_non_dc_source:
+  name: "DCSync Attack — Replication from Non-Domain-Controller Host"
+  description: >
+    Detects Active Directory replication requests originating from a host that
+    is NOT a known Domain Controller. Even if the requesting account is a
+    legitimate machine account (e.g., a compromised DC$ account), performing
+    replication from a non-DC IP is a strong indicator of DCSync abuse.
+    Requires a lookup table or asset category for DC IP addresses.
+  mitre:
+    tactic: Credential Access
+    technique: T1003.006
+    technique_name: "OS Credential Dumping: DCSync"
+  severity: critical
+  confidence: 85
+  risk_score: 90
+  data_sources:
+    - "Windows Security Event Log (Event ID 4662)"
+    - "Windows Security Event Log (Event ID 4624)"
+    - "Asset inventory (DC IP lookup)"
+  prerequisites:
+    - "Audit Directory Service Access — Success enabled on all DCs"
+    - "Splunk asset lookup or ES asset framework with DC IPs categorized"
+
+  # --- DC IP Lookup Setup ---
+  # Create a CSV lookup file: dc_ip_list.csv
+  # Fields: ip, hostname, role
+  # Example:
+  #   ip,hostname,role
+  #   10.0.0.10,DC01,domain_controller
+  #   10.0.0.11,DC02,domain_controller
+  #   10.0.0.12,DC03,domain_controller
+  #
+  # Upload to Splunk: Settings > Lookups > Lookup table files > Add new
+  # Create lookup definition: Settings > Lookups > Lookup definitions
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4662
+        Access_Mask=0x100
+        (
+            Properties="*{1131f6ad-9c07-11d1-f79f-00c04fc2dcd2}*"
+            OR Properties="*{1131f6aa-9c07-11d1-f79f-00c04fc2dcd2}*"
+            OR Properties="*{89e95b76-444d-4c62-991a-0facbeda640c}*"
+        )
+    ```Aggregate replication events per session (include machine accounts)```
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as replication_request_count,
+        values(Account_Name) as account_name,
+        values(Account_Domain) as account_domain,
+        values(Properties) as replication_rights
+        by Logon_ID, ComputerName
+    ```Join with logon event to get source IP```
+    | join type=inner Logon_ID
+        [
+            search index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4624
+            | fields Logon_ID, Source_Network_Address, Logon_Type
+        ]
+    ```Exclude known DC IPs using lookup```
+    | lookup dc_ip_list.csv ip as Source_Network_Address OUTPUT role as src_role
+    | where isnull(src_role) OR src_role!="domain_controller"
+    ```Exclude local loopback and empty IPs```
+    | where Source_Network_Address!="127.0.0.1"
+        AND Source_Network_Address!="-"
+        AND Source_Network_Address!="::1"
+        AND isnotnull(Source_Network_Address)
+    | eval mitre_technique="T1003.006"
+    | eval alert_name="DCSync Attack — Replication from Non-DC Host"
+    | eval attack_detail="Replication request from ".Source_Network_Address.
+        " (not a known DC) by account ".account_name." on ".ComputerName
+    | table first_seen, last_seen, account_name, account_domain, ComputerName,
+            Source_Network_Address, src_role, Logon_Type,
+            replication_request_count, replication_rights,
+            attack_detail, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "Source_Network_Address"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "DCSync from Non-DC — $Source_Network_Address$ via $account_name$"
+        severity: critical
+    - risk:
+        risk_object: "Source_Network_Address"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "Newly promoted DC not yet added to dc_ip_list.csv — update lookup after DC promotions"
+    - "Azure AD Connect server — add its IP to the DC lookup with role 'aad_connect'"
+    - "Disaster recovery DC restoration — temporary, verify with DR runbook"
+  tuning_guidance: |
+    1. Create dc_ip_list.csv with ALL domain controller IPs and keep it updated
+    2. Add Azure AD Connect servers with a distinct role like 'aad_connect'
+    3. Integrate with Splunk ES Asset framework if available (src_category=domain_controller)
+    4. Schedule a periodic review of the DC IP lookup (monthly or after infra changes)
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: DCSync Permission Grant — Replication Rights Added to Account
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects the PREPARATION stage of a DCSync attack — when an attacker grants
+#  themselves or another account the "Replicating Directory Changes" or
+#  "Replicating Directory Changes All" extended rights on the domain object.
+#  This is often MORE valuable than detecting the DCSync itself because it
+#  catches the attacker during setup, before credential theft occurs.
+#
+#  Confidence  : HIGH
+#  Severity    : HIGH
+#  FP Rate     : Medium — some AD migrations or permission reviews may trigger
+
+rule_3_dcsync_permission_grant:
+  name: "DCSync Preparation — Replication Rights Granted to Account"
+  description: >
+    Detects modifications to the domain root object's security descriptor
+    (nTSecurityDescriptor) that add DS-Replication-Get-Changes or
+    DS-Replication-Get-Changes-All extended rights. This is a critical
+    precursor to a DCSync attack — an attacker must first have (or grant
+    themselves) these permissions before they can invoke replication.
+    Catching this event provides early warning before credential theft.
+  mitre:
+    tactic: "Defense Evasion, Persistence"
+    technique: T1222.001
+    technique_name: "File and Directory Permissions Modification: Windows File and Directory Permissions Modification"
+    related_technique: T1003.006
+  severity: high
+  confidence: 80
+  risk_score: 85
+  data_sources:
+    - "Windows Security Event Log (Event ID 5136)"
+  prerequisites:
+    - "Audit Directory Service Changes — Success enabled on all DCs"
+    - "SACL on domain root for nTSecurityDescriptor modifications"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5136
+        ObjectClass="domainDNS"
+        AttributeLDAPDisplayName="nTSecurityDescriptor"
+    ```Search for replication GUIDs in the new security descriptor value```
+    | where
+        like(AttributeValue, "%1131f6aa-9c07-11d1-f79f-00c04fc2dcd2%")
+        OR like(AttributeValue, "%1131f6ad-9c07-11d1-f79f-00c04fc2dcd2%")
+        OR like(AttributeValue, "%89e95b76-444d-4c62-991a-0facbeda640c%")
+    ```Identify which replication rights were granted```
+    | eval rights_granted=mvappend(
+        if(like(AttributeValue, "%1131f6aa%"), "DS-Replication-Get-Changes", null()),
+        if(like(AttributeValue, "%1131f6ad%"), "DS-Replication-Get-Changes-All", null()),
+        if(like(AttributeValue, "%89e95b76%"), "DS-Replication-Get-Changes-In-Filtered-Set", null())
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as modification_count,
+        values(rights_granted) as rights_granted,
+        values(ObjectDN) as target_object_dn
+        by SubjectUserName, SubjectDomainName, ComputerName, OpCorrelationID
+    | eval mitre_technique="T1003.006 (preparation)"
+    | eval alert_name="DCSync Preparation — Replication Rights Granted"
+    | eval severity=if(
+        like(rights_granted, "%Get-Changes-All%"), "CRITICAL", "HIGH"
+      )
+    | table first_seen, last_seen, SubjectUserName, SubjectDomainName,
+            ComputerName, target_object_dn, rights_granted, modification_count,
+            severity, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "SubjectUserName"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Replication Rights Granted by $SubjectUserName$ on $target_object_dn$"
+        severity: high
+    - risk:
+        risk_object: "SubjectUserName"
+        risk_object_type: "user"
+        risk_score: 85
+
+  known_false_positives:
+    - "AD migration projects that modify domain-level permissions"
+    - "Initial Azure AD Connect setup granting MSOL_ account replication rights"
+    - "Legitimate delegation of replication rights for monitoring tools"
+  tuning_guidance: |
+    1. Correlate with change management tickets for AD permission modifications
+    2. Baseline which accounts already have replication rights (one-time query)
+    3. This rule detects NEW grants — existing permissions do not trigger it
+    4. If triggered, immediately check if the grantee account has been compromised
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: DCSync — Bulk Replication Requests (High-Volume Indicator)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects a burst of replication requests within a short time window from a
+#  single account or source. Legitimate DC-to-DC replication is steady and
+#  scheduled, while an attacker dumping all credentials generates a rapid
+#  burst of replication requests (one per user account targeted).
+#
+#  Confidence  : MEDIUM-HIGH (volume-based, needs tuning)
+#  Severity    : HIGH
+#  FP Rate     : Medium — new DC promotion or initial sync generates bursts
+
+rule_4_dcsync_bulk_replication:
+  name: "DCSync Attack — Bulk Replication Request Burst"
+  description: >
+    Detects an unusually high volume of Active Directory replication requests
+    within a 5-minute window from a single account. Normal DC replication is
+    steady and predictable. A DCSync attack dumping multiple accounts (e.g.,
+    Mimikatz dcsync /all) generates a rapid burst of 4662 events. The
+    threshold of 10+ requests in 5 minutes exceeds normal per-cycle replication.
+  mitre:
+    tactic: Credential Access
+    technique: T1003.006
+    technique_name: "OS Credential Dumping: DCSync"
+  severity: high
+  confidence: 75
+  risk_score: 80
+  data_sources:
+    - "Windows Security Event Log (Event ID 4662)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4662
+        Access_Mask=0x100
+        (
+            Properties="*{1131f6ad-9c07-11d1-f79f-00c04fc2dcd2}*"
+            OR Properties="*{1131f6aa-9c07-11d1-f79f-00c04fc2dcd2}*"
+        )
+    | bin _time span=5m
+    | stats
+        count as request_count,
+        dc(Object_Name) as unique_objects_targeted,
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        values(Account_Name) as account_name,
+        values(Account_Domain) as account_domain
+        by Logon_ID, ComputerName, _time
+    ```Threshold: 10+ replication requests in 5 minutes is anomalous```
+    | where request_count >= 10
+    ```Exclude known DC machine accounts (customize per environment)```
+    | where NOT match(account_name, "^(YOURDC01|YOURDC02|YOURDC03)\$$")
+    | eval burst_severity=case(
+        request_count >= 50, "CRITICAL — mass credential dump likely",
+        request_count >= 25, "HIGH — multiple accounts targeted",
+        request_count >= 10, "MEDIUM — replication burst detected"
+      )
+    | eval mitre_technique="T1003.006"
+    | eval alert_name="DCSync — Bulk Replication Burst"
+    | table first_seen, last_seen, account_name, account_domain, ComputerName,
+            request_count, unique_objects_targeted, burst_severity,
+            mitre_technique, alert_name
+    | sort - request_count
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "account_name"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Bulk DCSync — $request_count$ replication requests by $account_name$"
+        severity: high
+    - risk:
+        risk_object: "account_name"
+        risk_object_type: "user"
+        risk_score: 80
+
+  known_false_positives:
+    - "New DC initial replication sync (one-time event after dcpromo)"
+    - "AD database recovery/restore operations"
+    - "Azure AD Connect initial full sync (first-time setup only)"
+  tuning_guidance: |
+    1. Adjust the threshold (default 10) based on your AD size and replication frequency
+    2. Larger domains with frequent changes may have higher baseline replication counts
+    3. Monitor and baseline normal replication volume per DC before tuning
+    4. Replace YOURDC01/YOURDC02/YOURDC03 with actual DC machine account names
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: DCSync — Network-Based Detection (DRSUAPI Protocol Traffic)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Complements host-based detection by monitoring for DRS/DRSUAPI protocol
+#  traffic from sources that are NOT domain controllers. Requires
+#  application-aware network logging (firewall, IDS, or network TAP).
+#  Provides defense-in-depth when host-based logging is tampered with.
+#
+#  Confidence  : HIGH (if network data is available)
+#  Severity    : CRITICAL
+#  FP Rate     : Low — DRSUAPI is almost exclusively DC-to-DC
+
+rule_5_dcsync_network_drsuapi:
+  name: "DCSync Attack — DRSUAPI Traffic from Non-DC Source"
+  description: >
+    Detects Directory Replication Service (DRS/DRSUAPI) protocol traffic
+    originating from a host that is NOT a known Domain Controller. The
+    DRSUAPI protocol (RPC over TCP, typically port 135 + dynamic) is used
+    almost exclusively for DC-to-DC replication. Traffic from any non-DC
+    source is a strong indicator of a DCSync attack. This rule provides
+    network-layer detection independent of Windows event logging.
+  mitre:
+    tactic: Credential Access
+    technique: T1003.006
+    technique_name: "OS Credential Dumping: DCSync"
+  severity: critical
+  confidence: 85
+  risk_score: 90
+  data_sources:
+    - "Network Traffic logs (firewall, IDS/IPS, Zeek/Bro, or packet capture)"
+    - "Splunk CIM Network_Traffic data model"
+  prerequisites:
+    - "Application-aware firewall or IDS that classifies DRSUAPI/DRS traffic"
+    - "Network logs indexed in Splunk with CIM-compliant field names"
+    - "DC IP lookup table (dc_ip_list.csv)"
+
+  search: |
+    | tstats summariesonly=true
+        count,
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        values(All_Traffic.user) as user,
+        values(All_Traffic.transport) as transport,
+        values(All_Traffic.dest_port) as dest_port,
+        values(All_Traffic.bytes_out) as bytes_out
+        from datamodel=Network_Traffic
+        where All_Traffic.app IN ("ms-dc-replication", "drsuapi", "ad-drs",
+                                   "ms-drsr", "active-directory-replication")
+        by All_Traffic.src, All_Traffic.dest, All_Traffic.app
+    | rename All_Traffic.* as *
+    ```Exclude known DC-to-DC replication```
+    | lookup dc_ip_list.csv ip as src OUTPUT role as src_role
+    | lookup dc_ip_list.csv ip as dest OUTPUT role as dest_role
+    | where (isnull(src_role) OR src_role!="domain_controller")
+        AND isnotnull(dest_role)
+        AND dest_role="domain_controller"
+    | eval mitre_technique="T1003.006"
+    | eval alert_name="DCSync — DRSUAPI Traffic from Non-DC"
+    | eval detail="DRSUAPI traffic from non-DC ".src." to DC ".dest." via ".app
+    | table first_seen, last_seen, src, dest, app, transport, dest_port,
+            bytes_out, count, user, src_role, dest_role,
+            detail, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "DRSUAPI from Non-DC — $src$ → $dest$"
+        severity: critical
+    - risk:
+        risk_object: "src"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "Azure AD Connect server performing sync — add its IP to dc_ip_list.csv"
+    - "AD administration tools running replication diagnostics"
+    - "Network app classification mislabeling non-DRSUAPI traffic"
+  tuning_guidance: |
+    1. Ensure your firewall/IDS correctly classifies DRSUAPI protocol
+    2. The app name varies by vendor — adjust the IN clause for your environment
+       Palo Alto: "ms-dc-replication", Fortinet: "MS.AD.Replication"
+    3. Keep dc_ip_list.csv in sync with your DC inventory
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  INVESTIGATION QUERIES — Run manually during incident response
+# ██████████████████████████████████████████████████████████████████████████████
+
+investigation_queries:
+
+  # --- Query A: List all accounts with replication rights (baseline audit) ---
+  baseline_replication_accounts:
+    description: >
+      One-time or periodic audit query to enumerate all accounts that have
+      exercised AD replication rights. Establishes a baseline of legitimate
+      replication sources. Run this BEFORE deploying detection rules.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4662
+          Access_Mask=0x100
+          (
+              Properties="*{1131f6ad-9c07-11d1-f79f-00c04fc2dcd2}*"
+              OR Properties="*{1131f6aa-9c07-11d1-f79f-00c04fc2dcd2}*"
+          )
+      | stats
+          count,
+          min(_time) as first_seen,
+          max(_time) as last_seen,
+          dc(ComputerName) as dc_count
+          by Account_Name, Account_Domain
+      | sort - count
+      | eval is_machine_account=if(match(Account_Name, "\$$"), "YES", "NO")
+      | table Account_Name, Account_Domain, is_machine_account,
+              count, first_seen, last_seen, dc_count
+
+  # --- Query B: Full session reconstruction for a suspected DCSync event ---
+  session_reconstruction:
+    description: >
+      Given a Logon_ID from a DCSync alert, reconstruct the full session:
+      logon event, all replication requests, and any other activity in that session.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          Logon_ID="<INSERT_LOGON_ID>"
+          EventCode IN (4624, 4662, 4634, 4672)
+      | sort _time
+      | table _time, EventCode, Account_Name, Source_Network_Address,
+              Logon_Type, Properties, Access_Mask, Object_Name, Privileges
+
+  # --- Query C: Timeline of replication activity around an incident ---
+  replication_timeline:
+    description: >
+      Show all replication activity in a 1-hour window around a suspected
+      DCSync event. Helps distinguish attacker activity from normal replication.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4662
+          Access_Mask=0x100
+          (
+              Properties="*{1131f6ad-9c07-11d1-f79f-00c04fc2dcd2}*"
+              OR Properties="*{1131f6aa-9c07-11d1-f79f-00c04fc2dcd2}*"
+          )
+          earliest="<INCIDENT_TIME_MINUS_30m>"
+          latest="<INCIDENT_TIME_PLUS_30m>"
+      | timechart span=1m count by Account_Name
+
+  # --- Query D: Identify who granted replication rights (permission forensics) ---
+  permission_grant_history:
+    description: >
+      Search for historical modifications to the domain root's security
+      descriptor. Helps identify when replication rights were added and by whom.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5136
+          ObjectClass="domainDNS"
+          AttributeLDAPDisplayName="nTSecurityDescriptor"
+          (
+              AttributeValue="*1131f6aa*"
+              OR AttributeValue="*1131f6ad*"
+              OR AttributeValue="*89e95b76*"
+          )
+      | table _time, SubjectUserName, SubjectDomainName, ComputerName,
+              ObjectDN, OperationType, AttributeValue
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RESPONSE PLAYBOOK — Actions upon confirmed DCSync detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+response_playbook:
+  name: "DCSync Attack — Incident Response Procedure"
+  description: >
+    Step-by-step response procedure when a DCSync detection rule fires
+    and is confirmed as a true positive.
+
+  immediate_actions:
+    - step: 1
+      action: "Disable the compromised account"
+      detail: >
+        Immediately disable the account identified in the alert
+        (Account_Name). If it is a service account, coordinate with the
+        service owner before disabling.
+      command: "Disable-ADAccount -Identity <Account_Name>"
+
+    - step: 2
+      action: "Isolate the source host"
+      detail: >
+        Network-isolate the host at Source_Network_Address. Use firewall
+        rules or EDR network containment. Do NOT shut down the machine —
+        preserve volatile memory for forensics.
+
+    - step: 3
+      action: "Reset the KRBTGT password (twice)"
+      detail: >
+        The attacker likely has KRBTGT hash. Reset the KRBTGT password
+        twice (with a 12+ hour gap between resets to allow replication)
+        to invalidate all Kerberos tickets including Golden Tickets.
+      reference: "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/forest-recovery-guide/ad-forest-recovery-resetting-the-krbtgt-password"
+
+    - step: 4
+      action: "Reset all privileged account passwords"
+      detail: >
+        Reset passwords for Domain Admins, Enterprise Admins, Schema
+        Admins, and any accounts identified in the replication request.
+
+    - step: 5
+      action: "Audit replication permissions"
+      detail: >
+        Run the baseline_replication_accounts investigation query to
+        identify all accounts with replication rights. Remove any
+        unauthorized entries.
+
+  forensic_actions:
+    - "Collect memory dump from the source host (for Mimikatz/tool analysis)"
+    - "Analyze Event 4624 for the full authentication chain (source IP, logon type)"
+    - "Check for Golden Ticket usage — Event 4769 with ticket encryption type 0x17"
+    - "Search for lateral movement from the compromised account (Event 4624 type 3/10)"
+    - "Review Event 5136 history for when replication rights were first granted"
+    - "Check for persistence mechanisms (scheduled tasks, WMI subscriptions, services)"

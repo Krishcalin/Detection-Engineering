@@ -1,0 +1,1318 @@
+# ==============================================================================
+#  ADCS (Active Directory Certificate Services) Attack Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for ADCS abuse (ESC1-ESC13+) based on
+#                the SpecterOps "Certified Pre-Owned" research. Correlates
+#                Certificate Services events (4886/4887/4898), Kerberos PKINIT
+#                (4768), Directory Service changes (5136), and process creation
+#                (4688/4104) to detect certificate-based privilege escalation,
+#                credential theft, and persistence.
+#  MITRE ATT&CK: T1649 - Steal or Forge Authentication Certificates
+#                 T1550 - Use Alternate Authentication Material
+#                 T1484 - Domain or Tenant Policy Modification
+#                 T1557 - Adversary-in-the-Middle (ESC8/ESC11 relay)
+#  Kill Chain   : Privilege Escalation -> Credential Access -> Persistence
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-03
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES (must be configured BEFORE these rules generate detections):
+#
+#  1. Enable CA Auditing on ALL Certificate Authority servers:
+#     certsrv.msc > right-click CA > Properties > Auditing tab > Enable ALL:
+#       - Issue and manage certificates
+#       - Change CA configuration
+#       - Change CA security settings
+#       - Start and stop Active Directory Certificate Services
+#       - Back up and restore the CA database
+#
+#  2. Enable Audit Policy on all Domain Controllers:
+#     Computer Configuration > Windows Settings > Security Settings >
+#       Advanced Audit Policy Configuration:
+#       - DS Access > "Audit Directory Service Changes" -> Success
+#       - Account Logon > "Audit Kerberos Authentication Service" -> Success
+#       - Object Access > "Audit Certification Services" -> Success
+#
+#  3. Enable PowerShell Script Block Logging on all endpoints:
+#     Computer Configuration > Administrative Templates > Windows Components >
+#       Windows PowerShell > Turn on PowerShell Script Block Logging -> Enabled
+#
+#  4. Enable Process Creation with Command Line on all endpoints:
+#     Computer Configuration > Administrative Templates > System >
+#       Audit Process Creation > Include command line in process creation events
+#
+#  5. Forward Security logs from CA servers and DCs to Splunk via Universal
+#     Forwarder with sourcetype=XmlWinEventLog:Security
+#
+#  6. Optionally forward Certificate Lifecycle logs from endpoints:
+#     Microsoft-Windows-CertificateServicesClient-Lifecycle-System/Operational
+#
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+#  Reference: ESC Attack Matrix (SpecterOps "Certified Pre-Owned" + Community)
+# ------------------------------------------------------------------------------
+#
+#  ESC  | Attack Vector                             | Primary Detection Event
+#  ---- | ----------------------------------------- | -----------------------
+#  ESC1 | Enrollee supplies SAN in cert request     | 4887 (SAN mismatch)
+#  ESC2 | Any Purpose / SubCA EKU template          | 5136 / 4898 (EKU audit)
+#  ESC3 | Certificate Request Agent abuse           | 4887 / 4898
+#  ESC4 | Template ACL modification                 | 5136 (template changes)
+#  ESC5 | CA object ACL abuse                       | 5136 (CA object changes)
+#  ESC6 | EDITF_ATTRIBUTESUBJECTALTNAME2 on CA      | 4688 (certutil)
+#  ESC7 | CA Manager approval abuse                 | 4890 (CA settings changed)
+#  ESC8 | NTLM relay to HTTP enrollment (PetitPotam)| 4768 (PKINIT from relay)
+#  ESC9 | No Security Extension flag                | 5136 (enrollment flag)
+#  ESC10| Weak certificate mapping                  | 5136 (UPN change)
+#  ESC11| NTLM relay to ICPR (RPC enrollment)       | 4768 (PKINIT anomaly)
+#  ESC13| OID group link abuse                      | 5136 (OIDToGroupLink)
+#
+#  Key EKU OIDs:
+#  1.3.6.1.5.5.7.3.2          = Client Authentication
+#  1.3.6.1.4.1.311.20.2.2     = Smart Card Logon
+#  1.3.6.1.4.1.311.20.2.1     = Certificate Request Agent (Enrollment Agent)
+#  2.5.29.37.0                 = Any Purpose
+#  1.3.6.1.5.2.3.4            = PKINIT Client Authentication
+#
+#  PKINIT PreAuthType=16 (PA_PK_AS_REQ) in Event 4768
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: ESC1 — Certificate Issued with SAN Mismatch (Impersonation)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The highest-value ADCS detection. Fires when a certificate is issued where
+#  the Subject Alternative Name (SAN) UPN does not match the Requester account.
+#  This means someone requested a certificate that authenticates as a DIFFERENT
+#  user — the hallmark of ESC1 and ESC6 exploitation.
+#
+#  Covers  : ESC1, ESC6 (after flag is enabled)
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Low — exclude web server templates that legitimately use dns= SANs
+#  Tools caught: Certify, Certipy, Impacket ntlmrelayx, manual certreq
+
+rule_1_esc1_san_mismatch:
+  name: "ADCS ESC1 — Certificate Issued with Subject Alternative Name Impersonation"
+  description: >
+    Detects issuance of a certificate where the Subject Alternative Name (SAN)
+    contains a User Principal Name (UPN) that differs from the requesting account.
+    This indicates that a user obtained a certificate to authenticate as a
+    different identity — the core technique of ESC1. An attacker with enrollment
+    rights on a template with CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT and Client
+    Authentication EKU can request a certificate for any user, including
+    Domain Admins, and use it for PKINIT Kerberos authentication.
+  mitre:
+    tactic: "Privilege Escalation, Credential Access"
+    technique: T1649
+    technique_name: "Steal or Forge Authentication Certificates"
+    sub_techniques:
+      - "ESC1: Enrollee Supplies Subject Alternative Name"
+      - "ESC6: EDITF_ATTRIBUTESUBJECTALTNAME2 (CA-wide SAN override)"
+  severity: critical
+  confidence: 90
+  risk_score: 95
+  kill_chain_phase: "Privilege Escalation"
+  data_sources:
+    - "Windows Security Event Log on CA server (Event ID 4886, 4887)"
+  prerequisites:
+    - "CA Auditing enabled (Issue and manage certificates)"
+    - "CA server Security event logs forwarded to Splunk"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode IN (4886, 4887)
+        Attributes="*SAN:*upn*"
+        Attributes="*CertificateTemplate:*"
+    ```Extract certificate template name, SAN UPN, SAN DNS, and requester```
+    | rex field=Attributes "(?i)CertificateTemplate:(?<certificate_template>[^\r\n]+)"
+    | rex max_match=10 field=Attributes "(?i)upn=(?<san_upn>[^\r\n&]+)"
+    | rex max_match=10 field=Attributes "(?i)dns=(?<san_dns>[^\r\n&]+)"
+    | rex field=Attributes "(?i)ccm:(?<request_source_host>[^\r\n]+)"
+    | rex field=Requester "(?:.+\\\\)?(?<requester_samaccount>[^\r\n]+)"
+    ```Normalize for comparison```
+    | eval san_upn_user=lower(mvindex(san_upn, 0))
+    | eval requester_lower=lower(requester_samaccount)
+    | rex field=san_upn_user "^(?<san_user_part>[^@]+)"
+    ```Detect mismatch: requester is NOT the same as the SAN UPN user```
+    | where isnotnull(san_upn_user) AND san_user_part!=requester_lower
+    ```Exclude known legitimate SAN templates (customize per environment)```
+    | search NOT certificate_template IN (
+        "WebServer", "DomainController", "DomainControllerAuthentication",
+        "KerberosAuthentication", "DirectoryEmailReplication"
+      )
+    | eval impersonated_user=san_upn_user
+    | eval attack_type=case(
+        match(san_upn_user, "(?i)(admin|krbtgt|enterprise)"), "CRITICAL - Privileged account targeted",
+        match(san_upn_user, "(?i)\\$$"), "HIGH - Machine account targeted",
+        1==1, "HIGH - User impersonation"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as request_count,
+        values(EventCode) as event_codes,
+        values(certificate_template) as template_used,
+        values(san_upn) as san_upn_values,
+        values(san_dns) as san_dns_values,
+        values(request_source_host) as source_host,
+        values(Subject) as cert_subject,
+        values(attack_type) as attack_type
+        by Requester, requester_samaccount, impersonated_user,
+           ComputerName, RequestId
+    | eval mitre_technique="T1649"
+    | eval mitre_tactic="Credential Access, Privilege Escalation"
+    | eval alert_name="ADCS ESC1 - SAN Impersonation"
+    | table first_seen, last_seen, Requester, requester_samaccount,
+            impersonated_user, ComputerName, source_host, template_used,
+            san_upn_values, san_dns_values, cert_subject, RequestId,
+            request_count, attack_type, event_codes,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "Requester"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "ADCS ESC1 — $requester_samaccount$ requested cert as $impersonated_user$"
+        rule_description: >
+          Account $Requester$ requested and was issued a certificate with
+          SAN UPN=$san_upn_values$ using template $template_used$ on CA
+          $ComputerName$. The SAN identity does not match the requester,
+          indicating ESC1 certificate impersonation. The attacker can use
+          this certificate for PKINIT authentication as $impersonated_user$.
+        severity: critical
+        drilldown_search: >
+          index=wineventlog EventCode IN (4886, 4887, 4768)
+          (Requester="$Requester$" OR RequestId="$RequestId$"
+           OR TargetUserName="$impersonated_user$")
+    - risk:
+        risk_object: "requester_samaccount"
+        risk_object_type: "user"
+        risk_score: 95
+    - risk:
+        risk_object: "impersonated_user"
+        risk_object_type: "user"
+        risk_score: 50
+
+  known_false_positives:
+    - "Web server certificate requests with dns= SANs (not upn=) — filtered by template whitelist"
+    - "SCCM/ConfigMgr enrollment via NDES — add SCCM templates and service accounts to exclusion"
+    - "Azure AD Connect certificate requests — add MSOL_ account to exclusion"
+    - "Delegated enrollment by authorized IT staff — document and whitelist enrollment agent accounts"
+  tuning_guidance: |
+    1. Add your environment's legitimate SAN-capable templates to the NOT IN exclusion list
+    2. If using enrollment agents (ESC3 by design), whitelist those accounts
+    3. Focus alerting on upn= SANs, not dns= SANs (dns= is normal for web server certs)
+    4. Correlate with Rule 2 (PKINIT authentication) for confirmed exploitation
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Certificate-Based PKINIT Authentication (Post-Exploitation)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects certificate-based Kerberos authentication (PKINIT) which is the
+#  final step in most ADCS attacks — using the stolen/forged certificate to
+#  obtain a TGT. Correlates with certificate issuance events to identify
+#  certificates used suspiciously soon after issuance, or from unexpected
+#  source IPs.
+#
+#  Covers  : All ESC attacks (post-exploitation phase), Golden Certificate
+#  Confidence  : MEDIUM-HIGH (PKINIT is legitimate in WHfB environments)
+#  Severity    : HIGH
+#  FP Rate     : Medium — Windows Hello for Business generates PKINIT events
+
+rule_2_pkinit_certificate_authentication:
+  name: "ADCS — Suspicious Certificate-Based Kerberos Authentication (PKINIT)"
+  description: >
+    Detects Kerberos TGT requests using certificate-based pre-authentication
+    (PreAuthType=16, PKINIT). While legitimate in Windows Hello for Business
+    and smart card environments, PKINIT is the final step in ADCS exploitation
+    chains (ESC1-ESC13). This rule focuses on anomalies: machine accounts
+    authenticating via certificate from a different IP, user accounts that
+    have never previously used certificate auth, and certificates issued by
+    suspicious CAs or with unusual serial numbers.
+  mitre:
+    tactic: "Credential Access, Lateral Movement"
+    technique: T1550
+    technique_name: "Use Alternate Authentication Material"
+    related_technique: T1649
+  severity: high
+  confidence: 75
+  risk_score: 80
+  data_sources:
+    - "Windows Security Event Log on DCs (Event ID 4768)"
+    - "Windows Security Event Log on CA (Event ID 4887) for correlation"
+  prerequisites:
+    - "Audit Kerberos Authentication Service — Success enabled on all DCs"
+    - "DC Security event logs forwarded to Splunk"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4768
+        CertThumbprint=*
+    | where isnotnull(CertIssuerName) AND isnotnull(CertSerialNumber)
+        AND CertThumbprint!=""
+    ```Extract key authentication fields```
+    | rename TargetUserName as authenticated_user,
+             IpAddress as source_ip,
+             Computer as domain_controller
+    | eval is_machine_account=if(match(authenticated_user, "\$$"), "YES", "NO")
+    ```Detect anomalous TicketOptions (Rubeus/Impacket artifact: 0x4080xxxx)```
+    | eval suspicious_ticket_options=if(
+        match(TicketOptions, "^0x4080"), "YES - Tool artifact (missing Canonicalize flag)", "NO"
+      )
+    ```Flag machine accounts authenticating via PKINIT (ESC8/PetitPotam indicator)```
+    | eval machine_pkinit=if(
+        is_machine_account=="YES" AND PreAuthType=="16", "YES - Machine PKINIT", "NO"
+      )
+    ```Correlate with recent certificate issuance on the same thumbprint```
+    | join type=left CertThumbprint
+        [
+            search index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4887
+            | rename SubjectKeyIdentifier as CertThumbprint
+            | eval cert_issued_time=_time
+            | rex field=Attributes "(?i)CertificateTemplate:(?<issued_template>[^\r\n]+)"
+            | rex field=Attributes "(?i)upn=(?<issued_san_upn>[^\r\n&]+)"
+            | fields CertThumbprint, cert_issued_time, Requester, issued_template, issued_san_upn
+        ]
+    ```Calculate time delta between certificate issuance and PKINIT use```
+    | eval time_delta_minutes=if(isnotnull(cert_issued_time),
+        round((_time - cert_issued_time) / 60, 1), null())
+    | eval rapid_use=if(time_delta_minutes < 60 AND isnotnull(time_delta_minutes),
+        "YES - Used within ".time_delta_minutes." minutes of issuance", "NO")
+    ```Aggregate and score```
+    | eval suspicion_score=0
+    | eval suspicion_score=suspicion_score + if(suspicious_ticket_options=="YES - Tool artifact (missing Canonicalize flag)", 40, 0)
+    | eval suspicion_score=suspicion_score + if(machine_pkinit=="YES - Machine PKINIT", 30, 0)
+    | eval suspicion_score=suspicion_score + if(rapid_use!="NO", 30, 0)
+    | eval suspicion_score=suspicion_score + if(isnotnull(issued_san_upn), 20, 0)
+    | where suspicion_score >= 30
+    | eval severity=case(
+        suspicion_score >= 70, "CRITICAL",
+        suspicion_score >= 50, "HIGH",
+        1==1, "MEDIUM"
+      )
+    | eval mitre_technique="T1649, T1550"
+    | eval alert_name="ADCS - Suspicious PKINIT Authentication"
+    | table _time, authenticated_user, source_ip, domain_controller,
+            CertIssuerName, CertSerialNumber, CertThumbprint,
+            PreAuthType, TicketOptions,
+            is_machine_account, suspicious_ticket_options, machine_pkinit,
+            Requester, issued_template, issued_san_upn,
+            time_delta_minutes, rapid_use,
+            suspicion_score, severity, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "authenticated_user"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Suspicious PKINIT — $authenticated_user$ from $source_ip$ (score: $suspicion_score$)"
+        severity: high
+    - risk:
+        risk_object: "authenticated_user"
+        risk_object_type: "user"
+        risk_score: 80
+    - risk:
+        risk_object: "source_ip"
+        risk_object_type: "system"
+        risk_score: 60
+
+  known_false_positives:
+    - "Windows Hello for Business (WHfB) — generates legitimate PreAuthType=16 events; baseline WHfB users"
+    - "Smart card authentication — legitimate PKINIT; whitelist smart card user groups"
+    - "VPN certificate-based authentication — some VPN solutions use PKINIT"
+    - "Newly deployed certificate autoenrollment — temporary spike after GPO change"
+  tuning_guidance: |
+    1. Baseline PKINIT usage: run a 30-day lookback to identify accounts that normally use certificates
+    2. If WHfB is deployed, lower the suspicion_score threshold or add a WHfB account lookup exclusion
+    3. Machine account PKINIT (machine_pkinit) is rare outside of ESC8 — investigate these always
+    4. Focus on suspicion_score >= 50 for high-confidence alerts
+    5. Tool artifact detection (TicketOptions 0x4080) is evasion-prone but catches default tool configs
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: ESC4 — Certificate Template Modification (Weaponization)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects dangerous modifications to certificate template objects in AD.
+#  An attacker with WriteProperty/WriteDACL/WriteOwner on a template can
+#  enable ENROLLEE_SUPPLIES_SUBJECT, add dangerous EKUs, remove signature
+#  requirements, or grant enrollment rights — converting a safe template
+#  into an ESC1/ESC2/ESC3 vulnerability.
+#
+#  Covers  : ESC4, ESC5 (CA object), ESC9 (enrollment flag), ESC13 (OID link)
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Low — template changes are rare in production environments
+
+rule_3_esc4_template_modification:
+  name: "ADCS ESC4 — Dangerous Certificate Template Modification"
+  description: >
+    Detects modifications to certificate template objects (pKICertificateTemplate)
+    in Active Directory that introduce exploitable conditions. Monitors changes
+    to critical LDAP attributes including msPKI-Certificate-Name-Flag (SAN
+    control), pKIExtendedKeyUsage (EKU), nTSecurityDescriptor (permissions),
+    msPKI-Enrollment-Flag (security extension), and msPKI-RA-Signature
+    (authorized signatures). Any modification that enables ENROLLEE_SUPPLIES_SUBJECT,
+    adds Any Purpose or Request Agent EKU, removes signature requirements, or
+    grants broad enrollment permissions is flagged as a potential ESC4 attack.
+  mitre:
+    tactic: "Defense Evasion, Privilege Escalation"
+    technique: T1484
+    technique_name: "Domain or Tenant Policy Modification"
+    related_technique: T1649
+  severity: critical
+  confidence: 85
+  risk_score: 90
+  data_sources:
+    - "Windows Security Event Log on DCs (Event ID 5136)"
+  prerequisites:
+    - "Audit Directory Service Changes — Success enabled on all DCs"
+    - "DC Security event logs forwarded to Splunk"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5136
+        ObjectClass="pKICertificateTemplate"
+        AttributeLDAPDisplayName IN (
+            "msPKI-Certificate-Name-Flag",
+            "pKIExtendedKeyUsage",
+            "msPKI-Certificate-Application-Policy",
+            "nTSecurityDescriptor",
+            "msPKI-Enrollment-Flag",
+            "msPKI-RA-Signature",
+            "msPKI-Minimal-Key-Size"
+        )
+    ```Classify the type and severity of the modification```
+    | eval dangerous_change=case(
+        AttributeLDAPDisplayName=="msPKI-Certificate-Name-Flag"
+            AND AttributeValue=="1",
+            "ENROLLEE_SUPPLIES_SUBJECT enabled (ESC1 condition created)",
+        AttributeLDAPDisplayName=="pKIExtendedKeyUsage"
+            AND AttributeValue=="2.5.29.37.0",
+            "Any Purpose EKU added (ESC2 condition created)",
+        AttributeLDAPDisplayName=="pKIExtendedKeyUsage"
+            AND AttributeValue=="1.3.6.1.4.1.311.20.2.1",
+            "Certificate Request Agent EKU added (ESC3 condition created)",
+        AttributeLDAPDisplayName=="msPKI-Certificate-Application-Policy"
+            AND AttributeValue=="2.5.29.37.0",
+            "Any Purpose Application Policy added (ESC2 condition created)",
+        AttributeLDAPDisplayName=="msPKI-Certificate-Application-Policy"
+            AND AttributeValue=="1.3.6.1.4.1.311.20.2.1",
+            "Request Agent Application Policy added (ESC3 condition created)",
+        AttributeLDAPDisplayName=="msPKI-Enrollment-Flag"
+            AND match(AttributeValue, "524288"),
+            "NO_SECURITY_EXTENSION flag added (ESC9 condition created)",
+        AttributeLDAPDisplayName=="msPKI-RA-Signature"
+            AND AttributeValue=="0",
+            "Authorized signatures removed (signature bypass)",
+        AttributeLDAPDisplayName=="msPKI-Minimal-Key-Size"
+            AND tonumber(AttributeValue) < 2048,
+            "Weak key size set (< 2048 bits)",
+        AttributeLDAPDisplayName=="nTSecurityDescriptor"
+            AND match(AttributeValue,
+                "\([OA]{1,2};;[A-Z]*(WD|WO|WP|CR)[A-Z]*;;;(DU|AU|S-1-1-0)\)"),
+            "Dangerous permissions granted to broad group (ESC4 ACL abuse)",
+        1==1, null()
+      )
+    | where isnotnull(dangerous_change)
+    ```Extract the template name from the ObjectDN```
+    | rex field=ObjectDN "CN=(?<template_name>[^,]+)"
+    | eval change_severity=case(
+        match(dangerous_change, "(ENROLLEE_SUPPLIES_SUBJECT|Any Purpose|Request Agent|NO_SECURITY_EXTENSION|Dangerous permissions)"),
+            "CRITICAL",
+        match(dangerous_change, "(signature|Weak key)"),
+            "HIGH",
+        1==1, "MEDIUM"
+      )
+    | eval esc_classification=case(
+        match(dangerous_change, "ENROLLEE_SUPPLIES_SUBJECT"), "ESC1/ESC4",
+        match(dangerous_change, "Any Purpose"), "ESC2/ESC4",
+        match(dangerous_change, "Request Agent"), "ESC3/ESC4",
+        match(dangerous_change, "NO_SECURITY_EXTENSION"), "ESC9",
+        match(dangerous_change, "Dangerous permissions"), "ESC4",
+        1==1, "ESC4"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as modification_count,
+        values(dangerous_change) as changes_made,
+        values(AttributeLDAPDisplayName) as attributes_modified,
+        values(change_severity) as severity,
+        values(esc_classification) as esc_type
+        by SubjectUserName, SubjectDomainName, ComputerName,
+           ObjectDN, template_name, OpCorrelationID
+    | eval mitre_technique="T1484, T1649"
+    | eval alert_name="ADCS ESC4 - Template Modification"
+    | table first_seen, last_seen, SubjectUserName, SubjectDomainName,
+            ComputerName, template_name, ObjectDN, attributes_modified,
+            changes_made, modification_count, esc_type, severity,
+            OpCorrelationID, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "SubjectUserName"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "ADCS ESC4 — $SubjectUserName$ modified template $template_name$: $changes_made$"
+        severity: critical
+        drilldown_search: >
+          index=wineventlog EventCode=5136
+          ObjectClass=pKICertificateTemplate ObjectDN="$ObjectDN$"
+          | sort _time
+    - risk:
+        risk_object: "SubjectUserName"
+        risk_object_type: "user"
+        risk_score: 90
+
+  known_false_positives:
+    - "PKI administrator creating new templates during planned maintenance — correlate with change tickets"
+    - "SCCM/ConfigMgr template configuration — known templates, known service accounts"
+    - "Enterprise CA migration or PKI infrastructure rebuild — time-bounded, well-documented events"
+  tuning_guidance: |
+    1. Certificate template changes in production are RARE — any change warrants investigation
+    2. Baseline existing template configurations before deploying (use investigation query)
+    3. Whitelist known PKI admin accounts only if you have strong change management controls
+    4. Correlate with Rule 1 — if a template is modified and then enrolled against, that is CRITICAL
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: ESC6 — EDITF_ATTRIBUTESUBJECTALTNAME2 Flag Enabled on CA
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects the activation of the EDITF_ATTRIBUTESUBJECTALTNAME2 flag on a
+#  Certificate Authority via certutil.exe. When this flag is enabled, ANY
+#  certificate request can include a user-specified SAN regardless of template
+#  configuration, effectively making ALL published templates ESC1-vulnerable.
+#  This is a devastating configuration change.
+#
+#  Covers  : ESC6
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very low — this flag should almost never be enabled
+
+rule_4_esc6_editf_flag:
+  name: "ADCS ESC6 — EDITF_ATTRIBUTESUBJECTALTNAME2 Flag Enabled via CertUtil"
+  description: >
+    Detects execution of certutil.exe with the command to enable the
+    EDITF_ATTRIBUTESUBJECTALTNAME2 flag on the CA's policy module. When
+    enabled, this flag allows ANY certificate requester to specify a Subject
+    Alternative Name in their request, regardless of template configuration.
+    This effectively converts ALL published templates into ESC1-vulnerable
+    templates. Also detects direct registry manipulation of the EditFlags value.
+  mitre:
+    tactic: "Defense Evasion, Privilege Escalation"
+    technique: T1484
+    technique_name: "Domain or Tenant Policy Modification"
+    related_technique: T1649
+  severity: critical
+  confidence: 95
+  risk_score: 100
+  data_sources:
+    - "Windows Security Event Log (Event ID 4688 - Process Creation)"
+    - "PowerShell Script Block Logging (Event ID 4104)"
+    - "Registry Audit (Event ID 4657 or Sysmon Event ID 13)"
+
+  search: |
+    (
+        ```Detection 1: certutil.exe command-line```
+        (
+            index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+                (
+                    NewProcessName="*\\certutil.exe"
+                    AND (
+                        CommandLine="*EDITF_ATTRIBUTESUBJECTALTNAME2*"
+                        OR CommandLine="*editf*attributesubjectaltname2*"
+                    )
+                )
+        )
+        OR
+        ```Detection 2: PowerShell invocation```
+        (
+            index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-PowerShell/Operational"
+                EventCode=4104
+                ScriptBlockText="*EDITF_ATTRIBUTESUBJECTALTNAME2*"
+        )
+        OR
+        ```Detection 3: Direct registry modification of EditFlags```
+        (
+            index=wineventlog EventCode IN (4657, 13)
+                (
+                    ObjectName="*\\Services\\CertSvc\\Configuration\\*\\PolicyModules\\*"
+                    OR TargetObject="*\\Services\\CertSvc\\Configuration\\*\\PolicyModules\\*"
+                )
+                (ObjectValueName="EditFlags" OR TargetDetails="EditFlags")
+        )
+    )
+    | eval detection_method=case(
+        EventCode==4688, "certutil.exe command-line",
+        EventCode==4104, "PowerShell script block",
+        EventCode IN (4657, 13), "Direct registry modification"
+      )
+    | eval user=coalesce(SubjectUserName, user_id, SubjectUserName)
+    | eval host=coalesce(ComputerName, Computer, host)
+    | eval detail=coalesce(CommandLine, ScriptBlockText, ObjectName)
+    | eval mitre_technique="T1484, T1649"
+    | eval alert_name="ADCS ESC6 - EDITF Flag Enabled"
+    | table _time, user, host, detection_method, detail,
+            EventCode, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "ADCS ESC6 CRITICAL — EDITF_ATTRIBUTESUBJECTALTNAME2 enabled by $user$ on $host$"
+        severity: critical
+    - risk:
+        risk_object: "user"
+        risk_object_type: "user"
+        risk_score: 100
+    - risk:
+        risk_object: "host"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "Extremely rare — this flag should never be enabled in a secure environment"
+    - "Some legacy application documentation may instruct administrators to enable it (incorrect guidance)"
+  tuning_guidance: |
+    1. This rule should have ZERO false positives in a well-managed PKI
+    2. Any firing of this rule is an immediate P1 security incident
+    3. If the flag is currently enabled, disable it immediately:
+       certutil -setreg policy\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2
+       net stop certsvc && net start certsvc
+    4. After disabling, audit ALL certificates issued while the flag was active
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: ESC8 — Machine Account PKINIT from Non-Machine IP (NTLM Relay)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects NTLM relay to ADCS (PetitPotam/ESC8) by identifying machine
+#  accounts authenticating via PKINIT from an IP address that does NOT match
+#  the machine's expected IP. When an attacker coerces NTLM authentication
+#  from a DC (via PetitPotam, PrinterBug, etc.) and relays it to the ADCS
+#  HTTP enrollment endpoint, the resulting certificate is used for PKINIT
+#  from the attacker's machine — creating an IP mismatch.
+#
+#  Covers  : ESC8, ESC11
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Low — requires machine IP asset lookup
+
+rule_5_esc8_relay_machine_pkinit:
+  name: "ADCS ESC8 — Machine Account PKINIT from Unexpected Source (NTLM Relay)"
+  description: >
+    Detects a machine account (ending in $) authenticating via certificate-based
+    PKINIT (PreAuthType=16) from a source IP that does not match the machine's
+    known IP address. This is the signature of an ESC8/PetitPotam attack where
+    an attacker coerces NTLM authentication from a target (often a Domain
+    Controller), relays it to the ADCS HTTP enrollment endpoint to obtain a
+    certificate, then uses that certificate for PKINIT from their own machine.
+    Requires a machine-to-IP lookup table for accurate detection.
+  mitre:
+    tactic: "Credential Access, Lateral Movement"
+    technique: T1557
+    technique_name: "Adversary-in-the-Middle"
+    related_techniques:
+      - "T1649: Steal or Forge Authentication Certificates"
+      - "T1187: Forced Authentication (PetitPotam coercion)"
+  severity: critical
+  confidence: 85
+  risk_score: 95
+  data_sources:
+    - "Windows Security Event Log on DCs (Event ID 4768)"
+    - "Machine-to-IP asset lookup table"
+
+  # --- Machine IP Lookup Setup ---
+  # Create a CSV lookup: machine_ip_list.csv
+  # Fields: machine_name, ip, site
+  # Example:
+  #   machine_name,ip,site
+  #   DC01$,10.0.0.10,HQ
+  #   DC02$,10.0.0.11,HQ
+  #   FILESERVER01$,10.0.1.20,HQ
+  #
+  # Alternatively, use Splunk ES Asset framework with dns resolution
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4768
+        CertThumbprint=*
+        PreAuthType=16
+    | where isnotnull(CertIssuerName) AND isnotnull(CertSerialNumber)
+    | rename TargetUserName as machine_account, IpAddress as auth_source_ip,
+             Computer as domain_controller
+    ```Only look at machine accounts (ending in $)```
+    | where match(machine_account, "\$$")
+    ```Lookup the machine's expected IP```
+    | lookup machine_ip_list.csv machine_name as machine_account
+        OUTPUT ip as expected_ip, site as expected_site
+    ```Flag mismatches — auth came from a different IP than the machine owns```
+    | where isnotnull(expected_ip) AND auth_source_ip!=expected_ip
+    ```Exclude loopback and link-local```
+    | where auth_source_ip!="127.0.0.1" AND auth_source_ip!="::1"
+        AND auth_source_ip!="-"
+    | eval ip_mismatch_detail="Machine ".machine_account." expected from "
+        .expected_ip." but PKINIT came from ".auth_source_ip
+    | eval attack_severity=case(
+        match(machine_account, "(?i)^DC"), "CRITICAL - Domain Controller account relayed",
+        1==1, "HIGH - Machine account relayed"
+      )
+    | eval mitre_technique="T1557, T1649"
+    | eval alert_name="ADCS ESC8 - NTLM Relay Machine PKINIT"
+    | table _time, machine_account, auth_source_ip, expected_ip, expected_site,
+            domain_controller, CertIssuerName, CertSerialNumber, CertThumbprint,
+            TicketOptions, ip_mismatch_detail, attack_severity,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "machine_account"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "ADCS ESC8 Relay — $machine_account$ PKINIT from attacker IP $auth_source_ip$"
+        severity: critical
+    - risk:
+        risk_object: "auth_source_ip"
+        risk_object_type: "system"
+        risk_score: 95
+    - risk:
+        risk_object: "machine_account"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "Machine IP change (DHCP reassignment) — update machine_ip_list.csv or use DNS-based lookup"
+    - "Disaster recovery failover with IP changes — temporary, time-bounded"
+    - "NAT/proxy environments — use the actual machine IP, not the NAT gateway IP"
+  tuning_guidance: |
+    1. Create and maintain machine_ip_list.csv — focus on DCs, CA servers, and critical servers first
+    2. Use Splunk ES Asset framework or DNS lookup as an alternative to static CSV
+    3. DC machine account PKINIT mismatches are ALWAYS critical — investigate immediately
+    4. Correlate with PetitPotam indicators: Event 5145 for share access to IPC$ with EFS/LSARPC pipes
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: ESC2/ESC3 — Vulnerable Template Loaded (Configuration Audit)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects when the CA loads a certificate template with dangerous EKUs or
+#  enrollment conditions. Event 4898 fires when a template is loaded and
+#  contains the full TemplateContent including EKUs, flags, and security
+#  descriptor — making it ideal for identifying vulnerable templates.
+#
+#  Covers  : ESC2, ESC3 (template identification, not active exploitation)
+#  Confidence  : HIGH (for vulnerable template identification)
+#  Severity    : HIGH
+#  FP Rate     : Medium — run as scheduled audit, not real-time alert
+
+rule_6_esc2_esc3_vulnerable_template:
+  name: "ADCS ESC2/ESC3 — Vulnerable Certificate Template Detected"
+  description: >
+    Identifies certificate templates loaded by the CA that have dangerous
+    configurations: Any Purpose EKU (ESC2), Certificate Request Agent EKU
+    with low signature requirements (ESC3), or templates where Domain Users
+    or Authenticated Users can enroll in templates with Client Authentication
+    EKU and ENROLLEE_SUPPLIES_SUBJECT flag (ESC1 condition). This is a
+    configuration audit rule, not an active attack detection.
+  mitre:
+    tactic: "Credential Access"
+    technique: T1649
+    technique_name: "Steal or Forge Authentication Certificates"
+  severity: high
+  confidence: 80
+  risk_score: 70
+  data_sources:
+    - "Windows Security Event Log on CA server (Event ID 4898)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4898
+    ```Parse template content into searchable tokens```
+    | rename TemplateInternalName as template_name
+    | eval template_content=TemplateContent
+    ```Check for dangerous EKUs```
+    | eval has_any_purpose=if(
+        match(template_content, "2\.5\.29\.37\.0"), "YES", "NO")
+    | eval has_request_agent=if(
+        match(template_content, "1\.3\.6\.1\.4\.1\.311\.20\.2\.1"), "YES", "NO")
+    | eval has_client_auth=if(
+        match(template_content, "1\.3\.6\.1\.5\.5\.7\.3\.2"), "YES", "NO")
+    | eval has_smart_card_logon=if(
+        match(template_content, "1\.3\.6\.1\.4\.1\.311\.20\.2\.2"), "YES", "NO")
+    ```Check for ENROLLEE_SUPPLIES_SUBJECT```
+    | eval has_enrollee_supplies_subject=if(
+        match(template_content, "CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT"), "YES", "NO")
+    ```Check for manager approval (mitigating control)```
+    | eval has_manager_approval=if(
+        match(template_content, "CT_FLAG_PEND_ALL_REQUESTS"), "YES", "NO")
+    ```Check authorized signatures requirement```
+    | rex field=template_content "msPKI-RA-Signature = (?<ra_signature>\d+)"
+    ```Check if broad groups can enroll (DU=Domain Users, AU=Authenticated Users)```
+    | eval broad_enrollment=if(
+        match(template_content,
+            "\(OA;;CR;(0e10c968-78fb-11d2-90d4-00c04f79dc55|a05b8cc2-17bc-4802-a710-e7c15ab866a2);;(DU|AU)\)"),
+        "YES", "NO")
+    ```Classify vulnerability```
+    | eval vulnerability=case(
+        has_any_purpose=="YES" AND broad_enrollment=="YES"
+            AND has_manager_approval=="NO",
+            "ESC2 - Any Purpose EKU with broad enrollment",
+        has_request_agent=="YES" AND has_manager_approval=="NO"
+            AND (ra_signature=="0" OR isnull(ra_signature))
+            AND broad_enrollment=="YES",
+            "ESC3 - Request Agent EKU, no manager approval, no signature required",
+        has_enrollee_supplies_subject=="YES"
+            AND (has_client_auth=="YES" OR has_smart_card_logon=="YES")
+            AND broad_enrollment=="YES"
+            AND has_manager_approval=="NO",
+            "ESC1 - Enrollee supplies subject with Client Auth and broad enrollment",
+        1==1, null()
+      )
+    | where isnotnull(vulnerability)
+    | eval mitre_technique="T1649"
+    | eval alert_name="ADCS Vulnerable Template Detected"
+    | table _time, ComputerName, template_name, vulnerability,
+            has_any_purpose, has_request_agent, has_client_auth,
+            has_enrollee_supplies_subject, has_manager_approval,
+            ra_signature, broad_enrollment,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "0 6 * * *"
+    earliest: "-25h"
+    latest: "now"
+    description: "Daily audit — runs once per day at 6 AM"
+  throttle:
+    field: "template_name"
+    period: "24h"
+  actions:
+    - notable_event:
+        rule_title: "Vulnerable ADCS Template — $template_name$: $vulnerability$"
+        severity: high
+
+  known_false_positives:
+    - "Templates intentionally configured for web server enrollment (WebServer with SAN)"
+    - "Legacy templates from older AD versions that have not been hardened"
+    - "Test/lab environments with permissive template configurations"
+  tuning_guidance: |
+    1. Run this rule as a daily audit, not a real-time alert
+    2. Remediate identified templates: remove ENROLLEE_SUPPLIES_SUBJECT, require manager approval,
+       restrict enrollment to specific security groups (not Domain Users/Authenticated Users)
+    3. Use as input to a vulnerability management workflow rather than a SOC alert
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: ADCS Tool Detection — Certify / Certipy / CertUtil Abuse
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects execution of known ADCS exploitation tools via process creation
+#  events and PowerShell script block logging. Catches Certify (.NET),
+#  Certipy (Python), and CertUtil.exe abuse patterns.
+#
+#  Covers  : All ESC attacks (tool-based detection)
+#  Confidence  : HIGH
+#  Severity    : HIGH
+#  FP Rate     : Low for Certify/Certipy, Medium for CertUtil (legitimate admin use)
+
+rule_7_adcs_tool_detection:
+  name: "ADCS Attack Tool Detected — Certify / Certipy / CertUtil Abuse"
+  description: >
+    Detects execution of ADCS exploitation tools through process creation
+    (Event 4688) and PowerShell script block logging (Event 4104). Monitors
+    for Certify and Certipy command-line patterns (find /vulnerable, request
+    /ca:, auth -pfx), and CertUtil.exe abuse patterns (backup CA database,
+    export PFX, enable EDITF flag). Also detects PowerShell-based certificate
+    export commands (Export-PfxCertificate, Export-Certificate).
+  mitre:
+    tactic: "Execution, Credential Access"
+    technique: T1649
+    technique_name: "Steal or Forge Authentication Certificates"
+    related_techniques:
+      - "T1059.001: PowerShell"
+      - "T1059.003: Windows Command Shell"
+  severity: high
+  confidence: 85
+  risk_score: 85
+  data_sources:
+    - "Windows Security Event Log (Event ID 4688 - Process Creation)"
+    - "PowerShell Operational Log (Event ID 4104 - Script Block)"
+    - "Sysmon Event ID 1 (Process Creation) as alternative"
+
+  search: |
+    (
+        ```Detection 1: Certify.exe command-line patterns```
+        (
+            index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+                (
+                    (NewProcessName="*\\Certify.exe" OR NewProcessName="*\\Certipy*")
+                    OR
+                    (
+                        CommandLine="*find*" AND CommandLine="*/vulnerable*"
+                    )
+                    OR
+                    (
+                        CommandLine="*request*" AND CommandLine="*/ca:*"
+                        AND CommandLine IN ("*/template:*", "*/altname:*")
+                    )
+                    OR
+                    (
+                        CommandLine="*auth*" AND CommandLine="*-pfx*"
+                    )
+                )
+        )
+        OR
+        ```Detection 2: CertUtil.exe abuse patterns```
+        (
+            index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+                NewProcessName="*\\certutil.exe"
+                (
+                    CommandLine="*-backupDB*"
+                    OR CommandLine="*-backupKey*"
+                    OR CommandLine="*-exportPFX*"
+                    OR CommandLine="*-importPFX*"
+                    OR CommandLine="*EDITF_ATTRIBUTESUBJECTALTNAME2*"
+                    OR CommandLine="*-config*" AND CommandLine="*-ca.cert*"
+                )
+        )
+        OR
+        ```Detection 3: PowerShell certificate abuse patterns```
+        (
+            index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-PowerShell/Operational"
+                EventCode=4104
+                (
+                    ScriptBlockText="*Certify*" AND ScriptBlockText IN
+                        ("*find*vulnerable*", "*/enrolleeSuppliesSubject*",
+                         "*/json*/outfile*", "*request*/ca:*")
+                )
+                OR
+                (
+                    ScriptBlockText IN (
+                        "*Export-PfxCertificate*",
+                        "*Export-Certificate*",
+                        "*Get-ChildItem*Cert:\\*-Exportable*"
+                    )
+                )
+        )
+    )
+    | eval tool_detected=case(
+        match(coalesce(NewProcessName, ""), "(?i)certify"), "Certify.exe (SpecterOps ADCS tool)",
+        match(coalesce(NewProcessName, ""), "(?i)certipy"), "Certipy (Python ADCS tool)",
+        match(coalesce(CommandLine, ""), "(?i)find.*vulnerable"), "ADCS enumeration (Certify pattern)",
+        match(coalesce(CommandLine, ""), "(?i)request.*/ca:.*altname"), "ADCS cert request with SAN (ESC1)",
+        match(coalesce(CommandLine, ""), "(?i)auth.*-pfx"), "PKINIT auth with stolen certificate",
+        match(coalesce(CommandLine, ""), "(?i)certutil.*backupDB"), "CertUtil CA database backup (key theft)",
+        match(coalesce(CommandLine, ""), "(?i)certutil.*backupKey"), "CertUtil CA key backup (key theft)",
+        match(coalesce(CommandLine, ""), "(?i)certutil.*exportPFX"), "CertUtil PFX export (cert theft)",
+        match(coalesce(CommandLine, ""), "(?i)EDITF_ATTRIBUTESUBJECTALTNAME2"), "CertUtil ESC6 flag change",
+        match(coalesce(ScriptBlockText, ""), "(?i)Export-PfxCertificate"), "PowerShell PFX export",
+        match(coalesce(ScriptBlockText, ""), "(?i)Certify"), "Certify via PowerShell (in-memory)",
+        1==1, "ADCS tool activity"
+      )
+    | eval user=coalesce(SubjectUserName, user_id)
+    | eval host=coalesce(ComputerName, Computer)
+    | eval command=coalesce(CommandLine, ScriptBlockText)
+    | eval severity=case(
+        match(tool_detected, "(Certify|Certipy|ESC1|ESC6|key theft)"), "CRITICAL",
+        match(tool_detected, "(enumeration|PFX export)"), "HIGH",
+        1==1, "HIGH"
+      )
+    | eval mitre_technique="T1649, T1059"
+    | eval alert_name="ADCS Attack Tool Detected"
+    | table _time, user, host, tool_detected, command, EventCode,
+            severity, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "user"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "ADCS Tool — $tool_detected$ by $user$ on $host$"
+        severity: high
+    - risk:
+        risk_object: "user"
+        risk_object_type: "user"
+        risk_score: 85
+    - risk:
+        risk_object: "host"
+        risk_object_type: "system"
+        risk_score: 70
+
+  known_false_positives:
+    - "CertUtil.exe is a legitimate Windows tool — -exportPFX and -backupDB may be used by PKI admins"
+    - "Export-PfxCertificate is used in certificate lifecycle management"
+    - "Security teams running Certify/Certipy for authorized assessments — use time-based exclusions"
+  tuning_guidance: |
+    1. CertUtil detections have higher FP rate — correlate with user role (is this a PKI admin?)
+    2. Certify.exe and Certipy detections are almost always malicious on production systems
+    3. PowerShell Export-PfxCertificate may be legitimate — focus on the target certificate store path
+    4. Consider adding Sysmon Event ID 1 as an additional data source for better command-line capture
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: ESC13 — OID Group Link Modification
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects modifications to the msDS-OIDToGroupLink attribute on OID objects
+#  in the AD Configuration partition. This attribute links an issuance policy
+#  to an AD security group via Authentication Mechanism Assurance (AMA).
+#  An attacker can abuse this to gain membership in a privileged group by
+#  obtaining a certificate with the linked issuance policy.
+#
+#  Covers  : ESC13
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very low — OID group links are rarely modified
+
+rule_8_esc13_oid_group_link:
+  name: "ADCS ESC13 — OID Group Link Modification (Issuance Policy Abuse)"
+  description: >
+    Detects modifications to the msDS-OIDToGroupLink attribute on OID objects
+    in the Configuration partition of Active Directory. ESC13 abuses
+    Authentication Mechanism Assurance (AMA) by linking a certificate issuance
+    policy to a privileged security group. When an attacker enrolls in a template
+    with the linked issuance policy, the issued certificate automatically grants
+    them membership in the linked group during authentication.
+  mitre:
+    tactic: "Privilege Escalation, Persistence"
+    technique: T1484
+    technique_name: "Domain or Tenant Policy Modification"
+    related_technique: T1649
+  severity: critical
+  confidence: 90
+  risk_score: 90
+  data_sources:
+    - "Windows Security Event Log on DCs (Event ID 5136)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5136
+        AttributeLDAPDisplayName="msDS-OIDToGroupLink"
+    | rex field=ObjectDN "CN=(?<oid_object>[^,]+)"
+    | rex field=AttributeValue "CN=(?<linked_group>[^,]+)"
+    | eval mitre_technique="T1484, T1649"
+    | eval alert_name="ADCS ESC13 - OID Group Link Modified"
+    | eval detail="OID object ".oid_object." linked to group ".linked_group
+        ." by ".SubjectUserName
+    | table _time, SubjectUserName, SubjectDomainName, ComputerName,
+            ObjectDN, oid_object, AttributeValue, linked_group,
+            detail, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "SubjectUserName"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "ADCS ESC13 — $SubjectUserName$ linked OID $oid_object$ to group $linked_group$"
+        severity: critical
+    - risk:
+        risk_object: "SubjectUserName"
+        risk_object_type: "user"
+        risk_score: 90
+
+  known_false_positives:
+    - "Initial AMA configuration by PKI administrators — very rare, verify with change management"
+  tuning_guidance: |
+    1. msDS-OIDToGroupLink changes should essentially NEVER happen outside of initial AMA setup
+    2. Any modification is worth immediate investigation
+    3. Check the linked group — if it maps to Domain Admins, Enterprise Admins, etc., escalate immediately
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 9: CA Configuration Change (ESC5/ESC7)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects changes to the Certificate Authority configuration via Event 4890.
+#  This includes CA security settings changes, officer/manager permission
+#  modifications, and policy module configuration changes (including ESC6).
+#
+#  Covers  : ESC5, ESC7
+#  Confidence  : MEDIUM-HIGH
+#  Severity    : HIGH
+#  FP Rate     : Low — CA configuration changes are rare
+
+rule_9_ca_configuration_change:
+  name: "ADCS — Certificate Authority Configuration Changed"
+  description: >
+    Detects changes to the Certificate Authority configuration including
+    manager settings, security properties, and policy module configuration.
+    Event 4890 fires when CA manager settings are changed, which can indicate
+    ESC7 (attacker with ManageCA granting themselves ManageCertificates) or
+    ESC5 (modifying the CA's own AD object permissions). Also monitors for
+    CA database backup events (4876) which may indicate CA private key theft
+    for Golden Certificate attacks.
+  mitre:
+    tactic: "Defense Evasion, Privilege Escalation"
+    technique: T1484
+    technique_name: "Domain or Tenant Policy Modification"
+  severity: high
+  confidence: 75
+  risk_score: 75
+  data_sources:
+    - "Windows Security Event Log on CA server (Event ID 4890, 4876)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security"
+        EventCode IN (4890, 4876)
+    | eval change_type=case(
+        EventCode==4890, "CA manager/configuration settings changed",
+        EventCode==4876, "CA database backed up (potential key theft)"
+      )
+    | eval severity=case(
+        EventCode==4876, "CRITICAL",
+        1==1, "HIGH"
+      )
+    | eval mitre_technique="T1484, T1649"
+    | eval alert_name="ADCS CA Configuration Change"
+    | table _time, SubjectUserName, SubjectDomainName, ComputerName,
+            EventCode, change_type, severity, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "ComputerName"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "ADCS — $change_type$ by $SubjectUserName$ on $ComputerName$"
+        severity: high
+    - risk:
+        risk_object: "SubjectUserName"
+        risk_object_type: "user"
+        risk_score: 75
+
+  known_false_positives:
+    - "Scheduled CA database backups — whitelist the backup service account and schedule window"
+    - "PKI administrator performing planned maintenance — correlate with change management"
+  tuning_guidance: |
+    1. Whitelist known backup service accounts for Event 4876 to reduce noise
+    2. Event 4890 should be rare — any occurrence warrants investigation
+    3. Correlate 4890 with subsequent 4887 events to detect ESC7 exploitation chain
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  INVESTIGATION QUERIES — Run manually during incident response
+# ██████████████████████████████████████████████████████████████████████████████
+
+investigation_queries:
+
+  # --- Query A: Enumerate all certificate templates and their risk level ---
+  template_risk_audit:
+    description: >
+      Comprehensive audit of all certificate templates loaded by the CA.
+      Identifies templates with ESC1, ESC2, ESC3 conditions. Run periodically
+      or after a suspected ADCS compromise.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4898
+      | rename TemplateInternalName as template_name
+      | eval has_enrollee_supplies_subject=if(
+          match(TemplateContent, "CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT"), "YES", "NO")
+      | eval has_any_purpose=if(
+          match(TemplateContent, "2\.5\.29\.37\.0"), "YES", "NO")
+      | eval has_client_auth=if(
+          match(TemplateContent, "1\.3\.6\.1\.5\.5\.7\.3\.2"), "YES", "NO")
+      | eval has_request_agent=if(
+          match(TemplateContent, "1\.3\.6\.1\.4\.1\.311\.20\.2\.1"), "YES", "NO")
+      | eval has_manager_approval=if(
+          match(TemplateContent, "CT_FLAG_PEND_ALL_REQUESTS"), "YES", "NO")
+      | eval broad_enrollment=if(
+          match(TemplateContent,
+              "\(OA;;CR;(0e10c968|a05b8cc2)[^;]*;;(DU|AU)\)"),
+          "YES", "NO")
+      | rex field=TemplateContent "msPKI-RA-Signature = (?<ra_sig>\d+)"
+      | eval risk=case(
+          has_enrollee_supplies_subject=="YES" AND has_client_auth=="YES"
+              AND broad_enrollment=="YES" AND has_manager_approval=="NO",
+              "CRITICAL (ESC1)",
+          has_any_purpose=="YES" AND broad_enrollment=="YES"
+              AND has_manager_approval=="NO",
+              "CRITICAL (ESC2)",
+          has_request_agent=="YES" AND broad_enrollment=="YES"
+              AND has_manager_approval=="NO" AND (ra_sig=="0" OR isnull(ra_sig)),
+              "HIGH (ESC3)",
+          has_enrollee_supplies_subject=="YES" AND has_client_auth=="YES",
+              "MEDIUM (ESC1 potential - restricted enrollment)",
+          1==1, "LOW")
+      | table template_name, risk, has_enrollee_supplies_subject, has_any_purpose,
+              has_client_auth, has_request_agent, has_manager_approval,
+              ra_sig, broad_enrollment
+      | sort - risk
+
+  # --- Query B: All certificate issuances with SAN in the last 7 days ---
+  recent_san_certificates:
+    description: >
+      Lists all certificates issued with a Subject Alternative Name in the
+      past 7 days. Review for any SAN UPN mismatches with the Requester.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4887
+          Attributes="*SAN:*" earliest=-7d
+      | rex field=Attributes "(?i)CertificateTemplate:(?<template>[^\r\n]+)"
+      | rex max_match=10 field=Attributes "(?i)upn=(?<san_upn>[^\r\n&]+)"
+      | rex max_match=10 field=Attributes "(?i)dns=(?<san_dns>[^\r\n&]+)"
+      | rex field=Requester "(?:.+\\\\)?(?<requester_sam>[^\r\n]+)"
+      | table _time, Requester, requester_sam, san_upn, san_dns,
+              template, Subject, ComputerName, RequestId
+
+  # --- Query C: All PKINIT authentications in the last 7 days ---
+  recent_pkinit_events:
+    description: >
+      Baseline query for all certificate-based Kerberos authentications.
+      Identifies accounts that regularly use PKINIT (WHfB, smart card) vs
+      accounts that suddenly start using certificate authentication.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4768
+          CertThumbprint=* earliest=-7d
+      | where isnotnull(CertIssuerName)
+      | rename TargetUserName as user, IpAddress as src_ip, Computer as dc
+      | stats count, dc(src_ip) as unique_ips, dc(CertThumbprint) as unique_certs,
+              min(_time) as first_seen, max(_time) as last_seen
+              by user, CertIssuerName
+      | eval is_machine=if(match(user, "\$$"), "YES", "NO")
+      | sort - count
+
+  # --- Query D: Certificate template modification history ---
+  template_change_history:
+    description: >
+      Full history of certificate template modifications. Essential for
+      forensic investigation of ESC4 attacks and for establishing a baseline.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5136
+          ObjectClass="pKICertificateTemplate"
+      | rex field=ObjectDN "CN=(?<template_name>[^,]+)"
+      | table _time, SubjectUserName, SubjectDomainName, template_name,
+              ObjectDN, AttributeLDAPDisplayName, AttributeValue,
+              OperationType, ComputerName
+      | sort _time
+
+  # --- Query E: Correlation chain — template change → cert issuance → PKINIT ---
+  full_attack_chain:
+    description: >
+      Identifies the complete ESC4 attack chain: template modification,
+      followed by certificate enrollment on the modified template, followed
+      by PKINIT authentication. Run with specific time ranges during investigation.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode IN (5136, 4887, 4768)
+          earliest="<INCIDENT_START>"
+          latest="<INCIDENT_END>"
+      | eval event_phase=case(
+          EventCode==5136, "1-Template Modified",
+          EventCode==4887, "2-Certificate Issued",
+          EventCode==4768 AND isnotnull(CertThumbprint), "3-PKINIT Authentication",
+          1==1, "Other")
+      | where event_phase!="Other"
+      | eval user=coalesce(SubjectUserName, Requester, TargetUserName)
+      | sort _time
+      | table _time, event_phase, EventCode, user, ComputerName,
+              ObjectDN, Attributes, CertIssuerName, CertThumbprint, IpAddress
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RESPONSE PLAYBOOK — Actions upon confirmed ADCS attack detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+response_playbook:
+  name: "ADCS Attack — Incident Response Procedure"
+  description: >
+    Step-by-step response procedure when an ADCS detection rule fires
+    and is confirmed as a true positive.
+
+  immediate_actions:
+    - step: 1
+      action: "Identify and revoke the malicious certificate"
+      detail: >
+        Use the RequestId from Event 4887 to locate the certificate in the
+        CA management console (certsrv.msc > Issued Certificates). Revoke
+        the certificate immediately. Publish a new CRL.
+      commands:
+        - "certutil -revoke <SerialNumber> 1"
+        - "certutil -CRL"
+
+    - step: 2
+      action: "Disable the compromised account"
+      detail: >
+        Disable the account that requested the malicious certificate.
+        If the account is a service account, coordinate with the application
+        owner. Reset the account's password.
+      command: "Disable-ADAccount -Identity <RequesterSAMAccount>"
+
+    - step: 3
+      action: "Remediate the vulnerable template"
+      detail: >
+        If the attack exploited a misconfigured template (ESC1/ESC2/ESC3/ESC4):
+        1. Remove ENROLLEE_SUPPLIES_SUBJECT flag if not needed
+        2. Restrict enrollment to specific security groups (remove Domain Users/Authenticated Users)
+        3. Enable manager approval (CT_FLAG_PEND_ALL_REQUESTS)
+        4. Require authorized signatures (msPKI-RA-Signature >= 1)
+        5. Remove Any Purpose and Request Agent EKUs if not needed
+
+    - step: 4
+      action: "Disable EDITF_ATTRIBUTESUBJECTALTNAME2 if enabled (ESC6)"
+      detail: >
+        Check and disable the flag on all CAs.
+      commands:
+        - "certutil -getreg policy\\EditFlags"
+        - "certutil -setreg policy\\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2"
+        - "net stop certsvc && net start certsvc"
+
+    - step: 5
+      action: "Audit all certificates issued during the compromise window"
+      detail: >
+        Export and review all certificates issued between the earliest
+        suspicious event and the current time. Revoke any certificates
+        with unexpected SAN values or issued to unexpected accounts.
+      command: "certutil -view -restrict 'Disposition=20,NotBefore>=<START_DATE>' -out 'RequestID,RequesterName,CommonName,CertificateTemplate,SAN'"
+
+    - step: 6
+      action: "Enable strong certificate mapping on all DCs"
+      detail: >
+        Set StrongCertificateBindingEnforcement to 2 (Full Enforcement)
+        on all Domain Controllers to mitigate ESC9/ESC10.
+      registry: "HKLM\\SYSTEM\\CurrentControlSet\\Services\\Kdc\\StrongCertificateBindingEnforcement = 2"
+
+  forensic_actions:
+    - "Collect CA audit logs for the full compromise window (Events 4886, 4887, 4888, 4890, 4898)"
+    - "Collect DC Kerberos logs (Event 4768) to identify all PKINIT authentications with suspect certificates"
+    - "Review Event 5136 for template and CA object modifications"
+    - "Check for persistence: exported certificates (.pfx, .p12 files) on compromised hosts"
+    - "Verify CRL distribution points are accessible and current"
+    - "If CA private key may be compromised (ESC12): plan CA rebuild and full PKI re-issuance"
+    - "Search for Golden Certificate indicators: certificates with no matching 4887 issuance event"
+    - "Review ntlmrelayx/PetitPotam indicators: Event 5145 for IPC$ access with EFSRPC/LSARPC pipes"

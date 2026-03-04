@@ -1,0 +1,1377 @@
+# ==============================================================================
+#  Kerberoasting Attack Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for Kerberoasting (T1558.003) and
+#                AS-REP Roasting (T1558.004) attacks. Correlates Kerberos TGS
+#                events (4769), TGT events (4768), process creation (4688),
+#                and PowerShell script block logging (4104) to detect offline
+#                password cracking attacks via Kerberos ticket abuse.
+#
+#                Kerberoasting: Any authenticated domain user can request a
+#                Kerberos TGS ticket for any SPN-registered service account.
+#                The ticket is encrypted with the service account's NTLM hash,
+#                which can then be cracked offline (Hashcat mode 13100/19700).
+#
+#                AS-REP Roasting: Accounts with "Do not require Kerberos
+#                pre-authentication" enabled respond to unauthenticated AS-REQ
+#                with an AS-REP encrypted by the user's key — crackable offline.
+#
+#  MITRE ATT&CK: T1558.003 - Steal or Forge Kerberos Tickets: Kerberoasting
+#                 T1558.004 - Steal or Forge Kerberos Tickets: AS-REP Roasting
+#                 T1087.002 - Account Discovery: Domain Account (precursor)
+#  Kill Chain   : Credential Access -> Privilege Escalation -> Lateral Movement
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-04
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES (must be configured BEFORE these rules generate detections):
+#
+#  1. Enable Advanced Audit Policy on ALL Domain Controllers:
+#     Computer Configuration > Windows Settings > Security Settings >
+#       Advanced Audit Policy Configuration:
+#       - Account Logon > "Audit Kerberos Service Ticket Operations" -> Success, Failure
+#       - Account Logon > "Audit Kerberos Authentication Service" -> Success, Failure
+#       - Account Logon > "Audit Credential Validation" -> Success, Failure
+#       - Detailed Tracking > "Audit Process Creation" -> Success
+#     (via GPO or: auditpol /set /subcategory:"Kerberos Service Ticket Operations" /success:enable)
+#
+#  2. Enable Command Line Logging in Process Creation Events on all hosts:
+#     Computer Configuration > Administrative Templates > System >
+#       Audit Process Creation > Include command line in process creation events -> Enabled
+#
+#  3. Enable PowerShell Script Block Logging on all endpoints:
+#     Computer Configuration > Administrative Templates > Windows Components >
+#       Windows PowerShell > Turn on PowerShell Script Block Logging -> Enabled
+#
+#  4. Forward Security logs from ALL Domain Controllers to Splunk via
+#     Universal Forwarder with sourcetype=XmlWinEventLog:Security
+#
+#  5. Forward PowerShell Operational logs from endpoints:
+#     sourcetype=XmlWinEventLog:Microsoft-Windows-PowerShell/Operational
+#
+#  6. Build an AD lookup table of privileged service accounts (recommended):
+#     Use a scheduled PowerShell script to export accounts with adminCount=1
+#     that also have servicePrincipalName set, into a CSV lookup:
+#       privileged_spn_accounts.csv (columns: samaccountname, groups, last_password_set)
+#     Script:
+#       Get-ADUser -Filter {adminCount -eq 1 -and servicePrincipalName -like "*"} `
+#         -Properties servicePrincipalName, memberOf, PasswordLastSet |
+#         Select-Object sAMAccountName, @{N='groups';E={$_.memberOf -join ';'}},
+#           @{N='password_last_set';E={$_.PasswordLastSet}}
+#
+# ==============================================================================
+#
+#  Encryption Type Reference (TicketEncryptionType in Event 4769):
+#
+#  Value  | Decimal | Algorithm               | Detection Context
+#  ------ | ------- | ----------------------- | -------------------------------------------
+#  0x1    |  1      | DES-CBC-CRC             | CRITICAL — legacy/disabled; highly suspicious
+#  0x3    |  3      | DES-CBC-MD5             | CRITICAL — legacy/disabled; highly suspicious
+#  0x11   | 17      | AES128-CTS-HMAC-SHA1-96 | NORMAL — modern AES; low noise
+#  0x12   | 18      | AES256-CTS-HMAC-SHA1-96 | NORMAL — modern AES; primary standard
+#  0x17   | 23      | RC4-HMAC                | HIGH — PRIMARY Kerberoasting indicator
+#  0x18   | 24      | RC4-HMAC-EXP            | CRITICAL — export-grade RC4; almost never legitimate
+#
+#  Note: 0x17 (RC4) may still be legitimate in environments with legacy
+#  applications or non-AES-configured service accounts. Baseline your
+#  environment before setting thresholds.
+#
+#  TicketOptions Common Values (Event 4769):
+#  0x40810000 = Forwardable + Renewable + Canonicalize (normal AND attack tools)
+#  0x40800000 = Forwardable + Renewable (older clients; some Impacket versions)
+#
+#  Tools using 0x40810000 (cannot distinguish alone — requires other indicators):
+#    Rubeus, Invoke-Kerberoast, GetUserSPNs.py (Impacket), PowerSploit
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: Classic Kerberoasting — RC4 Encryption Downgrade (Event 4769)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The highest-confidence Kerberoasting indicator. When an attacker requests a
+#  TGS ticket using RC4 (0x17) for a user service account, the resulting ticket
+#  is encrypted with the account's NTLM hash and can be cracked offline at
+#  billions of guesses per second using Hashcat mode 13100.
+#
+#  Detection logic:
+#    - Event 4769 (Kerberos Service Ticket Operations)
+#    - TicketEncryptionType = 0x17 (RC4-HMAC)
+#    - ServiceName does NOT end in $ (exclude machine accounts)
+#    - ServiceName is NOT krbtgt (exclude DC-to-DC replication tickets)
+#    - Status = 0x0 (successful ticket issuance)
+#    - Requesting account (Subject > Account Name) is NOT a machine account
+#
+#  Covers      : Classic Kerberoasting with RC4 downgrade request
+#  Confidence  : HIGH (90)
+#  Severity    : CRITICAL
+#  FP Rate     : Medium — legacy apps, cross-domain trusts may use RC4 legitimately.
+#                Baseline your environment. Build exclusion list of known RC4 consumers.
+#  Tools caught: Rubeus, Invoke-Kerberoast, GetUserSPNs.py, Mimikatz kerberos::ask
+
+rule_1_rc4_tgs_downgrade:
+  name: "Kerberoasting — RC4 Encryption Downgrade in TGS Request"
+  description: >
+    Detects a Kerberos TGS ticket request (Event 4769) where the client explicitly
+    requested RC4-HMAC (0x17) encryption for a user service account, which is the
+    primary indicator of Kerberoasting. The resulting ticket is encrypted with the
+    target service account's NTLM hash and can be cracked offline at extremely high
+    speeds using Hashcat (mode 13100). Machine accounts and the krbtgt account are
+    excluded since their passwords are not crackable in practice.
+    In modern Active Directory environments (2008+ DFL with AES-configured accounts),
+    legitimate RC4 TGS requests for user service accounts should be rare or absent.
+  mitre:
+    tactic: "Credential Access"
+    technique: T1558.003
+    technique_name: "Steal or Forge Kerberos Tickets: Kerberoasting"
+    related_techniques:
+      - "T1003.002: OS Credential Dumping (post-exploitation use of cracked hash)"
+      - "T1078.002: Valid Accounts: Domain Accounts (credential use after cracking)"
+  severity: critical
+  confidence: 90
+  risk_score: 90
+  kill_chain_phase: "Credential Access"
+  data_sources:
+    - "Windows Security Event Log on Domain Controllers (Event ID 4769)"
+  prerequisites:
+    - "Audit Kerberos Service Ticket Operations: Success enabled on all DCs"
+    - "DC Security event logs forwarded to Splunk"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+        TicketEncryptionType="0x17"
+        Status="0x0"
+    ``` Exclude machine account SPNs (end in $) and krbtgt ```
+    | where NOT match(ServiceName, "\\$$")
+    | where ServiceName!="krbtgt"
+    ``` Exclude the requesting account being a machine account itself ```
+    | where NOT match('SubjectAccountName', "\\$$")
+    | where 'SubjectAccountName'!="-"
+    ``` Normalize and enrich fields ```
+    | eval src_ip=replace(IpAddress, "::ffff:", "")
+    | eval target_service=lower(ServiceName)
+    | eval requesting_user=lower('SubjectAccountName')
+    | eval requesting_domain=lower('SubjectDomainName')
+    ``` Classify privilege risk of the targeted service account (customize) ```
+    | eval svc_risk=case(
+        match(ServiceName, "(?i)(MSSQLSvc|MSSQL|sqlsvc|sql_svc)"), "HIGH - SQL Service",
+        match(ServiceName, "(?i)(http|svc|service|app|iis|web)"), "MEDIUM - App Service",
+        match(ServiceName, "(?i)(backup|bkp|veeam|commvault)"), "HIGH - Backup Service",
+        match(ServiceName, "(?i)(admin|da|ea|sccm|mecm|configmgr)"), "CRITICAL - Admin Service",
+        1==1, "MEDIUM - Unknown Service"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as ticket_count,
+        dc(ServiceName) as unique_spns_targeted,
+        values(ServiceName) as spns_targeted,
+        values(src_ip) as source_ips,
+        values(ComputerName) as dc_name,
+        values(svc_risk) as risk_classifications,
+        values(TicketOptions) as ticket_options
+        by requesting_user, requesting_domain, SubjectLogonId
+    | eval mitre_technique="T1558.003"
+    | eval mitre_tactic="Credential Access"
+    | eval alert_name="Kerberoasting - RC4 TGS Downgrade"
+    | sort - unique_spns_targeted, ticket_count
+    | table first_seen, last_seen, requesting_user, requesting_domain,
+            source_ips, dc_name, unique_spns_targeted, spns_targeted,
+            ticket_count, risk_classifications, ticket_options,
+            SubjectLogonId, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "requesting_user"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Kerberoasting RC4 Downgrade — $requesting_user$ targeted $unique_spns_targeted$ SPN(s)"
+        rule_description: >
+          Account $requesting_user$@$requesting_domain$ requested TGS tickets encrypted
+          with RC4-HMAC (0x17) for $unique_spns_targeted$ service account SPN(s):
+          $spns_targeted$. Source IP: $source_ips$. This is the primary indicator of
+          Kerberoasting — the RC4-encrypted tickets can be cracked offline to recover
+          service account plaintext passwords. Risk classifications: $risk_classifications$.
+        severity: critical
+        drilldown_search: >
+          index=wineventlog EventCode IN (4769, 4768, 4624)
+          SubjectAccountName="$requesting_user$"
+          | sort _time
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Bulk TGS Requests — Volume Anomaly (Spray Kerberoasting)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Non-targeted Kerberoasting gathers ALL SPN-registered accounts and requests
+#  tickets for all of them in rapid succession. A normal user requests TGS
+#  tickets for a small, predictable set of services. Requesting tickets for
+#  10+ distinct user service accounts within 15 minutes is highly anomalous.
+#
+#  This rule catches spray-style attacks even when RC4 detection is evaded
+#  (e.g., attacker allows AES but still does bulk enumeration).
+#
+#  Covers      : Non-targeted bulk Kerberoasting, AES-based Kerberoasting spray
+#  Confidence  : HIGH (85)
+#  Severity    : HIGH
+#  FP Rate     : Medium — tune threshold for your environment. Vulnerability
+#                scanners (Qualys, Nessus), PAM tools (CyberArk), and SCCM
+#                may generate high TGS volumes. Baseline first.
+#  Tools caught: Rubeus /tgtdeleg mode, GetUserSPNs.py -request (all SPNs)
+
+rule_2_bulk_tgs_volume_anomaly:
+  name: "Kerberoasting — Bulk TGS Requests (Volume Anomaly, Spray Attack)"
+  description: >
+    Detects a single account or source IP requesting Kerberos TGS tickets for an
+    unusually large number of distinct service account SPNs within a short time window.
+    This is the hallmark of non-targeted (spray) Kerberoasting where the attacker
+    requests tickets for all discovered SPNs and attempts to crack all of them
+    offline. The threshold of 10+ distinct SPNs in 15 minutes is aggressive for
+    normal users but may require tuning in PAM-heavy environments.
+    This rule catches AES-based Kerberoasting that evades RC4 downgrade detection.
+  mitre:
+    tactic: "Credential Access"
+    technique: T1558.003
+    technique_name: "Steal or Forge Kerberos Tickets: Kerberoasting"
+    related_techniques:
+      - "T1087.002: Account Discovery: Domain Account (SPN enumeration precursor)"
+  severity: high
+  confidence: 85
+  risk_score: 80
+  kill_chain_phase: "Credential Access"
+  data_sources:
+    - "Windows Security Event Log on Domain Controllers (Event ID 4769)"
+  prerequisites:
+    - "Audit Kerberos Service Ticket Operations: Success enabled on all DCs"
+    - "DC Security event logs forwarded to Splunk"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+        Status="0x0"
+    ``` Exclude machine account SPNs and the krbtgt ```
+    | where NOT match(ServiceName, "\\$$")
+    | where ServiceName!="krbtgt"
+    ``` Exclude machine account requesters ```
+    | where NOT match('SubjectAccountName', "\\$$")
+    | where 'SubjectAccountName'!="-"
+    | eval src_ip=replace(IpAddress, "::ffff:", "")
+    | eval enc_type=case(
+        TicketEncryptionType=="0x17", "RC4-HMAC (weak)",
+        TicketEncryptionType=="0x12", "AES256 (strong)",
+        TicketEncryptionType=="0x11", "AES128 (strong)",
+        TicketEncryptionType=="0x18", "RC4-EXP (export-grade)",
+        1==1, "Unknown/"+TicketEncryptionType
+      )
+    ``` Aggregate per requesting user + source IP within the search window ```
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        dc(ServiceName) as unique_spns_requested,
+        values(ServiceName) as spn_list,
+        count as total_tgs_requests,
+        values(enc_type) as encryption_types_used,
+        values(ComputerName) as dcs_queried,
+        values(TicketOptions) as ticket_options
+        by 'SubjectAccountName', 'SubjectDomainName', src_ip, SubjectLogonId
+    ``` Alert threshold: 10+ distinct user SPNs in the search window ```
+    ``` Tune this threshold based on your environment baseline             ```
+    | where unique_spns_requested >= 10
+    | eval severity_label=case(
+        unique_spns_requested >= 50, "CRITICAL - Mass enumeration",
+        unique_spns_requested >= 25, "HIGH - Broad enumeration",
+        unique_spns_requested >= 10, "HIGH - Suspicious volume"
+      )
+    | eval mitre_technique="T1558.003"
+    | eval mitre_tactic="Credential Access"
+    | eval alert_name="Kerberoasting - Bulk TGS Volume Anomaly"
+    | sort - unique_spns_requested
+    | table first_seen, last_seen, SubjectAccountName, SubjectDomainName,
+            src_ip, unique_spns_requested, total_tgs_requests, spn_list,
+            encryption_types_used, dcs_queried, ticket_options,
+            SubjectLogonId, severity_label, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/15 * * * *"
+    earliest: "-20m"
+    latest: "now"
+    window: "15m"
+  throttle:
+    field: "SubjectAccountName"
+    period: "2h"
+  actions:
+    - notable_event:
+        rule_title: "Kerberoasting Spray — $SubjectAccountName$ requested $unique_spns_requested$ SPNs in 15 min"
+        rule_description: >
+          Account $SubjectAccountName$@$SubjectDomainName$ from $src_ip$ requested TGS
+          tickets for $unique_spns_requested$ distinct service account SPNs within 15 minutes.
+          Total TGS requests: $total_tgs_requests$. Encryption types used: $encryption_types_used$.
+          SPNs targeted: $spn_list$. This volume is characteristic of spray Kerberoasting
+          where all SPN-registered accounts are targeted for offline password cracking.
+        severity: high
+        drilldown_search: >
+          index=wineventlog EventCode=4769
+          SubjectAccountName="$SubjectAccountName$" src_ip="$src_ip$"
+          | sort _time
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Targeted Kerberoasting — Privileged Service Account
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Sophisticated attackers perform targeted Kerberoasting: they enumerate and
+#  carefully select only high-value service accounts (adminCount=1, DA members,
+#  SCCM/SQL service accounts) requesting only 1-3 tickets to avoid volume alerts.
+#  This rule uses a lookup table of privileged service accounts to detect
+#  TGS requests for them regardless of encryption type or volume.
+#
+#  Covers      : Targeted Kerberoasting of privileged/sensitive service accounts
+#  Confidence  : HIGH (85)
+#  Severity    : CRITICAL
+#  FP Rate     : Low — legitimate access to privileged SPNs is rare from
+#                non-authorized hosts. Requires the privileged SPN lookup CSV.
+#  Tools caught: Any tool performing targeted single-SPN Kerberoasting
+
+rule_3_privileged_svc_targeting:
+  name: "Kerberoasting — Privileged Service Account Targeted (adminCount=1)"
+  description: >
+    Detects TGS ticket requests (Event 4769) targeting service accounts with
+    elevated privileges — specifically accounts with adminCount=1 or membership
+    in privileged groups (Domain Admins, Enterprise Admins, Schema Admins,
+    Backup Operators, etc.). These are the highest-value Kerberoasting targets
+    because cracking their passwords grants domain-level access. Even a single
+    TGS request for a privileged service account SPN from an unexpected source
+    warrants immediate investigation. This catches targeted attacks that evade
+    both RC4 detection (attacker requests AES) and volume detection (requests
+    only 1-2 tickets).
+    DEPENDENCY: Requires privileged_spn_accounts.csv lookup table populated
+    via scheduled Active Directory export (see prerequisites).
+  mitre:
+    tactic: "Credential Access, Privilege Escalation"
+    technique: T1558.003
+    technique_name: "Steal or Forge Kerberos Tickets: Kerberoasting"
+    related_techniques:
+      - "T1078.002: Valid Accounts: Domain Accounts (post-crack privilege use)"
+      - "T1087.002: Account Discovery: Domain Account (SPN enumeration)"
+  severity: critical
+  confidence: 85
+  risk_score: 95
+  kill_chain_phase: "Credential Access"
+  data_sources:
+    - "Windows Security Event Log on Domain Controllers (Event ID 4769)"
+    - "Active Directory lookup: privileged_spn_accounts.csv"
+  prerequisites:
+    - "Audit Kerberos Service Ticket Operations: Success enabled on all DCs"
+    - "DC Security event logs forwarded to Splunk"
+    - "privileged_spn_accounts.csv lookup table in Splunk (see file-level comment)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+        Status="0x0"
+    ``` Exclude machine account SPNs and krbtgt ```
+    | where NOT match(ServiceName, "\\$$")
+    | where ServiceName!="krbtgt"
+    | where NOT match('SubjectAccountName', "\\$$")
+    | where 'SubjectAccountName'!="-"
+    | eval src_ip=replace(IpAddress, "::ffff:", "")
+    ``` Enrich with privileged service account lookup ```
+    | lookup privileged_spn_accounts.csv samaccountname AS ServiceName
+        OUTPUT groups, password_last_set, is_privileged, admin_count
+    ``` Filter to only privileged service account targets ```
+    | where is_privileged="true" OR admin_count="1"
+    | eval enc_type=case(
+        TicketEncryptionType=="0x17", "RC4-HMAC (crackable — fast)",
+        TicketEncryptionType=="0x12", "AES256 (crackable — slow)",
+        TicketEncryptionType=="0x11", "AES128 (crackable — slow)",
+        TicketEncryptionType=="0x18", "RC4-EXP (crackable — very fast)",
+        1==1, TicketEncryptionType
+      )
+    | eval password_age_days=round((now()-strptime(password_last_set, "%Y-%m-%d"))/86400, 0)
+    | eval cracking_risk=case(
+        TicketEncryptionType=="0x17" AND password_age_days > 365, "CRITICAL - Old password + RC4",
+        TicketEncryptionType=="0x17" AND password_age_days > 90, "CRITICAL - Stale password + RC4",
+        TicketEncryptionType=="0x17", "HIGH - RC4 encryption",
+        password_age_days > 365, "HIGH - Password over 1 year old",
+        1==1, "HIGH - Privileged account targeted"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as ticket_count,
+        values(ServiceName) as targeted_spns,
+        values(groups) as target_groups,
+        values(enc_type) as encryption_used,
+        values(cracking_risk) as cracking_risk,
+        values(password_age_days) as password_age_days,
+        values(ComputerName) as dc_name
+        by 'SubjectAccountName', 'SubjectDomainName', src_ip, SubjectLogonId
+    | eval mitre_technique="T1558.003"
+    | eval mitre_tactic="Credential Access, Privilege Escalation"
+    | eval alert_name="Kerberoasting - Privileged SPN Targeted"
+    | sort - ticket_count
+    | table first_seen, last_seen, SubjectAccountName, SubjectDomainName,
+            src_ip, targeted_spns, target_groups, encryption_used,
+            cracking_risk, password_age_days, ticket_count, dc_name,
+            SubjectLogonId, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "SubjectAccountName"
+    period: "4h"
+  actions:
+    - notable_event:
+        rule_title: "Kerberoasting — PRIVILEGED SPN targeted: $targeted_spns$ by $SubjectAccountName$"
+        rule_description: >
+          Account $SubjectAccountName$@$SubjectDomainName$ from $src_ip$ requested a TGS
+          ticket for PRIVILEGED service account(s): $targeted_spns$ (groups: $target_groups$).
+          Encryption type: $encryption_used$. Password age: $password_age_days$ days.
+          Cracking risk assessment: $cracking_risk$. Even a single targeted TGS request
+          against a privileged service account warrants immediate investigation and
+          preventive password rotation.
+        severity: critical
+        drilldown_search: >
+          index=wineventlog EventCode IN (4769, 4768, 4624, 4625)
+          (SubjectAccountName="$SubjectAccountName$" OR ServiceName IN ($targeted_spns$))
+          | sort _time
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: AS-REP Roasting — Pre-Authentication Disabled (Event 4768)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  AS-REP Roasting targets accounts with "Do not require Kerberos
+#  pre-authentication" set (UAC flag DONT_REQUIRE_PREAUTH). An attacker sends
+#  an AS-REQ without the encrypted timestamp, and the KDC responds with an
+#  AS-REP containing the user's session key encrypted with their password hash.
+#  Unlike Kerberoasting, AS-REP Roasting does NOT require domain authentication.
+#
+#  Indicator: Event 4768 with PreAuthType=0 (no pre-auth used)
+#
+#  Covers      : AS-REP Roasting (T1558.004)
+#  Confidence  : HIGH (90)
+#  Severity    : CRITICAL
+#  FP Rate     : Low — in a hardened AD, NO accounts should have DONT_REQUIRE_PREAUTH.
+#                Any such account existing is itself a misconfiguration finding.
+#  Tools caught: Rubeus asreproast, GetNPUsers.py (Impacket), Invoke-ASREPRoast
+
+rule_4_asrep_roasting:
+  name: "AS-REP Roasting — Kerberos Pre-Authentication Disabled Account Request"
+  description: >
+    Detects AS-REP Roasting (MITRE T1558.004) where an attacker requests a TGT
+    for a user account that has "Do not require Kerberos pre-authentication" set
+    (userAccountControl DONT_REQUIRE_PREAUTH = 0x400000). The KDC responds with
+    an AS-REP encrypted with the user's long-term key, which can be cracked
+    offline using Hashcat mode 18200. Unlike Kerberoasting, this attack does NOT
+    require the attacker to be authenticated to the domain — only a valid username
+    is needed. Any Event 4768 with PreAuthType=0 is suspicious; in a hardened
+    Active Directory, no accounts should have this flag set. An attacker may also
+    SET this flag on a compromised account before performing AS-REP Roasting.
+  mitre:
+    tactic: "Credential Access"
+    technique: T1558.004
+    technique_name: "Steal or Forge Kerberos Tickets: AS-REP Roasting"
+    related_techniques:
+      - "T1558.003: Kerberoasting (often used together)"
+      - "T1087.002: Account Discovery: Domain Account (enumeration of no-preauth accounts)"
+  severity: critical
+  confidence: 90
+  risk_score: 90
+  kill_chain_phase: "Credential Access"
+  data_sources:
+    - "Windows Security Event Log on Domain Controllers (Event ID 4768)"
+  prerequisites:
+    - "Audit Kerberos Authentication Service: Success, Failure enabled on all DCs"
+    - "DC Security event logs forwarded to Splunk"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4768
+    ``` PreAuthType=0 means pre-authentication was NOT performed ```
+    | where PreAuthType="0"
+    | where Status="0x0"
+    ``` Exclude machine accounts and service-to-service auth ```
+    | where NOT match(TargetUserName, "\\$$")
+    | where TargetUserName!="ANONYMOUS LOGON"
+    | where TargetUserName!="-"
+    | eval src_ip=replace(IpAddress, "::ffff:", "")
+    | eval enc_type=case(
+        TicketEncryptionType=="0x17", "RC4-HMAC (fast to crack — Hashcat mode 18200)",
+        TicketEncryptionType=="0x12", "AES256 (slower — Hashcat mode 19900)",
+        TicketEncryptionType=="0x11", "AES128 (slower)",
+        1==1, TicketEncryptionType
+      )
+    ``` Flag as external if source is not RFC1918 ```
+    | eval src_type=case(
+        match(src_ip, "^10\\."), "INTERNAL",
+        match(src_ip, "^172\\.(1[6-9]|2[0-9]|3[01])\\."), "INTERNAL",
+        match(src_ip, "^192\\.168\\."), "INTERNAL",
+        src_ip=="::1" OR src_ip=="127.0.0.1", "LOOPBACK",
+        1==1, "EXTERNAL - HIGH RISK"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as asrep_count,
+        dc(TargetUserName) as unique_accounts_targeted,
+        values(TargetUserName) as accounts_targeted,
+        values(enc_type) as encryption_types,
+        values(src_type) as source_classification,
+        values(ComputerName) as dc_name,
+        values(TicketOptions) as ticket_options
+        by src_ip, TargetDomainName
+    | eval priority=case(
+        src_type="EXTERNAL - HIGH RISK", "CRITICAL - External source",
+        unique_accounts_targeted > 5, "CRITICAL - Mass AS-REP Roasting",
+        unique_accounts_targeted > 1, "HIGH - Multiple accounts",
+        1==1, "HIGH - Single account"
+      )
+    | eval mitre_technique="T1558.004"
+    | eval mitre_tactic="Credential Access"
+    | eval alert_name="AS-REP Roasting - Pre-Auth Disabled Account"
+    | sort - unique_accounts_targeted
+    | table first_seen, last_seen, src_ip, TargetDomainName,
+            unique_accounts_targeted, accounts_targeted, encryption_types,
+            source_classification, asrep_count, dc_name, ticket_options,
+            priority, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "src_ip"
+    period: "2h"
+  actions:
+    - notable_event:
+        rule_title: "AS-REP Roasting — $unique_accounts_targeted$ account(s) targeted from $src_ip$"
+        rule_description: >
+          AS-REP Roasting detected from $src_ip$ ($source_classification$). Accounts targeted:
+          $accounts_targeted$ in domain $TargetDomainName$. Encryption types requested:
+          $encryption_types$. Total AS-REP requests: $asrep_count$. PreAuthType=0 indicates
+          these accounts have "Do not require Kerberos pre-authentication" set — a
+          misconfiguration that allows offline cracking of the AS-REP without domain
+          authentication. Priority: $priority$. Immediately disable this flag on targeted
+          accounts and reset their passwords.
+        severity: critical
+        drilldown_search: >
+          index=wineventlog EventCode IN (4768, 4769, 4624, 4625)
+          (TargetUserName IN ($accounts_targeted$) OR src_ip="$src_ip$")
+          | sort _time
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Kerberoasting Tool Detection — Process & PowerShell Execution
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects execution of known Kerberoasting tools and techniques via process
+#  creation events (4688) and PowerShell script block logging (4104). This
+#  provides endpoint-level detection that complements the DC-level Event 4769
+#  detections and catches cases where the source host runs the attack tooling.
+#
+#  Tools: Rubeus (kerberoast/asreproast arguments), Invoke-Kerberoast,
+#         GetUserSPNs.py (Impacket), Request-SPNTicket, GetNPUsers.py
+#
+#  Covers      : Tool execution detection across all Kerberoasting variants
+#  Confidence  : HIGH (90)
+#  Severity    : CRITICAL
+#  FP Rate     : Low — these specific patterns (Rubeus kerberoast, Invoke-Kerberoast)
+#                are not present in legitimate tooling. Red team activities will
+#                also trigger this rule.
+#  Tools caught: Rubeus, Invoke-Kerberoast, GetUserSPNs.py, GetNPUsers.py,
+#                PowerSploit, Empire, Covenant, Cobalt Strike (execute-assembly)
+
+rule_5_tool_execution_detection:
+  name: "Kerberoasting Tool Execution — Rubeus, Invoke-Kerberoast, Impacket Detected"
+  description: >
+    Detects execution of known Kerberoasting and AS-REP Roasting attack tools
+    and PowerShell cmdlets. Sources include process creation events (4688) with
+    command-line logging and PowerShell script block logging (4104). This catches
+    attacks at the execution layer on the attacker-controlled host, complementing
+    the Domain Controller-side TGS request detections. Patterns cover Rubeus
+    kerberoast/asreproast modes, PowerSploit Invoke-Kerberoast, Impacket
+    GetUserSPNs.py and GetNPUsers.py, and direct .NET KerberosRequestorSecurityToken
+    usage (the underlying .NET class used by most PowerShell Kerberoasting tools).
+  mitre:
+    tactic: "Credential Access, Execution"
+    technique: T1558.003
+    technique_name: "Steal or Forge Kerberos Tickets: Kerberoasting"
+    related_techniques:
+      - "T1059.001: PowerShell (Invoke-Kerberoast execution)"
+      - "T1106: Native API (direct .NET Kerberos API calls)"
+      - "T1558.004: AS-REP Roasting (Rubeus asreproast, GetNPUsers.py)"
+  severity: critical
+  confidence: 90
+  risk_score: 95
+  kill_chain_phase: "Credential Access"
+  data_sources:
+    - "Windows Security Event Log: Process Creation (4688) with command-line logging"
+    - "PowerShell Operational Log: Script Block Logging (4104)"
+  prerequisites:
+    - "Process Creation auditing with command-line logging enabled via GPO"
+    - "PowerShell Script Block Logging enabled via GPO"
+    - "Endpoint Security logs forwarded to Splunk"
+
+  search: |
+    ``` --- BRANCH A: Process Creation (Event 4688) --- ```
+    (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+        (CommandLine="*rubeus*" OR CommandLine="*kerberoast*" OR CommandLine="*asreproast*"
+         OR CommandLine="*GetUserSPNs*" OR CommandLine="*GetNPUsers*"
+         OR CommandLine="*/tgtdeleg*" OR CommandLine="*/rc4opsec*"
+         OR CommandLine="*invoke-kerberoast*" OR CommandLine="*Request-SPNTicket*"
+         OR CommandLine="*Get-DomainSPNTicket*" OR CommandLine="*enctype:rc4*"
+         OR CommandLine="*enctype:rc*")
+    | eval detection_source="Process Creation (4688)"
+    | eval process_name='NewProcessName'
+    | eval cmdline='CommandLine'
+    | eval username='SubjectAccountName')
+
+    OR
+
+    ``` --- BRANCH B: PowerShell Script Block Logging (4104) --- ```
+    (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-PowerShell/Operational"
+        EventCode=4104
+        (ScriptBlockText="*Invoke-Kerberoast*" OR ScriptBlockText="*Request-SPNTicket*"
+         OR ScriptBlockText="*Get-DomainSPNTicket*" OR ScriptBlockText="*KerberosRequestorSecurityToken*"
+         OR ScriptBlockText="*Add-Type*Kerberos*" OR ScriptBlockText="*GetUserSPNs*"
+         OR ScriptBlockText="*asreproast*" OR ScriptBlockText="*GetNPUsers*"
+         OR ScriptBlockText="*rubeus*kerberoast*" OR ScriptBlockText="*tgtdeleg*")
+    | eval detection_source="PowerShell Script Block (4104)"
+    | eval process_name="powershell.exe"
+    | eval cmdline=ScriptBlockText
+    | eval username='SubjectAccountName')
+
+    | eval host_name=coalesce(ComputerName, host)
+    | eval src_ip=coalesce(IpAddress, src_ip)
+    ``` Classify the tool/technique detected ```
+    | eval tool_detected=case(
+        match(lower(cmdline), "rubeus.*kerberoast"),       "Rubeus (kerberoast mode)",
+        match(lower(cmdline), "rubeus.*asreproast"),       "Rubeus (asreproast mode)",
+        match(lower(cmdline), "invoke-kerberoast"),        "PowerSploit/Empire Invoke-Kerberoast",
+        match(lower(cmdline), "request-spnticket"),        "PowerSploit Request-SPNTicket",
+        match(lower(cmdline), "get-domainspnticket"),      "PowerView Get-DomainSPNTicket",
+        match(lower(cmdline), "kerberosrequestorsecuritytoken"), ".NET KerberosRequestorSecurityToken",
+        match(lower(cmdline), "getuserspns"),              "Impacket GetUserSPNs.py",
+        match(lower(cmdline), "getnpusers"),               "Impacket GetNPUsers.py (AS-REP)",
+        match(lower(cmdline), "/tgtdeleg"),                "Rubeus /tgtdeleg (unconstrained delegation abuse)",
+        match(lower(cmdline), "/rc4opsec"),                "Rubeus RC4 OPSEC mode",
+        1==1, "Kerberoasting tool (generic pattern)"
+      )
+    | eval attack_type=if(
+        match(lower(cmdline), "asrep|getnpusers|no-preauth"),
+        "AS-REP Roasting (T1558.004)",
+        "Kerberoasting (T1558.003)"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as execution_count,
+        values(detection_source) as detection_sources,
+        values(tool_detected) as tools_detected,
+        values(attack_type) as attack_types,
+        values(process_name) as processes,
+        values(cmdline) as command_lines,
+        values(host_name) as affected_hosts
+        by username, src_ip
+    | eval mitre_technique="T1558.003/T1558.004"
+    | eval mitre_tactic="Credential Access"
+    | eval alert_name="Kerberoasting Tool Execution Detected"
+    | table first_seen, last_seen, username, src_ip, affected_hosts,
+            tools_detected, attack_types, detection_sources, processes,
+            command_lines, execution_count,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "username"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Kerberoasting Tool Execution — $tools_detected$ on $affected_hosts$"
+        rule_description: >
+          Kerberoasting/AS-REP Roasting tool execution detected on host(s) $affected_hosts$
+          by user $username$ from $src_ip$. Tool(s) identified: $tools_detected$.
+          Attack type: $attack_types$. Detection source: $detection_sources$.
+          Command lines: $command_lines$. This indicates active credential theft
+          targeting Kerberos service account password hashes for offline cracking.
+          Immediately isolate the source host and investigate the user session.
+        severity: critical
+        drilldown_search: >
+          index=wineventlog
+          (ComputerName IN ($affected_hosts$) OR SubjectAccountName="$username$")
+          EventCode IN (4769, 4768, 4688, 4104)
+          | sort _time
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: RC4 TGS Requests from Non-Standard / External Source
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects RC4-encrypted TGS requests originating from:
+#    - Non-domain-joined hosts (no corresponding machine account)
+#    - External/non-RFC1918 IP addresses
+#    - Unusual source ports (Linux Kerberos clients vs Windows)
+#  This is particularly relevant for detecting Impacket-based attacks from
+#  Linux attack boxes and WAN-side Kerberoasting.
+#
+#  Covers      : Remote Kerberoasting from non-standard sources, Impacket attacks
+#  Confidence  : HIGH (85)
+#  Severity    : HIGH
+#  FP Rate     : Low for external sources; Medium for internal non-domain hosts.
+#                Exclude known Linux Kerberos clients (build servers, jump boxes).
+
+rule_6_rc4_tgs_unusual_source:
+  name: "Kerberoasting — RC4 TGS Request from Unusual or External Source"
+  description: >
+    Detects RC4-encrypted TGS requests (Event 4769) originating from IP addresses
+    that are either external (non-RFC1918), from a source port pattern characteristic
+    of Linux Kerberos clients, or where the requesting account last authenticated
+    from a different IP range than the TGS request source. This specifically targets
+    Impacket-based Kerberoasting (GetUserSPNs.py) running from Linux attack hosts,
+    as well as WAN-originating attacks. An external source performing Kerberoasting
+    indicates a serious perimeter breach — the attacker has already obtained valid
+    domain credentials and network access to the domain controllers.
+  mitre:
+    tactic: "Credential Access"
+    technique: T1558.003
+    technique_name: "Steal or Forge Kerberos Tickets: Kerberoasting"
+    related_techniques:
+      - "T1133: External Remote Services (initial access before Kerberoasting)"
+  severity: high
+  confidence: 85
+  risk_score: 85
+  kill_chain_phase: "Credential Access"
+  data_sources:
+    - "Windows Security Event Log on Domain Controllers (Event ID 4769, 4768)"
+  prerequisites:
+    - "Audit Kerberos Service Ticket Operations: Success enabled on all DCs"
+    - "DC Security event logs forwarded to Splunk"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+        TicketEncryptionType="0x17"
+        Status="0x0"
+    | where NOT match(ServiceName, "\\$$")
+    | where ServiceName!="krbtgt"
+    | where NOT match('SubjectAccountName', "\\$$")
+    | where 'SubjectAccountName'!="-"
+    | eval src_ip=replace(IpAddress, "::ffff:", "")
+    ``` Classify source IP as internal or external ```
+    | eval src_classification=case(
+        match(src_ip, "^10\\."),                                   "INTERNAL_10",
+        match(src_ip, "^172\\.(1[6-9]|2[0-9]|3[01])\\."),         "INTERNAL_172",
+        match(src_ip, "^192\\.168\\."),                            "INTERNAL_192",
+        src_ip=="::1" OR src_ip=="127.0.0.1",                     "LOOPBACK",
+        match(src_ip, "^169\\.254\\."),                            "APIPA",
+        1==1,                                                      "EXTERNAL"
+      )
+    ``` Flag sources that are external OR use non-standard source ports ```
+    ``` IpPort > 1023 from a Linux client is normal; fixed ports indicate tools ```
+    | eval is_suspicious_source=case(
+        src_classification=="EXTERNAL", "true",
+        IpPort > 0 AND IpPort < 1024 AND src_classification!="LOOPBACK", "true",
+        1==1, "false"
+      )
+    ``` Also flag internal but non-domain-joined looking sources ```
+    ``` (correlate with dc_ip_list or ad_computers lookup if available) ```
+    | where src_classification=="EXTERNAL" OR is_suspicious_source=="true"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as rc4_tgs_count,
+        dc(ServiceName) as unique_spns,
+        values(ServiceName) as spns_targeted,
+        values(src_classification) as src_classification,
+        values(IpPort) as source_ports,
+        values(ComputerName) as dc_name
+        by 'SubjectAccountName', 'SubjectDomainName', src_ip
+    | eval risk_level=case(
+        src_classification="EXTERNAL", "CRITICAL - External Kerberoasting",
+        unique_spns > 5, "HIGH - Bulk from unusual source",
+        1==1, "HIGH - Unusual source RC4 TGS"
+      )
+    | eval mitre_technique="T1558.003"
+    | eval mitre_tactic="Credential Access"
+    | eval alert_name="Kerberoasting - RC4 TGS from Unusual Source"
+    | table first_seen, last_seen, SubjectAccountName, SubjectDomainName,
+            src_ip, src_classification, source_ports, unique_spns, spns_targeted,
+            rc4_tgs_count, dc_name, risk_level,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "src_ip"
+    period: "2h"
+  actions:
+    - notable_event:
+        rule_title: "Kerberoasting from $src_classification$ source — $SubjectAccountName$ @ $src_ip$"
+        rule_description: >
+          RC4-encrypted TGS ticket request(s) detected from $src_classification$ source
+          IP $src_ip$ (ports: $source_ports$). Requesting account: $SubjectAccountName$@$SubjectDomainName$.
+          SPNs targeted: $spns_targeted$ ($unique_spns$ unique). Risk: $risk_level$.
+          External sources performing Kerberoasting indicate the attacker has obtained
+          valid domain credentials and can reach the Domain Controllers from outside the network.
+        severity: critical
+        drilldown_search: >
+          index=wineventlog EventCode IN (4769, 4768, 4624)
+          (IpAddress="$src_ip$" OR SubjectAccountName="$SubjectAccountName$")
+          | sort _time
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: SPN Enumeration Precursor — LDAP Reconnaissance for Service Accounts
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Before Kerberoasting, the attacker must enumerate service accounts with SPNs.
+#  This is done via LDAP queries for objects with servicePrincipalName=*.
+#  Detecting the enumeration phase allows earlier intervention — before any
+#  tickets are requested. Requires LDAP Query Auditing (Event 1644) or
+#  network-layer LDAP monitoring.
+#
+#  Fallback: Detect the PowerShell/process execution of SPN enumeration tools
+#  when 1644 is not available.
+#
+#  Covers      : SPN enumeration reconnaissance precursor to Kerberoasting
+#  Confidence  : MEDIUM (70)
+#  Severity    : HIGH
+#  FP Rate     : Medium — AD management tools, identity governance platforms,
+#                and monitoring solutions legitimately query SPNs.
+
+rule_7_spn_enumeration_ldap:
+  name: "Kerberoasting Precursor — SPN Enumeration via LDAP or PowerShell/Process"
+  description: >
+    Detects Active Directory LDAP queries enumerating accounts with
+    servicePrincipalName set — the reconnaissance step that precedes Kerberoasting.
+    Attackers use tools like PowerView Get-DomainUser -SPN, Impacket GetUserSPNs.py,
+    ldapsearch, or ADExplorer to identify target accounts before requesting TGS tickets.
+    Detection covers two sources: (1) Event 1644 LDAP diagnostic logging if enabled
+    for filter-based detection of SPN enumeration queries, and (2) process creation
+    and PowerShell logs for known enumeration commands. Early detection at this phase
+    may prevent ticket requests entirely.
+    NOTE: Event 1644 requires LDAP query auditing to be enabled:
+    HKLM\SYSTEM\CurrentControlSet\Services\NTDS\Diagnostics "15 Field Engineering" = 5
+  mitre:
+    tactic: "Discovery, Credential Access"
+    technique: T1087.002
+    technique_name: "Account Discovery: Domain Account"
+    related_techniques:
+      - "T1558.003: Kerberoasting (follows this enumeration)"
+      - "T1069.002: Permission Groups Discovery: Domain Groups"
+  severity: high
+  confidence: 70
+  risk_score: 70
+  kill_chain_phase: "Discovery"
+  data_sources:
+    - "Windows Directory Service Event Log: LDAP Queries (Event 1644)"
+    - "Windows Security Event Log: Process Creation (4688)"
+    - "PowerShell Operational Log: Script Block Logging (4104)"
+  prerequisites:
+    - "LDAP Diagnostic Logging OR Process Creation + PowerShell logging enabled"
+    - "Logs forwarded to Splunk from Domain Controllers and endpoints"
+
+  search: |
+    ``` --- BRANCH A: LDAP Query Audit (Event 1644) if available --- ```
+    (index=wineventlog sourcetype="XmlWinEventLog:Directory Service" EventCode=1644
+        (Filter="*servicePrincipalName*" OR Filter="*SPN*")
+        (Filter="*objectClass=user*" OR Filter="*samAccountType*")
+    | eval detection_source="LDAP Audit (1644)"
+    | eval query_content=Filter
+    | eval querying_host=coalesce(Client, ComputerName))
+
+    OR
+
+    ``` --- BRANCH B: Process / PowerShell SPN Enumeration Commands --- ```
+    (index=wineventlog (sourcetype="XmlWinEventLog:Security" EventCode=4688
+        (CommandLine="*servicePrincipalName*" OR CommandLine="*-SPN*"
+         OR CommandLine="*Get-DomainUser*SPN*" OR CommandLine="*GetUserSPNs*"
+         OR CommandLine="*setspn -L*" OR CommandLine="*setspn -Q*"
+         OR CommandLine="*ldapsearch*servicePrincipalName*"
+         OR CommandLine="*Get-ADUser*ServicePrincipalName*"
+         OR CommandLine="*Get-DomainSPNTicket*"))
+     OR (sourcetype="XmlWinEventLog:Microsoft-Windows-PowerShell/Operational" EventCode=4104
+        (ScriptBlockText="*servicePrincipalName*" OR ScriptBlockText="*Get-DomainUser*SPN*"
+         OR ScriptBlockText="*Get-DomainSPNTicket*" OR ScriptBlockText="*Invoke-Kerberoast*"
+         OR ScriptBlockText="*Get-ADServiceAccount*" OR ScriptBlockText="*setspn*"))
+    | eval detection_source="Process/PowerShell Execution"
+    | eval query_content=coalesce(CommandLine, ScriptBlockText)
+    | eval querying_host=ComputerName)
+
+    | eval username=coalesce('SubjectAccountName', user, "-")
+    | where NOT match(username, "\\$$") AND username!="-"
+    ``` Classify enumeration tool ```
+    | eval enum_tool=case(
+        match(lower(query_content), "invoke-kerberoast|get-domainspnticket"), "PowerSploit Invoke-Kerberoast",
+        match(lower(query_content), "getuserspns"),     "Impacket GetUserSPNs.py",
+        match(lower(query_content), "get-domainuser.*spn"), "PowerView Get-DomainUser",
+        match(lower(query_content), "setspn"),          "setspn.exe built-in",
+        match(lower(query_content), "get-aduser.*spn"), "ActiveDirectory module query",
+        match(lower(query_content), "ldapsearch"),      "ldapsearch (Linux tool)",
+        1==1, "Unknown SPN enumeration"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as enumeration_events,
+        values(detection_source) as detection_sources,
+        values(enum_tool) as tools_used,
+        values(query_content) as queries,
+        values(querying_host) as source_hosts
+        by username
+    | eval mitre_technique="T1087.002"
+    | eval mitre_tactic="Discovery"
+    | eval alert_name="Kerberoasting Precursor - SPN Enumeration"
+    | table first_seen, last_seen, username, source_hosts, tools_used,
+            detection_sources, queries, enumeration_events,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/15 * * * *"
+    earliest: "-20m"
+    latest: "now"
+    window: "15m"
+  throttle:
+    field: "username"
+    period: "4h"
+  actions:
+    - notable_event:
+        rule_title: "Kerberoasting Precursor — SPN Enumeration by $username$ using $tools_used$"
+        rule_description: >
+          Account $username$ performed SPN enumeration on host(s) $source_hosts$ using
+          $tools_used$. Detection source: $detection_sources$. This is the reconnaissance
+          step immediately preceding Kerberoasting — the attacker is identifying service
+          accounts to target for offline password cracking. Correlate with Event 4769
+          TGS requests within the next 60 minutes from the same user or source host.
+        severity: high
+        drilldown_search: >
+          index=wineventlog EventCode IN (4769, 4768, 4688, 4104)
+          SubjectAccountName="$username$"
+          | sort _time
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INVESTIGATION QUERIES
+#  Use these manually in Splunk Search & Reporting for incident response.
+# ══════════════════════════════════════════════════════════════════════════════
+
+investigation_queries:
+
+  # ── IQ-1: Full Kerberoasting Timeline for a Specific User/IP ──────────────
+  #
+  #  Shows all Kerberos events (TGT + TGS requests), process creation, and
+  #  PowerShell execution for a given account or source IP to reconstruct
+  #  the attack timeline. Replace $USERNAME$ and $SRC_IP$ with actual values.
+  #
+  #  Usage: Run over the attack window (e.g., earliest=-24h latest=now)
+
+  iq_1_full_attack_timeline: |
+    index=wineventlog
+        EventCode IN (4768, 4769, 4771, 4688, 4104, 4624, 4625, 4648)
+        (SubjectAccountName="$USERNAME$" OR TargetUserName="$USERNAME$"
+         OR IpAddress="$SRC_IP$" OR IpAddress="::ffff:$SRC_IP$")
+    | eval event_type=case(
+        EventCode="4768", "TGT Request (AS-REQ)",
+        EventCode="4769", "TGS Request (Kerberoasting)",
+        EventCode="4771", "Pre-Auth Failed",
+        EventCode="4688", "Process Created",
+        EventCode="4104", "PowerShell Script Block",
+        EventCode="4624", "Successful Logon",
+        EventCode="4625", "Failed Logon",
+        EventCode="4648", "Explicit Credential Logon",
+        1==1, "Other (EventCode="+EventCode+")"
+      )
+    | eval enc_label=case(
+        TicketEncryptionType="0x17", "RC4 (Kerberoasting!)",
+        TicketEncryptionType="0x12", "AES256",
+        TicketEncryptionType="0x11", "AES128",
+        isnotnull(TicketEncryptionType), TicketEncryptionType,
+        1==1, "-"
+      )
+    | eval detail=coalesce(
+        ServiceName+" ["+enc_label+"]",
+        TargetUserName,
+        CommandLine,
+        ScriptBlockText,
+        "-"
+      )
+    | table _time, EventCode, event_type, ComputerName, IpAddress,
+            SubjectAccountName, TargetUserName, detail,
+            Status, TicketOptions, LogonType
+    | sort _time
+
+  # ── IQ-2: All RC4 TGS Requests in Last 24 Hours ───────────────────────────
+  #
+  #  Provides a full picture of all RC4 TGS requests in the environment over
+  #  the last day. Use to assess scope of ongoing Kerberoasting campaign,
+  #  identify all targeted service accounts, and prioritize password resets.
+
+  iq_2_all_rc4_tgs_24h: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+        TicketEncryptionType="0x17" Status="0x0"
+        earliest=-24h latest=now
+    | where NOT match(ServiceName, "\\$$")
+    | where ServiceName!="krbtgt"
+    | where NOT match('SubjectAccountName', "\\$$")
+    | eval src_ip=replace(IpAddress, "::ffff:", "")
+    | stats
+        count as tgs_count,
+        dc(ServiceName) as unique_spns,
+        values(ServiceName) as spns_targeted,
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        values(src_ip) as source_ips,
+        values(ComputerName) as dc_name
+        by SubjectAccountName, SubjectDomainName
+    | sort - unique_spns, tgs_count
+    | table SubjectAccountName, SubjectDomainName, source_ips, unique_spns,
+            spns_targeted, tgs_count, first_seen, last_seen, dc_name
+
+  # ── IQ-3: Service Account Password Age Analysis (Kerberoasting Risk) ──────
+  #
+  #  Identifies service accounts that have been targeted in TGS requests over
+  #  the last 7 days. Correlate with password age from the AD lookup table to
+  #  prioritize which accounts need immediate password rotation. Accounts with
+  #  old passwords and RC4 support are at the highest risk of successful cracking.
+
+  iq_3_targeted_spn_risk_assessment: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+        Status="0x0"
+        earliest=-7d latest=now
+    | where NOT match(ServiceName, "\\$$")
+    | where ServiceName!="krbtgt"
+    | eval enc_type=case(
+        TicketEncryptionType="0x17", "RC4 (HIGH RISK - fast cracking)",
+        TicketEncryptionType="0x12", "AES256 (lower risk - slow cracking)",
+        TicketEncryptionType="0x11", "AES128 (lower risk)",
+        TicketEncryptionType="0x18", "RC4-EXP (CRITICAL RISK)",
+        1==1, TicketEncryptionType
+      )
+    | stats
+        count as total_tgs_requests,
+        dc(SubjectAccountName) as distinct_requesters,
+        values(enc_type) as encryption_types,
+        min(_time) as first_targeted,
+        max(_time) as last_targeted
+        by ServiceName
+    ``` Join with privileged SPN lookup if available ```
+    | lookup privileged_spn_accounts.csv samaccountname AS ServiceName
+        OUTPUT is_privileged, admin_count, password_last_set, groups
+    | eval cracking_risk=case(
+        match(mvjoin(encryption_types, ","), "RC4.*HIGH") AND admin_count="1",    "CRITICAL",
+        match(mvjoin(encryption_types, ","), "RC4.*HIGH"),                         "HIGH",
+        admin_count="1",                                                           "HIGH",
+        1==1,                                                                      "MEDIUM"
+      )
+    | sort - cracking_risk, total_tgs_requests
+    | table ServiceName, total_tgs_requests, distinct_requesters, encryption_types,
+            first_targeted, last_targeted, is_privileged, admin_count,
+            password_last_set, groups, cracking_risk
+
+  # ── IQ-4: AS-REP Roastable Accounts Audit ────────────────────────────────
+  #
+  #  Identifies which accounts have received AS-REP responses without
+  #  pre-authentication (PreAuthType=0) in the last 30 days. These accounts
+  #  have DONT_REQUIRE_PREAUTH set and should be remediated immediately.
+  #  This is both a detection and a hygiene audit query.
+
+  iq_4_asrep_roastable_accounts: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4768
+        PreAuthType="0" Status="0x0"
+        earliest=-30d latest=now
+    | where NOT match(TargetUserName, "\\$$")
+    | where TargetUserName!="ANONYMOUS LOGON"
+    | eval src_ip=replace(IpAddress, "::ffff:", "")
+    | eval src_type=case(
+        match(src_ip, "^10\\.|^172\\.(1[6-9]|2[0-9]|3[01])\\.|^192\\.168\\."),
+            "INTERNAL",
+        src_ip=="::1", "LOOPBACK",
+        1==1, "EXTERNAL"
+      )
+    | stats
+        count as asrep_count,
+        dc(src_ip) as unique_sources,
+        values(src_ip) as source_ips,
+        values(src_type) as source_types,
+        values(TicketEncryptionType) as enc_types,
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        values(ComputerName) as dc_name
+        by TargetUserName, TargetDomainName
+    | eval remediation="Disable DONT_REQUIRE_PREAUTH flag + reset password immediately"
+    | sort - asrep_count
+    | table TargetUserName, TargetDomainName, asrep_count, unique_sources,
+            source_ips, source_types, enc_types, first_seen, last_seen,
+            dc_name, remediation
+
+  # ── IQ-5: Kerberoasting Attack Chain — Full Correlation ──────────────────
+  #
+  #  Reconstructs the full Kerberoasting kill chain for an attacker session:
+  #  SPN enumeration -> TGT request -> TGS request(s) -> post-exploitation
+  #  logons using cracked credentials. Use after a confirmed Kerberoasting
+  #  incident to trace attacker movement and scope the compromise.
+
+  iq_5_full_kerberoasting_chain: |
+    ``` Step 1: Find confirmed Kerberoasting events in the window ```
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+        TicketEncryptionType="0x17" Status="0x0"
+        earliest="-$WINDOW$" latest=now
+    | where NOT match(ServiceName, "\\$$")
+    | where ServiceName!="krbtgt"
+    | where NOT match('SubjectAccountName', "\\$$")
+    | eval src_ip=replace(IpAddress, "::ffff:", "")
+    | eval phase="2 - TGS Request (Kerberoasting)"
+    | eval key_field=SubjectAccountName
+    | eval detail=ServiceName+" (enc:"+TicketEncryptionType+")"
+    | eval logon_id=SubjectLogonId
+
+    ``` Step 2: Bring in TGT requests from same logon session ```
+    | append [
+        search index=wineventlog EventCode=4768
+            earliest="-$WINDOW$" latest=now
+        | where NOT match(TargetUserName, "\\$$")
+        | eval src_ip=replace(IpAddress, "::ffff:", "")
+        | eval phase="1 - TGT Request (Authentication)"
+        | eval key_field=TargetUserName
+        | eval detail="TGT for "+TargetUserName+" (enc:"+TicketEncryptionType+")"
+        | eval logon_id="-"
+      ]
+
+    ``` Step 3: Bring in post-exploitation logons using targeted service accounts ```
+    | append [
+        search index=wineventlog EventCode=4624
+            SubjectAccountName IN ("$TARGETED_SVC_ACCTS$")
+            earliest="-$WINDOW$" latest=now
+        | eval phase="3 - Post-exploitation Logon (cracked credentials?)"
+        | eval key_field=SubjectAccountName
+        | eval detail="Logon type "+LogonType+" from "+IpAddress
+        | eval src_ip=IpAddress
+      ]
+
+    | sort _time
+    | table _time, phase, key_field, src_ip, ComputerName, detail,
+            logon_id, EventCode, Status
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INCIDENT RESPONSE PLAYBOOK
+#  Follow these steps in order when a Kerberoasting alert is confirmed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+incident_response_playbook:
+
+  trigger_conditions:
+    - "Rule 1 fires: RC4 TGS request for user service account"
+    - "Rule 2 fires: 10+ distinct SPNs requested within 15 minutes"
+    - "Rule 3 fires: Privileged service account (adminCount=1) targeted"
+    - "Rule 4 fires: AS-REP Roasting (PreAuthType=0) detected"
+    - "Rule 5 fires: Kerberoasting tool (Rubeus/Invoke-Kerberoast) executed"
+    - "Rule 6 fires: RC4 TGS request from external or unusual source"
+
+  phase_1_immediate_triage:
+    timeframe: "0-15 minutes"
+    steps:
+      - step: "1.1"
+        action: "Verify alert is not a false positive"
+        detail: >
+          Check if the requesting account or source IP is a known:
+          (a) Vulnerability scanner (Qualys, Nessus, Rapid7) — coordinate with security team
+          (b) PAM solution (CyberArk, BeyondTrust) performing credential checkout
+          (c) Monitoring tool (SCOM, SCCM, Splunk) with legitimate SPN access
+          (d) Legacy application with known RC4 dependency — check your RC4 exclusion list
+          (e) Red team engagement — verify with internal team on change record
+
+      - step: "1.2"
+        action: "Identify scope and attacker foothold"
+        detail: >
+          Run IQ-2 (all RC4 TGS in 24h) and IQ-1 (full timeline for requesting user/IP).
+          Determine:
+          - Total number of SPNs targeted
+          - Which SPNs/service accounts are targeted (prioritize adminCount=1)
+          - Source IP — internal or external? Domain-joined or non-domain?
+          - Requesting user account — legitimate business user or compromised account?
+          - Logon session origin — where did the attacker's Kerberos session originate?
+
+      - step: "1.3"
+        action: "Preserve forensic evidence"
+        detail: >
+          Export and preserve:
+          - All Event 4769 records for the attack window (including all fields)
+          - Event 4768 records from same logon session (use SubjectLogonId correlation)
+          - Event 4624 logon event for the attacking session (how did attacker authenticate?)
+          - Process creation (4688) and PowerShell (4104) events from source host
+          - Capture a Splunk search result export with timestamp and all fields
+
+  phase_2_containment:
+    timeframe: "15-45 minutes"
+    steps:
+      - step: "2.1"
+        action: "Contain the source host"
+        detail: >
+          If the source host is identified and is internal:
+          - Network isolate via EDR (CrowdStrike/Defender for Endpoint contain action)
+          - Apply ACL/VLAN isolation at nearest switch if no EDR
+          - Do NOT shut down the host — preserve volatile memory for forensics if needed
+          CAUTION: Do not isolate if the source is a legitimate monitoring tool.
+
+      - step: "2.2"
+        action: "Disable the attacker's user account (if compromised)"
+        detail: >
+          If the requesting account is confirmed compromised (not the attacker's own account):
+          - Disable via AD Users & Computers or: Disable-ADAccount -Identity $username
+          - Reset the password immediately (25+ character random)
+          - Revoke all active Kerberos sessions: klist purge on any hosts using the account
+          - Coordinate with the account owner before disabling to avoid operational impact
+
+      - step: "2.3"
+        action: "Immediately rotate all targeted service account passwords"
+        detail: >
+          For ALL service accounts that received TGS requests (regardless of RC4/AES):
+          - Reset passwords to 25+ character, randomly generated strings
+          - Document the accounts reset and notify the service/application owners
+          - If the service can use gMSA, schedule migration as a remediation action
+          - For SQL service accounts: update SQL Server service properties, NOT just AD
+          Priority order: adminCount=1 accounts first, then by password age (oldest first)
+          PowerShell: Set-ADAccountPassword -Identity $spn_account -NewPassword (Read-Host -AsSecureString)
+
+  phase_3_investigation:
+    timeframe: "45 minutes - 4 hours"
+    steps:
+      - step: "3.1"
+        action: "Determine if password cracking succeeded"
+        detail: >
+          After Kerberoasting, the attacker takes the encrypted tickets offline to crack.
+          Cracking time depends on password strength and encryption:
+          - RC4 + 8-char password: Minutes on modern GPU
+          - RC4 + complex 12-char: Hours to days
+          - AES256 + any password: Days to weeks (much slower)
+          Check for post-cracking activity:
+          - Event 4624 (logon) for any targeted service accounts from new/unusual IPs
+          - Event 4768 (TGT request) for targeted service accounts from unusual sources
+          - Lateral movement indicators: SMB (Event 4769 with MSSQLSvc or CIFS SPNs)
+          - Any net use, schtasks, or service creation using targeted service account names
+          - Password change events (4723/4724) NOT initiated by IT for targeted accounts
+
+      - step: "3.2"
+        action: "Trace the attacker's initial access"
+        detail: >
+          Kerberoasting requires an authenticated domain session. Determine how attacker obtained it:
+          - Phishing / credential harvesting (check email gateway logs + 4625 spray patterns)
+          - Password spray (many 4771/4625 failures from same source before success)
+          - Credential dump from a previously compromised endpoint
+          - VPN / RDP brute force (check VPN access logs for the attacker's IP)
+          - Supply chain / insider threat
+          Run: index=wineventlog EventCode IN (4624, 4625) IpAddress="$src_ip$" | timechart count
+
+      - step: "3.3"
+        action: "Assess lateral movement from targeted service accounts"
+        detail: >
+          Check each targeted service account for post-Kerberoasting use:
+          - Event 4624 LogonType 3 (network) or 10 (remote interactive) from new hosts
+          - Event 4769 TGS requests made BY the service account (accessing other services)
+          - Event 4648 (explicit credential use) referencing the service account
+          - WMI execution (Event 4624 + 4688 from unusual parent processes)
+          - Scheduled task creation (Event 4698/4702) using service account credentials
+
+  phase_4_remediation:
+    timeframe: "4-24 hours"
+    steps:
+      - step: "4.1"
+        action: "Migrate service accounts to Group Managed Service Accounts (gMSA)"
+        detail: >
+          gMSA accounts have 120-character randomly-generated passwords that auto-rotate
+          every 30 days. They are not vulnerable to Kerberoasting in practice.
+          Identify candidates: Get-ADServiceAccount -Filter *
+          Create gMSA: New-ADServiceAccount -Name "gMSA_svcname" -DNSHostName "server.domain.com"
+          This is the highest-value long-term remediation action.
+
+      - step: "4.2"
+        action: "Disable RC4 Kerberos encryption where possible"
+        detail: >
+          Via GPO (Computer Configuration > Security Settings > Local Policies > Security Options):
+          "Network security: Configure encryption types allowed for Kerberos"
+          Deselect: DES_CBC_CRC, DES_CBC_MD5, RC4_HMAC_MD5
+          Keep: AES128_HMAC_SHA1, AES256_HMAC_SHA1, Future encryption types
+          IMPORTANT: Test in a lab/pilot before enforcing in production.
+          Some legacy applications (SQL 2008, older Java GSSAPI, older Linux Kerberos clients)
+          may break. Identify RC4 dependencies by reviewing Event 4769 logs first.
+          Per-account: Set-ADUser -KerberosEncryptionType AES128,AES256
+
+      - step: "4.3"
+        action: "Remediate AS-REP Roastable accounts (if Rule 4 triggered)"
+        detail: >
+          Run IQ-4 to identify all accounts with DONT_REQUIRE_PREAUTH.
+          For each account:
+          - Remove the DONT_REQUIRE_PREAUTH flag: Set-ADUser $user -DoesNotRequirePreAuth $false
+          - Reset the password immediately
+          - Investigate why the flag was set (was it set by an attacker, misconfiguration, or legacy need?)
+          No legitimate application should require this flag in a modern AD environment.
+
+      - step: "4.4"
+        action: "Apply Protected Users security group to high-privilege accounts"
+        detail: >
+          The Protected Users group prevents RC4 encryption usage, NTLM authentication,
+          Kerberos delegation, and cached credentials for members.
+          Add all Tier 0/Tier 1 accounts (Domain Admins, Enterprise Admins, etc.):
+          Add-ADGroupMember "Protected Users" -Members $privileged_accounts
+          CAUTION: Test thoroughly. Protected Users restrictions are intentionally strict
+          and may break some legacy delegation scenarios.
+
+      - step: "4.5"
+        action: "Enforce minimum password length and complexity for service accounts"
+        detail: >
+          Use Fine-Grained Password Policy (PSO) for service accounts:
+          - Minimum 25 characters
+          - Maximum password age: 365 days (consider 180 days for high-privilege)
+          - Password history: 24
+          Apply via: New-ADFineGrainedPasswordPolicy + Add-ADFineGrainedPasswordPolicySubject
+          Alternatively, use a PAM solution to manage and auto-rotate service account passwords.
+
+  phase_5_post_incident:
+    steps:
+      - step: "5.1"
+        action: "Deploy ongoing monitoring and tune detection rules"
+        detail: >
+          - Schedule the Splunk rules from this file as production scheduled searches
+          - Set up monthly review of RC4 TGS baseline to identify new legitimate consumers
+          - Run IQ-3 (Targeted SPN Risk Assessment) weekly as a hygiene check
+          - Add the attacker's IP addresses to a watchlist for long-term monitoring
+
+      - step: "5.2"
+        action: "Conduct AD service account hygiene audit"
+        detail: >
+          Regularly audit SPN-registered user accounts:
+          - Get-ADUser -Filter {ServicePrincipalName -like "*"} -Properties SPN, adminCount, PasswordLastSet
+          - Identify stale SPNs (accounts that no longer run services but still have SPNs)
+          - Remove unnecessary SPNs: Set-ADUser $acct -ServicePrincipalNames @{Remove="$stale_spn"}
+          - Report on accounts with SPN + adminCount=1 to management for risk acceptance
+
+      - step: "5.3"
+        action: "Consider Microsoft Defender for Identity (MDI) deployment"
+        detail: >
+          MDI provides real-time Kerberoasting detection using machine learning on
+          DC traffic and logs, with lower false positive rates than rule-based detection.
+          It integrates directly with Microsoft Sentinel and Microsoft 365 Defender.
+          If budget allows, MDI is the gold standard for Kerberoasting detection.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# END OF KERBEROASTING ATTACK DETECTION RULES
+# ══════════════════════════════════════════════════════════════════════════════
