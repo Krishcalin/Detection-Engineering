@@ -1,0 +1,720 @@
+# ==============================================================================
+#  NTLM Relay Attack Detection — Splunk Correlation Rules
+# ==============================================================================
+#  MITRE ATT&CK : T1557.001 — Adversary-in-the-Middle: LLMNR/NBT-NS Poisoning
+#                              and SMB Relay
+#                 T1187     — Forced Authentication
+#  Tactic        : Credential Access, Collection, Lateral Movement
+#  Severity      : CRITICAL
+#  Author        : Krishnendu De
+#  Version       : 1.0.0
+#  License       : MIT
+# ==============================================================================
+#
+#  ATTACK OVERVIEW
+#  ---------------
+#  NTLM Relay is a two-stage attack:
+#
+#  Stage 1 — Credential Capture (LLMNR/NBT-NS Poisoning via Responder):
+#    An attacker runs Responder on the local network, which answers LLMNR
+#    (UDP 5355) and NBT-NS (UDP 137) queries for non-existent hostnames.
+#    When a victim machine fails DNS resolution, it broadcasts the name via
+#    LLMNR or NBT-NS; Responder answers, and the victim sends NTLM
+#    authentication to the attacker. The hash is captured but NOT cracked.
+#
+#  Stage 2 — Relay (Impacket ntlmrelayx):
+#    The captured NTLM challenge/response is immediately relayed to a target
+#    machine (SMB, LDAP, MSSQL, HTTP). The target receives a valid auth from
+#    what it believes is the victim machine, and grants access.
+#
+#  High-impact relay targets:
+#    - SMB relay to another machine → remote code execution (smbexec pattern)
+#    - LDAP relay to DC → Resource-Based Constrained Delegation (RBCD) write
+#      (msDS-AllowedToActOnBehalfOfOtherIdentity attribute on computer objects)
+#    - LDAP relay to DC → Adding victim account to privileged group
+#
+#  Core Detection Signals:
+#    1. WorkstationName vs IpAddress mismatch in Event 4624 (LogonType=3, NTLM)
+#       — the relay middleman's IP differs from the claimed hostname
+#    2. Multiple victim accounts authenticating from the same single source IP
+#    3. ANONYMOUS LOGON via NTLM on DC (successful LDAP relay indicator)
+#    4. Event 5136: msDS-AllowedToActOnBehalfOfOtherIdentity written on computer
+#       object (RBCD persistence after relay)
+#    5. Impacket smbexec payload: cmd.exe /Q /c <cmd> 1>\\127.0.0.1\ADMIN$\__
+#    6. Event 4648 with TargetServerName pointing to attacker IP (victim-side)
+#
+#  Key Field Names (XmlWinEventLog:Security):
+#    4624: LogonType, AuthenticationPackageName, LogonProcessName,
+#          TargetUserName, WorkstationName, IpAddress, SubjectUserSid
+#    4648: SubjectUserName, TargetServerName, IpAddress
+#    5136: ObjectDN, AttributeLDAPDisplayName, AttributeValue, OperationType,
+#          SubjectUserName
+#    5140: ShareName, IpAddress, SubjectUserName
+#    5145: ShareName, RelativeTargetName, IpAddress, AccessMask
+#
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Enable Advanced Audit Policy on ALL domain-joined hosts:
+#     Logon/Logoff > "Audit Logon"         -> Success, Failure
+#     Logon/Logoff > "Audit Special Logon" -> Success
+#     Object Access > "Audit File Share"   -> Success, Failure
+#     Object Access > "Audit Detailed File Share" -> Success, Failure
+#     (auditpol /set /subcategory:"Logon" /success:enable /failure:enable)
+#
+#  2. Enable Audit Directory Service Changes on all DCs:
+#     DS Access > "Audit Directory Service Changes" -> Success
+#     (required for Event 5136 — RBCD write detection)
+#
+#  3. Deploy Sysmon on all endpoints with:
+#     - ProcessCreate (Event 1) with CommandLine
+#     - NetworkConnect (Event 3) for outbound SMB/LDAP detection
+#     - DnsQuery (Event 22) for LLMNR fallback inference
+#
+#  4. Forward Security and Sysmon logs from all hosts to Splunk:
+#     sourcetype=XmlWinEventLog:Security
+#     sourcetype=XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+#
+#  5. Lookup tables:
+#     dc_ip_list.csv         — Domain Controller IP addresses
+#     trusted_ntlm_pairs.csv — Known-legitimate WorkstationName/IpAddress pairs
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: WorkstationName vs IpAddress Mismatch — NTLM Relay Middle-Man
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The most reliable NTLM relay indicator. When ntlmrelayx relays credentials,
+#  the NTLM Type 3 message carries the VICTIM's hostname in WorkstationName,
+#  but the actual TCP connection comes from the ATTACKER's relay IP.
+#  In legitimate NTLM auth: IpAddress resolves to the same host as WorkstationName.
+#  In relay: IpAddress is the attacker's machine; WorkstationName is the victim's.
+#
+#  Confidence : HIGH (85)
+#  Severity   : CRITICAL
+
+rule_1_ntlm_relay_ws_ip_mismatch:
+  name: "NTLM Relay — WorkstationName vs Source IP Mismatch (Relay Middle-Man)"
+  mitre_technique: "T1557.001"
+  description: >
+    Detects NTLM relay by identifying Event 4624 (LogonType=3, NTLM) where the
+    WorkstationName in the authentication does not resolve to the same host as
+    IpAddress. In legitimate NTLM logons the source IP belongs to the same
+    machine that claims the WorkstationName. When ntlmrelayx relays credentials,
+    the WorkstationName contains the victim's hostname but IpAddress is the
+    attacker's relay machine.
+  data_sources:
+    - "XmlWinEventLog:Security"
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security"
+        EventCode=4624
+        LogonType="3"
+        AuthenticationPackageName="NTLM"
+        LogonProcessName="NtLmSsp"
+    | where TargetUserName!="ANONYMOUS LOGON"
+          AND NOT match(TargetUserName, "\$$")
+          AND IpAddress!="127.0.0.1"
+          AND IpAddress!="::1"
+          AND IpAddress!=""
+          AND WorkstationName!=""
+    | eval ws_lower=lower(trim(WorkstationName))
+    | lookup dnslookup clientip AS IpAddress OUTPUT clienthost AS ip_resolved
+    | eval ip_resolved_lower=lower(trim(ip_resolved))
+    | where isnotnull(ip_resolved_lower)
+          AND NOT like(ip_resolved_lower, ws_lower+"%")
+          AND NOT like(ws_lower, ip_resolved_lower+"%")
+    | lookup trusted_ntlm_pairs WorkstationName IpAddress OUTPUTNEW is_trusted
+    | where isnull(is_trusted) OR is_trusted!="true"
+    | bin _time span=2m
+    | stats
+        dc(TargetUserName)  as unique_victims
+        values(TargetUserName) as victim_accounts
+        values(ComputerName)   as target_machines
+        values(WorkstationName) as claimed_hosts
+        count
+        by _time IpAddress ip_resolved
+    | where unique_victims >= 1
+    | sort -unique_victims
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    throttle_fields: ["IpAddress"]
+    throttle_period: "300"
+
+  actions:
+    notable:
+      title: "NTLM Relay — IP/Host Mismatch — $IpAddress$ authenticating as $claimed_hosts$"
+      description: >
+        NTLM authentication (LogonType=3) received where source IP $IpAddress$ (resolves
+        to $ip_resolved$) does not match claimed WorkstationName $claimed_hosts$.
+        Victim accounts: $victim_accounts$. This is the primary NTLM relay indicator.
+      severity: "critical"
+      risk_score: 90
+
+  false_positives:
+    - "NAT/PAT environments where many hosts share a single egress IP"
+    - "VPN split-tunneling where the VPN IP differs from the internal hostname"
+    - "Load balancers performing NTLM pre-auth on behalf of backend servers"
+    - "Mitigation: populate trusted_ntlm_pairs.csv with known-good pairs in above scenarios"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Multiple Victim Accounts Authenticating from Same Source IP
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  When ntlmrelayx is relaying multiple victims simultaneously (common when
+#  Responder captures many hosts in an enterprise environment), the same
+#  attacker IP appears as source for NTLM logons of many different accounts.
+#  One IP = one relay operator; many NTLM sessions = many captured creds.
+#
+#  Confidence : HIGH (88)
+#  Severity   : CRITICAL
+
+rule_2_multi_victim_single_source:
+  name: "NTLM Relay — Multiple Victim Accounts from Single Source IP (Relay Spray)"
+  mitre_technique: "T1557.001"
+  description: >
+    Detects NTLM relay by identifying a single source IP that authenticates as
+    3 or more distinct user accounts via NTLM (LogonType=3) within a 5-minute
+    window. A legitimate user's workstation authenticates as one account; a relay
+    machine authenticates as every victim whose credentials pass through it.
+  data_sources:
+    - "XmlWinEventLog:Security"
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security"
+        EventCode=4624
+        LogonType="3"
+        AuthenticationPackageName="NTLM"
+    | where TargetUserName!="ANONYMOUS LOGON"
+          AND NOT match(TargetUserName, "\$$")
+          AND IpAddress!="127.0.0.1"
+          AND IpAddress!="::1"
+    | bin _time span=5m
+    | stats
+        dc(TargetUserName)    as unique_accounts
+        values(TargetUserName) as accounts
+        values(WorkstationName) as claimed_hosts
+        values(ComputerName)    as target_machines
+        count
+        by _time IpAddress
+    | where unique_accounts >= 3
+    | eval relay_confidence=case(
+          unique_accounts >= 10, "CRITICAL",
+          unique_accounts >= 5,  "HIGH",
+          unique_accounts >= 3,  "MEDIUM-HIGH",
+          true(), "MEDIUM")
+    | sort -unique_accounts
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    throttle_fields: ["IpAddress"]
+    throttle_period: "600"
+
+  actions:
+    notable:
+      title: "NTLM Relay — $unique_accounts$ victim accounts from $IpAddress$"
+      description: >
+        Source IP $IpAddress$ authenticated as $unique_accounts$ distinct accounts via
+        NTLM in 5 minutes: $accounts$. Target machines: $target_machines$.
+        Relay confidence: $relay_confidence$.
+      severity: "critical"
+      risk_score: 88
+
+  false_positives:
+    - "Jump servers or Citrix/RDS farms where many users connect from a shared IP"
+    - "Service accounts performing batch operations"
+    - "Mitigation: whitelist known jump server and RDS farm IPs via lookup"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: ANONYMOUS LOGON via NTLM on DC — Successful LDAP Relay Indicator
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  When ntlmrelayx relays NTLM to LDAP on a DC without session signing enforced,
+#  the DC logs an ANONYMOUS LOGON for the session. This is because the relayed
+#  NTLM authentication is accepted without the SIGN and SEAL flags, causing the
+#  DC's LDAP server to treat the identity assertion as untrusted and log it as
+#  ANONYMOUS. This is a high-fidelity indicator of successful LDAP relay.
+#
+#  Confidence : HIGH (92)
+#  Severity   : CRITICAL
+
+rule_3_anonymous_ntlm_on_dc:
+  name: "NTLM LDAP Relay — ANONYMOUS LOGON via NTLM on Domain Controller"
+  mitre_technique: "T1557.001"
+  description: >
+    Detects successful LDAP relay by identifying Event 4624 with
+    TargetUserName=ANONYMOUS LOGON, LogonType=3, and NTLM authentication on a
+    Domain Controller. This pattern occurs when ntlmrelayx successfully relays
+    credentials to LDAP without signing enforcement, causing the DC to record
+    the session as anonymous. Extremely rare in legitimate environments.
+  data_sources:
+    - "XmlWinEventLog:Security"
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security"
+        EventCode=4624
+        TargetUserName="ANONYMOUS LOGON"
+        LogonType="3"
+        AuthenticationPackageName="NTLM"
+    | where IpAddress!="127.0.0.1"
+          AND IpAddress!="::1"
+          AND IpAddress!=""
+    | lookup dc_ip_list src_ip AS ComputerName_ip OUTPUTNEW is_dc
+    | eval is_dc=if(
+          match(ComputerName, "(?i)dc|domain|pdc"), "true", is_dc)
+    | table _time ComputerName IpAddress WorkstationName LogonType
+              AuthenticationPackageName TargetUserName SubjectUserSid
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    throttle_fields: ["IpAddress", "ComputerName"]
+    throttle_period: "600"
+
+  actions:
+    notable:
+      title: "CRITICAL: ANONYMOUS NTLM Logon on DC $ComputerName$ from $IpAddress$"
+      description: >
+        ANONYMOUS LOGON via NTLM (LogonType=3) detected on DC $ComputerName$ from
+        source IP $IpAddress$. This is a high-confidence indicator of successful LDAP
+        relay via ntlmrelayx. The attacker may now be writing RBCD or group modifications.
+      severity: "critical"
+      risk_score: 95
+
+  false_positives:
+    - "Legacy applications connecting to LDAP with anonymous binds (rare in modern AD)"
+    - "Network scanners or vulnerability scanners probing LDAP (check IpAddress against scanner list)"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: RBCD Write After NTLM Relay — msDS-AllowedToActOnBehalfOfOtherIdentity
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The most common post-relay persistence action: ntlmrelayx writes
+#  msDS-AllowedToActOnBehalfOfOtherIdentity on a target computer object,
+#  granting the attacker-controlled machine the ability to impersonate any
+#  user to that computer (RBCD). This is captured by Event 5136.
+#
+#  Confidence : HIGH (95)
+#  Severity   : CRITICAL
+
+rule_4_rbcd_write_after_relay:
+  name: "NTLM Relay — RBCD Write: msDS-AllowedToActOnBehalfOfOtherIdentity Modified"
+  mitre_technique: "T1557.001"
+  description: >
+    Detects Resource-Based Constrained Delegation (RBCD) configuration written by
+    ntlmrelayx after a successful LDAP relay. Event 5136 fires when
+    msDS-AllowedToActOnBehalfOfOtherIdentity is written on a computer object.
+    After this write, the attacker can use S4U2Self + S4U2Proxy to impersonate
+    any domain user (including Domain Admin) to the target computer.
+  data_sources:
+    - "XmlWinEventLog:Security"
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security"
+        EventCode=5136
+        AttributeLDAPDisplayName="msDS-AllowedToActOnBehalfOfOtherIdentity"
+        OperationType="%%14675"
+    | where match(ObjectDN, "CN=.*,CN=Computers,DC=|CN=.*,OU=.*,DC=")
+    | eval target_computer=replace(ObjectDN, "CN=([^,]+),.*", "\1")
+    | table _time ComputerName SubjectUserName SubjectDomainName SubjectLogonId
+              ObjectDN target_computer AttributeValue OperationType
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    throttle_fields: ["SubjectUserName", "ObjectDN"]
+    throttle_period: "3600"
+
+  actions:
+    notable:
+      title: "CRITICAL: RBCD Written on $target_computer$ by $SubjectUserName$"
+      description: >
+        msDS-AllowedToActOnBehalfOfOtherIdentity was written on computer object
+        $ObjectDN$ by $SubjectUserName$. This RBCD delegation attribute enables full
+        impersonation of any user to $target_computer$. Typically written immediately
+        after a successful NTLM LDAP relay.
+      severity: "critical"
+      risk_score: 97
+
+  false_positives:
+    - "Intentional RBCD configuration by administrators (requires change ticket)"
+    - "Identity management tools configuring Kerberos constrained delegation"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Impacket smbexec Payload — Remote Code Execution via Relay
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  When ntlmrelayx performs SMB relay with remote command execution (--execute),
+#  it uses the Impacket smbexec technique: create a service that runs a cmd.exe
+#  command redirecting output to \\127.0.0.1\ADMIN$\__<epoch>. This hardcoded
+#  pattern is a near-zero FP indicator of Impacket-based lateral movement.
+#
+#  Confidence : HIGH (95)
+#  Severity   : CRITICAL
+
+rule_5_impacket_smbexec_payload:
+  name: "NTLM Relay — Impacket smbexec Remote Code Execution Pattern"
+  mitre_technique: "T1557.001"
+  description: >
+    Detects Impacket's smbexec execution pattern generated when ntlmrelayx relays
+    SMB credentials and runs commands on the target. smbexec creates a temporary
+    service via SCM that executes cmd.exe with output redirected to
+    \\127.0.0.1\ADMIN$\__<timestamp>. The parent process (services.exe) + this
+    specific CommandLine pattern has near-zero false positive rate.
+  data_sources:
+    - "XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    - "XmlWinEventLog:Security"
+  search: |
+    (
+        sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+        OR
+        sourcetype="XmlWinEventLog:Security" EventCode=4688
+    )
+    | eval process_image=coalesce(Image, NewProcessName)
+    | eval parent_image=coalesce(ParentImage, ParentProcessName)
+    | eval cmdline=coalesce(CommandLine)
+    | eval actor=coalesce(User, SubjectUserName)
+    | where match(lower(process_image), "cmd\.exe$")
+          AND match(lower(parent_image), "services\.exe$")
+          AND match(lower(cmdline), "cmd\.exe\s+/q\s+/c\s+.+1>\\\\127\.0\.0\.1\\\\admin\$\\\\__")
+    | table _time ComputerName actor process_image parent_image cmdline ProcessId
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    throttle_fields: ["ComputerName"]
+    throttle_period: "300"
+
+  actions:
+    notable:
+      title: "CRITICAL: Impacket smbexec RCE on $ComputerName$ — NTLM Relay Confirmed"
+      description: >
+        Impacket smbexec command execution pattern detected on $ComputerName$.
+        cmd.exe spawned from services.exe with \\127.0.0.1\ADMIN$\__ output
+        redirection — definitive indicator of NTLM relay → remote code execution.
+        Actor: $actor$. Command: $cmdline$.
+      severity: "critical"
+      risk_score: 99
+
+  false_positives:
+    - "Legitimate Impacket use in penetration testing engagements (require change ticket)"
+    - "No known legitimate use of this exact command pattern in production environments"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Credential Sent to Rogue Server — Victim-Side Event 4648
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  On the VICTIM machine, Event 4648 fires when Windows sends NTLM credentials
+#  to an external server. When LLMNR/NBT-NS poisoning causes the victim to
+#  authenticate to the attacker's Responder server, TargetServerName will
+#  contain the attacker's hostname/IP — not a legitimate internal server.
+#
+#  Confidence : MEDIUM-HIGH (75)
+#  Severity   : HIGH
+
+rule_6_victim_credential_sent_to_rogue:
+  name: "NTLM Credential Sent to Suspicious Host — Possible Responder/LLMNR Capture"
+  mitre_technique: "T1557.001"
+  description: >
+    Detects Event 4648 (explicit credential use) where TargetServerName resolves
+    to an IP that is not a known domain server — indicating the victim machine
+    sent NTLM credentials to an attacker-controlled rogue server. This is the
+    victim-side indicator of LLMNR/NBT-NS poisoning via Responder.
+  data_sources:
+    - "XmlWinEventLog:Security"
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security"
+        EventCode=4648
+    | where IpAddress!="127.0.0.1"
+          AND IpAddress!="::1"
+          AND IpAddress!=""
+          AND NOT match(IpAddress, "^$")
+    | lookup dc_ip_list src_ip AS IpAddress OUTPUTNEW is_dc
+    | lookup trusted_servers server_ip AS IpAddress OUTPUTNEW is_trusted
+    | where isnull(is_dc) AND isnull(is_trusted)
+    | bin _time span=5m
+    | stats
+        dc(IpAddress) as unique_rogue_ips
+        values(IpAddress) as rogue_ips
+        values(TargetServerName) as target_servers
+        values(SubjectUserName) as affected_users
+        count
+        by _time ComputerName
+    | where unique_rogue_ips >= 1
+    | sort -count
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    throttle_fields: ["ComputerName"]
+    throttle_period: "600"
+
+  actions:
+    notable:
+      title: "Credential Sent to Unknown Host — $ComputerName$ — Possible LLMNR Poisoning"
+      description: >
+        $ComputerName$ sent NTLM credentials (Event 4648) to unknown/untrusted IP(s):
+        $rogue_ips$ (claimed servers: $target_servers$).
+        Affected accounts: $affected_users$. Investigate for Responder/LLMNR poisoning.
+      severity: "high"
+      risk_score: 75
+
+  false_positives:
+    - "Legitimate connections to new servers not yet in trusted_servers.csv"
+    - "Cloud-hosted services with IP ranges not in internal lists"
+    - "Mitigation: maintain trusted_servers.csv with all legitimate internal server IPs"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: NTLM Relay Kill Chain — Relay Logon + RBCD Write Correlated
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Correlates the complete NTLM LDAP relay kill chain: ANONYMOUS LOGON on DC
+#  (Rule 3) followed by RBCD write (Rule 4) within 10 minutes from the same
+#  source IP. Both stages together = confirmed, successful LDAP relay attack.
+#
+#  Confidence : HIGH (97)
+#  Severity   : CRITICAL
+
+rule_7_relay_kill_chain:
+  name: "NTLM Relay Kill Chain — ANONYMOUS LOGON + RBCD Write Correlated"
+  mitre_technique: "T1557.001"
+  description: >
+    Correlates two stages of an NTLM LDAP relay attack within 10 minutes:
+    (1) ANONYMOUS LOGON via NTLM on a DC (Event 4624) followed by
+    (2) msDS-AllowedToActOnBehalfOfOtherIdentity RBCD write (Event 5136).
+    The combination with the same source IP is a definitive relay indicator.
+  data_sources:
+    - "XmlWinEventLog:Security"
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" earliest=-1h
+    | eval stage=case(
+          EventCode="4624"
+              AND TargetUserName="ANONYMOUS LOGON"
+              AND LogonType="3"
+              AND AuthenticationPackageName="NTLM"
+              AND IpAddress!="127.0.0.1",    "RELAY_ANON_LOGON",
+          EventCode="5136"
+              AND AttributeLDAPDisplayName="msDS-AllowedToActOnBehalfOfOtherIdentity",
+                                              "RBCD_WRITE",
+          true(), null())
+    | where isnotnull(stage)
+    | eval source_ip=coalesce(IpAddress, "")
+    | bin _time span=10m
+    | stats
+        dc(stage) as stage_count
+        values(stage) as stages
+        values(ObjectDN) as rbcd_targets
+        values(SubjectUserName) as actors
+        by _time ComputerName source_ip
+    | where stage_count >= 2
+          AND mvfind(stages, "RELAY_ANON_LOGON") >= 0
+          AND mvfind(stages, "RBCD_WRITE") >= 0
+    | table _time ComputerName source_ip actors stage_count stages rbcd_targets
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-20m"
+    latest: "now"
+    throttle_fields: ["source_ip", "ComputerName"]
+    throttle_period: "3600"
+
+  actions:
+    notable:
+      title: "CRITICAL: NTLM Relay Kill Chain — LDAP Relay + RBCD on $ComputerName$"
+      description: >
+        Complete NTLM LDAP relay kill chain detected: ANONYMOUS LOGON followed by RBCD
+        write on $ComputerName$ from source $source_ip$.
+        RBCD targets: $rbcd_targets$. Actors: $actors$.
+        The attacker can now impersonate any user to the target computers.
+      severity: "critical"
+      risk_score: 99
+
+  false_positives:
+    - "Extremely rare — this two-stage pattern has no legitimate use case"
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES — Run manually during incident response
+# ==============================================================================
+
+investigation_queries:
+
+  # --- IQ-1: Full NTLM relay attack timeline from suspect relay IP ---
+  iq_1_relay_ip_timeline:
+    description: >
+      Complete timeline of all authentication events from the identified relay IP.
+      Shows which accounts were relayed and to which target machines.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode IN (4624, 4648, 5136, 5140, 5145)
+          IpAddress="$relay_ip$"
+      | eval event_type=case(
+            EventCode="4624", "Logon Success (".LogonType.")",
+            EventCode="4648", "Explicit Cred Use",
+            EventCode="5136", "AD Object Write",
+            EventCode="5140", "Share Access",
+            EventCode="5145", "Share Object Access",
+            true(), "Other")
+      | eval target=coalesce(TargetUserName, SubjectUserName, ObjectDN, ShareName)
+      | table _time EventCode event_type ComputerName target AttributeLDAPDisplayName
+                AttributeValue AccessMask
+      | sort _time
+
+  # --- IQ-2: All NTLM logons from all sources — relay pattern analysis ---
+  iq_2_ntlm_logon_source_analysis:
+    description: >
+      Identify all source IPs with anomalous numbers of distinct NTLM victim accounts.
+      Use to discover undiscovered relay sources.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode=4624
+          LogonType="3"
+          AuthenticationPackageName="NTLM"
+      | where NOT match(TargetUserName, "\$$")
+            AND TargetUserName!="ANONYMOUS LOGON"
+      | bin _time span=15m
+      | stats
+          dc(TargetUserName) as unique_accounts
+          values(TargetUserName) as accounts
+          values(WorkstationName) as claimed_hosts
+          by _time IpAddress ComputerName
+      | where unique_accounts >= 2
+      | sort -unique_accounts
+
+  # --- IQ-3: RBCD audit — all computer objects with this attribute set ---
+  iq_3_rbcd_audit:
+    description: >
+      Review all Event 5136 entries for RBCD writes in last 30 days.
+      Identify which computer accounts have this delegation configured.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode=5136
+          AttributeLDAPDisplayName="msDS-AllowedToActOnBehalfOfOtherIdentity"
+      earliest=-30d
+      | table _time SubjectUserName SubjectDomainName ObjectDN AttributeValue OperationType ComputerName
+      | sort _time
+
+  # --- IQ-4: Post-relay activity — what did the attacker do after relay? ---
+  iq_4_post_relay_activity:
+    description: >
+      After identifying a relay IP, find all subsequent actions on the target
+      machines that received relayed logons.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode IN (4720, 4722, 4728, 4732, 4756, 5137, 5140, 4648)
+          IpAddress="$relay_ip$"
+      | eval action=case(
+            EventCode="4720", "Account Created",
+            EventCode="4722", "Account Enabled",
+            EventCode IN ("4728","4732","4756"), "Group Membership Added",
+            EventCode="5137", "AD Object Created",
+            EventCode="5140", "Share Accessed",
+            EventCode="4648", "Credential Use",
+            true(), "Other")
+      | table _time ComputerName action EventCode TargetUserName SubjectUserName
+                ShareName ObjectDN MemberName
+      | sort _time
+
+  # --- IQ-5: LLMNR fallback evidence — DNS vs SMB connection timing ---
+  iq_5_llmnr_fallback_evidence:
+    description: >
+      Detect LLMNR poisoning by finding hosts that made SMB connections (Sysmon 3)
+      to a suspect IP without a preceding DNS query for the target name.
+    search: |
+      index=sysmon sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=3
+          DestinationPort=445
+          DestinationIp="$relay_ip$"
+      | eval smb_host=ComputerName, smb_time=_time
+      | join type=left ComputerName [
+          search index=sysmon
+              sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+              EventCode=22 earliest=-1h
+          | stats max(_time) as last_dns by ComputerName QueryName
+        ]
+      | where isnull(last_dns) OR (smb_time - last_dns) > 30
+      | eval llmnr_likely=if(isnull(last_dns), "YES - no DNS query found", "POSSIBLE - DNS was stale")
+      | table smb_time ComputerName DestinationIp DestinationPort llmnr_likely QueryName
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+incident_response_playbook:
+
+  trigger: "Rule 3 (ANONYMOUS LOGON) or Rule 7 (kill chain) alert"
+
+  step_1_immediate_triage:
+    - "Identify the relay source IP (IpAddress field) — which machine is running ntlmrelayx?"
+    - "Run IQ-1 to see full timeline of what the relay IP has done"
+    - "Check if Rule 4 (RBCD write) or Rule 5 (smbexec) also fired — indicates active exploitation"
+    - "Determine which user accounts were relayed (victim accounts)"
+
+  step_2_scope_assessment:
+    - "Run IQ-2 to identify any additional relay IPs not yet flagged"
+    - "Run IQ-3 to audit all RBCD writes — computer accounts compromised"
+    - "Run IQ-4 to identify all post-relay actions (group changes, account creation, share access)"
+    - "Check if a privileged account was relayed (Domain Admin, Enterprise Admin)"
+
+  step_3_containment:
+    - "Isolate the relay machine (identified by relay source IP) from the network"
+    - "If RBCD was written (Rule 4): immediately remove the attribute from affected computer objects:
+        Set-ADComputer -Identity 'TARGET$' -Clear msDS-AllowedToActOnBehalfOfOtherIdentity"
+    - "Reset passwords for ALL relayed victim accounts"
+    - "If smbexec fired (Rule 5): isolate the target machine and forensically image it"
+    - "Enable LDAP signing enforcement to prevent future relay:
+        GPO: Domain Controller: LDAP server signing requirements = Require signing"
+    - "Enable SMB signing to prevent SMB relay:
+        GPO: Microsoft network server: Digitally sign communications = Always"
+
+  step_4_eradication:
+    - "Remove Responder/ntlmrelayx from the identified relay machine"
+    - "Investigate how the attacker gained access to the relay machine"
+    - "Disable LLMNR domain-wide:
+        GPO: Computer Config > Admin Templates > Network > DNS Client: Turn off multicast name resolution = Enabled"
+    - "Disable NBT-NS via DHCP options or GPO registry key"
+    - "Audit all computer objects for msDS-AllowedToActOnBehalfOfOtherIdentity (IQ-3)"
+
+  step_5_recovery:
+    - "Re-enable affected accounts after password reset"
+    - "Deploy LDAP signing and channel binding enforcement on all DCs"
+    - "Test that LDAP signing enforcement does not break legacy applications"
+    - "Monitor for 24 hours post-remediation for relay re-attempts"
+
+  step_6_lessons_learned:
+    - "Deploy SMB signing on ALL domain members (not just DCs) — prevents SMB relay entirely"
+    - "Enable Extended Protection for Authentication (EPA) on LDAP"
+    - "Implement network segmentation — workstations should not be able to reach each other on SMB"
+    - "Deploy Microsoft Defender for Identity (MDI) — dedicated NTLM relay detections"
+    - "Run Purple Team exercise: deploy Responder + ntlmrelayx in a lab to validate these rules fire"
+
+# ==============================================================================
+#  LOOKUP TABLES REQUIRED
+# ==============================================================================
+lookup_tables:
+  - name: "dc_ip_list.csv"
+    fields: ["src_ip", "is_dc"]
+    description: "All Domain Controller IP addresses"
+
+  - name: "trusted_ntlm_pairs.csv"
+    fields: ["WorkstationName", "IpAddress", "is_trusted"]
+    description: "Known-legitimate WorkstationName/IpAddress combinations (NAT, VPN, RDS farms)"
+
+  - name: "trusted_servers.csv"
+    fields: ["server_ip", "is_trusted"]
+    description: "All internal server IPs — used to exclude legitimate Event 4648 targets"

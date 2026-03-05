@@ -1,0 +1,1088 @@
+# ==============================================================================
+#  Privileged Group Membership Modification Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for Active Directory privileged group
+#                membership tampering (T1098.001). Covers all three group-type
+#                events (global/local/universal), direct LDAP writes (Event 5136),
+#                group creation mimicry, and AdminSDHolder ACL abuse. Correlates
+#                group membership events with logon context, time-of-day
+#                anomalies, and bulk-escalation patterns to distinguish attacker
+#                activity from legitimate IT operations.
+#
+#                Attack path: Attacker gains foothold → escalates to DA/EA/SA
+#                by adding a controlled account directly to a privileged group,
+#                nesting a controlled group inside a privileged group, or
+#                modifying the AdminSDHolder ACL so SDProp propagates covert
+#                access rights to all protected objects.
+#
+#  MITRE ATT&CK: T1098.001 - Account Manipulation: Additional Cloud Credentials
+#                              (covers AD group membership manipulation)
+#                T1078.002 - Valid Accounts: Domain Accounts (persistence via DA)
+#                T1136.002 - Create Account: Domain Account (new group creation)
+#  Kill Chain   : Privilege Escalation → Persistence → Lateral Movement
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-04
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES (must be configured BEFORE these rules generate detections):
+#
+#  1. Enable Audit Policy on all Domain Controllers:
+#     Computer Configuration > Windows Settings > Security Settings >
+#       Advanced Audit Policy Configuration > Audit Policies >
+#         Account Management >
+#           "Audit Security Group Management" → Enable SUCCESS and FAILURE
+#         DS Access >
+#           "Audit Directory Service Changes" → Enable SUCCESS only
+#           "Audit Directory Service Access" → Enable SUCCESS only (for 4662)
+#
+#  2. Configure SACLs on the AdminSDHolder object for 4662 coverage:
+#     ADSI Edit → CN=AdminSDHolder,CN=System,DC=domain,DC=com →
+#       Properties > Security > Advanced > Auditing > Add:
+#       Principal: Everyone
+#       Type: Success
+#       Applies to: This object only
+#       Permissions: Write All Properties, Modify Permissions, Modify Owner
+#
+#  3. Configure SACLs on privileged group objects for 4662 / 5136:
+#     In AD Users and Computers (advanced view), right-click each privileged
+#     group > Properties > Security > Advanced > Auditing > Add:
+#       Principal: Everyone  |  Type: Success
+#       Applies to: This object only
+#       Permissions: Write Members (member attribute)
+#
+#  4. Ensure Domain Controllers forward Security event logs to Splunk
+#     via Universal Forwarder with sourcetype=XmlWinEventLog:Security
+#
+# ==============================================================================
+#
+#  FIELD REFERENCE — Windows Security Event XML fields as seen in Splunk
+#  (XmlWinEventLog:Security sourcetype, Splunk Add-on for Microsoft Windows)
+#
+#  Events 4728 / 4732 / 4756 (Member Added to Security Group)
+#  -----------------------------------------------------------------------
+#  Field Name             | Description
+#  ---------------------- | -----------------------------------------------
+#  SubjectUserName        | Account that performed the change (actor)
+#  SubjectDomainName      | Domain of the actor account
+#  SubjectLogonId         | Logon session ID (hex) — links to Event 4624
+#  SubjectUserSid         | SID of the actor
+#  MemberName             | Distinguished Name (DN) of the added member
+#                         |   e.g. CN=jsmith,OU=Users,DC=corp,DC=com
+#                         |   May be "-" if member is not a user object
+#  MemberSid              | SID of the added member account/group
+#  TargetUserName         | Name of the GROUP being modified (destination group)
+#  TargetDomainName       | Domain of the group being modified
+#  TargetSid              | SID of the group being modified
+#  PrivilegeList          | Privileges list (usually "-" for group events)
+#  EventCode              | 4728 = global group, 4732 = local group,
+#                         |   4756 = universal group
+#
+#  Events 4727 / 4731 / 4754 (Security Group Created)
+#  -----------------------------------------------------------------------
+#  SubjectUserName        | Creator account name
+#  SubjectDomainName      | Creator domain
+#  TargetUserName         | Name of the newly created group
+#  TargetDomainName       | Domain of the new group
+#  TargetSid              | SID assigned to the new group
+#  SamAccountName         | SAM name of the new group
+#  GroupType              | Group type bitmask (e.g. -2147483646 = global)
+#
+#  Events 4735 / 4737 / 4755 (Security Group Changed)
+#  -----------------------------------------------------------------------
+#  SubjectUserName        | Account that changed the group
+#  TargetUserName         | Group that was changed
+#  SamAccountName         | New SAM name (populated if renamed)
+#  GroupType              | New group type (populated if type changed)
+#  Description            | New description (populated if description changed)
+#
+#  Event 5136 (Directory Service Object Modified — LDAP level)
+#  -----------------------------------------------------------------------
+#  SubjectUserName        | Account that performed the LDAP write
+#  SubjectDomainName      | Domain of the actor
+#  OpCorrelationID        | Correlates multiple 5136s in one LDAP operation
+#  DSName                 | Directory service name (FQDN)
+#  ObjectDN               | Distinguished Name of the modified object
+#  ObjectClass            | Object class (e.g. "group")
+#  AttributeLDAPDisplayName | Attribute modified (e.g. "member", "nTSecurityDescriptor")
+#  AttributeValue         | New attribute value (DN of member being added/removed)
+#  OperationType          | "Value Added" or "Value Deleted"
+#
+#  Event 4662 (Object Operation — SACL-based)
+#  -----------------------------------------------------------------------
+#  SubjectUserName        | Account that accessed/modified the object
+#  Object_Name            | Distinguished Name of the object accessed
+#  Properties             | GUIDs of properties accessed/modified
+#  Access_Mask            | Access type bitmask (0x20 = WriteProperty)
+#  Object_Type            | GUID of the object class
+#
+# ==============================================================================
+#
+#  PRIVILEGED GROUP SID REFERENCE
+#  -----------------------------------------------------------------------
+#  Group Name                | Well-Known SID or RID
+#  ------------------------- | ----------------------------------------
+#  Administrators            | S-1-5-32-544
+#  Account Operators         | S-1-5-32-548
+#  Server Operators          | S-1-5-32-549
+#  Print Operators           | S-1-5-32-550
+#  Backup Operators          | S-1-5-32-551
+#  Remote Management Users   | S-1-5-32-580
+#  Domain Admins             | S-1-5-21-<domain>-512
+#  Domain Controllers        | S-1-5-21-<domain>-516
+#  Schema Admins             | S-1-5-21-<domain>-518  (root domain only)
+#  Enterprise Admins         | S-1-5-21-<domain>-519  (root domain only)
+#  Group Policy Creator Owners | S-1-5-21-<domain>-520
+#  DnsAdmins                 | non-default, typically S-1-5-21-<domain>-1101
+#
+#  Well-known SID prefix S-1-5-32 = BUILTIN hive (same across all domains)
+#  Domain-specific SIDs: replace <domain> with domain SID base
+#
+# ==============================================================================
+#
+#  EVENT ROUTING BY GROUP TYPE
+#  -----------------------------------------------------------------------
+#  Group Type                | Member Added Event | Group Created Event | Group Changed
+#  ------------------------- | ----------------- | ------------------- | ------------
+#  Global Security Group     | 4728              | 4727                | 4737
+#  Local/Domain-Local Secgrp | 4732              | 4731                | 4735
+#  Universal Security Group  | 4756              | 4754                | 4755
+#
+#  Domain Admins → Global Security Group → Event 4728
+#  Administrators (BUILTIN) → Local Security Group → Event 4732
+#  Enterprise Admins, Schema Admins → Universal Security Group → Event 4756
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: Member Added to Privileged Security Group (All Types)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Core detection — covers group-type-aware events for all built-in privileged
+#  groups. Correlates with Event 4624 to capture source IP and logon type.
+#  The combined filter covers global (4728), local (4732), and universal (4756).
+#
+#  Confidence  : HIGH
+#  Severity    : HIGH to CRITICAL (depending on target group)
+#  FP Rate     : Medium — legitimate provisioning generates this event
+#  Tools caught: net group "Domain Admins" /add, Add-DomainGroupMember,
+#                New-ADGroupMember, ldifde, dsmod group, ADUC GUI
+
+rule_1_privileged_group_member_added:
+  name: "AD Privileged Group — Member Addition Detected"
+  description: >
+    Detects any account being added to a high-value Active Directory security
+    group. Monitors Events 4728 (global), 4732 (local), and 4756 (universal)
+    and fires for built-in privileged groups plus Domain Admins, Enterprise
+    Admins, Schema Admins, and DnsAdmins. Correlates with Event 4624 to
+    obtain the source IP address and logon type of the actor session.
+    Severity is elevated when changes occur outside business hours or when
+    the actor account is not a known privileged management account.
+  mitre:
+    tactic: Privilege Escalation
+    technique: T1098.001
+    technique_name: "Account Manipulation: Additional Cloud Credentials"
+    related: "T1078.002 - Valid Accounts: Domain Accounts"
+  severity: high
+  confidence: 85
+  risk_score: 75
+  kill_chain_phase: "Privilege Escalation"
+  data_sources:
+    - "Windows Security Event Log (EventCode 4728, 4732, 4756)"
+    - "Windows Security Event Log (EventCode 4624)"
+  prerequisites:
+    - "Audit Security Group Management — SUCCESS enabled on all DCs"
+    - "Security event logs forwarded to Splunk from all DCs"
+
+  # --- Splunk SPL Query ---
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security"
+        EventCode IN (4728, 4732, 4756)
+    ```Filter to monitored privileged groups only```
+    | where TargetUserName IN (
+        "Domain Admins",
+        "Enterprise Admins",
+        "Schema Admins",
+        "Group Policy Creator Owners",
+        "Administrators",
+        "Account Operators",
+        "Server Operators",
+        "Print Operators",
+        "Backup Operators",
+        "Remote Management Users",
+        "DnsAdmins",
+        "DnsUpdateProxy",
+        "Exchange Windows Permissions",
+        "Organization Management",
+        "Protected Users"
+    )
+    ```Exclude known automated provisioning accounts (customize per environment)```
+    | where NOT SubjectUserName IN (
+        "svc_provisioning",
+        "svc_idm",
+        "svc_sccm_admin"
+    )
+    ```Exclude machine accounts acting on behalf of logged-on users```
+    | where NOT match(SubjectUserName, "\$$")
+    ```Label group event type for readability```
+    | eval group_event_type=case(
+        EventCode==4728, "Global Security Group",
+        EventCode==4732, "Local Security Group",
+        EventCode==4756, "Universal Security Group"
+    )
+    ```Tag by target group risk tier```
+    | eval group_risk_tier=case(
+        TargetUserName IN ("Domain Admins","Enterprise Admins","Schema Admins"),
+            "CRITICAL",
+        TargetUserName IN ("Administrators","Account Operators","Server Operators",
+                           "Backup Operators","Print Operators","DnsAdmins"),
+            "HIGH",
+        1==1, "MEDIUM"
+    )
+    ```Detect off-hours changes (adjust timezone offset as needed)```
+    | eval hour_of_day=tonumber(strftime(_time, "%H"))
+    | eval day_of_week=strftime(_time, "%A")
+    | eval is_off_hours=if(
+        hour_of_day < 7 OR hour_of_day >= 20
+        OR day_of_week IN ("Saturday", "Sunday"),
+        "YES", "NO"
+    )
+    ```Extract member's RID from MemberSid to detect Administrator account (RID 500)```
+    | eval member_rid=if(
+        isnotnull(MemberSid) AND MemberSid!="-",
+        tonumber(replace(MemberSid, "^S-1-5-21-[0-9]+-[0-9]+-[0-9]+-", "")),
+        null()
+    )
+    | eval member_is_builtin_admin=if(member_rid==500, "YES", "NO")
+    ```Aggregate by actor + group + session```
+    | stats
+        min(_time) as first_event_time,
+        max(_time) as last_event_time,
+        count as addition_count,
+        values(MemberName) as members_added_dn,
+        values(MemberSid) as member_sids,
+        values(TargetUserName) as target_groups,
+        values(group_event_type) as event_types,
+        values(group_risk_tier) as risk_tiers,
+        values(is_off_hours) as off_hours_detected,
+        values(member_is_builtin_admin) as builtin_admin_added
+        by SubjectUserName, SubjectDomainName, SubjectLogonId, ComputerName
+    ```Join with 4624 to get source IP and logon type```
+    | join type=left SubjectLogonId
+        [
+            search index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4624
+            | rename Logon_ID as SubjectLogonId
+            | fields SubjectLogonId, Source_Network_Address, Logon_Type,
+                     Authentication_Package, WorkstationName
+        ]
+    ```Compute composite severity```
+    | eval composite_severity=case(
+        like(risk_tiers, "%CRITICAL%") AND off_hours_detected="YES", "CRITICAL",
+        like(risk_tiers, "%CRITICAL%"), "HIGH",
+        like(risk_tiers, "%HIGH%") AND off_hours_detected="YES", "HIGH",
+        like(risk_tiers, "%HIGH%"), "MEDIUM",
+        1==1, "LOW"
+    )
+    | eval mitre_technique="T1098.001"
+    | eval mitre_tactic="Privilege Escalation"
+    | eval alert_name="AD Privileged Group — Member Addition Detected"
+    | table first_event_time, last_event_time, SubjectUserName, SubjectDomainName,
+            ComputerName, Source_Network_Address, Logon_Type, Authentication_Package,
+            WorkstationName, target_groups, members_added_dn, member_sids,
+            event_types, addition_count, off_hours_detected, builtin_admin_added,
+            composite_severity, mitre_technique, mitre_tactic, alert_name
+    | sort - composite_severity
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "SubjectUserName"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Privileged Group Membership Change — $SubjectUserName$ added to $target_groups$"
+        rule_description: >
+          Account $SubjectUserName$ from $SubjectDomainName$ added member(s)
+          $members_added_dn$ to privileged group(s) $target_groups$ on
+          domain controller $ComputerName$. Source IP: $Source_Network_Address$.
+          Off-hours: $off_hours_detected$. Risk tier: $composite_severity$.
+        severity: high
+        drilldown_search: >
+          index=wineventlog EventCode IN (4728, 4732, 4756)
+          SubjectUserName="$SubjectUserName$" SubjectLogonId="$SubjectLogonId$"
+    - risk:
+        risk_object: "SubjectUserName"
+        risk_object_type: "user"
+        risk_score: 75
+    - risk:
+        risk_object: "Source_Network_Address"
+        risk_object_type: "system"
+        risk_score: 60
+
+  known_false_positives:
+    - "IT help desk / identity management team adding users during onboarding — correlate with ITSM tickets"
+    - "Automated IDM platforms (SailPoint, Saviynt, Okta IGA) using service accounts — add to exclusion list"
+    - "SCCM/MEM boundary group additions during client push deployment — filter svc_sccm_admin"
+    - "Periodic DBA group membership reviews that add SQL service accounts to Backup Operators"
+  tuning_guidance: |
+    1. Add known provisioning service account names to the SubjectUserName exclusion IN list
+    2. Adjust off-hours window (hour_of_day boundaries) to match your business hours and timezone
+    3. Extend TargetUserName IN list with custom privileged groups in your environment
+    4. Integrate with ITSM lookup (ServiceNow, Jira) to auto-approve changes with open tickets
+    5. Consider splitting CRITICAL vs HIGH tier into separate alerts with different notification paths
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: LDAP-Level Group Membership Modification (Event 5136)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects direct LDAP writes to the "member" attribute of privileged groups.
+#  This event fires when tools like ldifde, ldp.exe, PowerShell ADSI,
+#  Impacket, or any direct LDAP client bypass the high-level AD management
+#  APIs. Many attacker tools (e.g., PowerSploit Add-DomainGroupMember with
+#  -Method LDAP) prefer LDAP over ADUC GUI to avoid other logging channels.
+#
+#  Event 5136 fires TWICE per member change: once for "Value Deleted" (previous
+#  value) and once for "Value Added" (new value). Monitor OperationType = "%%14674"
+#  which corresponds to "Value Added" in Windows message tables.
+#
+#  Confidence  : HIGH
+#  Severity    : HIGH to CRITICAL
+#  FP Rate     : Low-Medium — ADUC GUI also produces 5136, but via different path
+
+rule_2_ldap_member_attribute_write:
+  name: "AD Privileged Group — Direct LDAP Member Attribute Write (Event 5136)"
+  description: >
+    Detects modifications to the "member" attribute on privileged AD group
+    objects via the Directory Service Changes audit (Event 5136). This
+    captures direct LDAP writes performed by attacker tooling such as
+    ldifde, PowerSploit Add-DomainGroupMember, Impacket addcomputer.py,
+    or any LDAP client that bypasses the standard group management API.
+    Event 5136 is generated at the LDAP layer and is distinct from Events
+    4728/4732/4756 — an attacker using direct LDAP may generate 5136
+    without generating the corresponding 4728/4732/4756.
+    Monitors only OperationType "%%14674" (Value Added) to suppress noisy
+    paired "Value Deleted" events.
+  mitre:
+    tactic: Privilege Escalation
+    technique: T1098.001
+    technique_name: "Account Manipulation: Additional Cloud Credentials"
+  severity: high
+  confidence: 80
+  risk_score: 80
+  data_sources:
+    - "Windows Security Event Log (EventCode 5136)"
+  prerequisites:
+    - "Audit Directory Service Changes — SUCCESS enabled on all DCs"
+    - "SACLs configured on privileged group objects for member attribute"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5136
+        ObjectClass="group"
+        AttributeLDAPDisplayName="member"
+        OperationType="%%14674"
+    ```Filter by privileged group distinguished names (customize with your domain)```
+    ```Match against the CN portion of the ObjectDN```
+    | eval target_group_cn=replace(ObjectDN, "^CN=([^,]+),.*$", "\1")
+    | where target_group_cn IN (
+        "Domain Admins",
+        "Enterprise Admins",
+        "Schema Admins",
+        "Group Policy Creator Owners",
+        "Administrators",
+        "Account Operators",
+        "Server Operators",
+        "Print Operators",
+        "Backup Operators",
+        "Remote Management Users",
+        "DnsAdmins",
+        "DnsUpdateProxy",
+        "Exchange Windows Permissions",
+        "Organization Management",
+        "Protected Users"
+    )
+    ```Exclude known-good service accounts```
+    | where NOT SubjectUserName IN (
+        "svc_provisioning",
+        "svc_idm",
+        "svc_sccm_admin"
+    )
+    | where NOT match(SubjectUserName, "\$$")
+    ```Detect off-hours activity```
+    | eval hour_of_day=tonumber(strftime(_time, "%H"))
+    | eval day_of_week=strftime(_time, "%A")
+    | eval is_off_hours=if(
+        hour_of_day < 7 OR hour_of_day >= 20
+        OR day_of_week IN ("Saturday", "Sunday"),
+        "YES", "NO"
+    )
+    ```Determine if a group (not a user) is being added — indicates nesting```
+    ```The value in AttributeValue is the DN of the member being added```
+    | eval member_is_group=if(
+        match(AttributeValue, "^CN=.*,OU=.*Groups.*") OR
+        match(AttributeValue, "^CN=.*,CN=Users.*") AND match(AttributeValue, "Group"),
+        "POSSIBLE", "UNKNOWN"
+    )
+    | stats
+        min(_time) as first_event_time,
+        max(_time) as last_event_time,
+        count as ldap_write_count,
+        values(ObjectDN) as modified_group_dn,
+        values(target_group_cn) as modified_group_name,
+        values(AttributeValue) as member_dns_added,
+        values(OpCorrelationID) as correlation_ids,
+        values(is_off_hours) as off_hours_detected
+        by SubjectUserName, SubjectDomainName, ComputerName
+    ```Flag multiple group writes in one session as potential bulk escalation```
+    | eval bulk_escalation=if(ldap_write_count > 3, "YES", "NO")
+    | eval alert_detail=SubjectUserName." performed ".ldap_write_count.
+        " direct LDAP member writes on groups: ".modified_group_name.
+        " from ".ComputerName." (off-hours: ".off_hours_detected.")"
+    | eval mitre_technique="T1098.001"
+    | eval alert_name="AD Privileged Group — LDAP Member Attribute Write"
+    | table first_event_time, last_event_time, SubjectUserName, SubjectDomainName,
+            ComputerName, modified_group_name, modified_group_dn, member_dns_added,
+            ldap_write_count, bulk_escalation, off_hours_detected,
+            mitre_technique, alert_name, alert_detail
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "SubjectUserName"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "LDAP Group Write — $SubjectUserName$ modified $modified_group_name$"
+        severity: high
+    - risk:
+        risk_object: "SubjectUserName"
+        risk_object_type: "user"
+        risk_score: 80
+
+  known_false_positives:
+    - "ADUC GUI management by admins also generates 5136 events alongside 4728/4732/4756"
+    - "Identity governance platforms using LDAP API directly"
+    - "AD migration or consolidation tools (ADMT, Quest Migration Manager)"
+  tuning_guidance: |
+    1. Correlate this rule with Rule 1 (4728/4732/4756) — attacker LDAP tools may only
+       generate 5136, not the high-level group events, making 5136-only detections valuable
+    2. Review OpCorrelationID to group related LDAP operations from a single tool invocation
+    3. Enrich AttributeValue (member DN) against HR/asset lookup to identify unexpected accounts
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Bulk Privilege Escalation — Multiple Privileged Group Additions
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects rapid-succession additions across MULTIPLE privileged groups by a
+#  single actor within a short window. An attacker who gains admin access
+#  frequently adds a backdoor account to several privileged groups simultaneously
+#  (Domain Admins + Backup Operators + Remote Desktop Users) to maximize foothold.
+#  This behavioral pattern is extremely rare in legitimate operations.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very Low — legitimate admins rarely modify multiple privileged
+#                groups in one sitting
+
+rule_3_bulk_privilege_escalation:
+  name: "AD Privileged Group — Bulk Privilege Escalation (Multiple Groups Modified)"
+  description: >
+    Detects a single actor account adding members to two or more distinct
+    privileged groups within a 10-minute window. This pattern indicates an
+    attacker rapidly establishing a privileged foothold by granting a backdoor
+    account memberships across multiple high-value groups. Legitimate identity
+    management workflows typically process one group at a time with separation
+    of duties and change-management approval.
+  mitre:
+    tactic: Privilege Escalation
+    technique: T1098.001
+    technique_name: "Account Manipulation: Additional Cloud Credentials"
+  severity: critical
+  confidence: 85
+  risk_score: 90
+  data_sources:
+    - "Windows Security Event Log (EventCode 4728, 4732, 4756)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security"
+        EventCode IN (4728, 4732, 4756)
+    | where TargetUserName IN (
+        "Domain Admins",
+        "Enterprise Admins",
+        "Schema Admins",
+        "Group Policy Creator Owners",
+        "Administrators",
+        "Account Operators",
+        "Server Operators",
+        "Print Operators",
+        "Backup Operators",
+        "Remote Management Users",
+        "DnsAdmins",
+        "Exchange Windows Permissions",
+        "Organization Management",
+        "Protected Users"
+    )
+    | where NOT SubjectUserName IN ("svc_provisioning", "svc_idm", "svc_sccm_admin")
+    | where NOT match(SubjectUserName, "\$$")
+    ```Bucket into 10-minute windows for burst detection```
+    | bin _time span=10m
+    | stats
+        count as total_additions,
+        dc(TargetUserName) as distinct_groups_modified,
+        dc(MemberSid) as distinct_members_added,
+        values(TargetUserName) as target_groups,
+        values(MemberName) as member_dns,
+        values(MemberSid) as member_sids,
+        values(EventCode) as event_codes_seen,
+        min(_time) as window_start,
+        max(_time) as window_end
+        by SubjectUserName, SubjectDomainName, ComputerName, _time
+    ```Threshold: 2+ distinct privileged groups in 10 minutes = anomalous```
+    | where distinct_groups_modified >= 2
+    | eval escalation_severity=case(
+        distinct_groups_modified >= 4, "CRITICAL — Massive privilege escalation",
+        distinct_groups_modified >= 3, "CRITICAL — Multi-group escalation",
+        distinct_groups_modified >= 2, "HIGH — Dual-group escalation"
+    )
+    | eval mitre_technique="T1098.001"
+    | eval alert_name="AD — Bulk Privilege Escalation Detected"
+    | table window_start, window_end, SubjectUserName, SubjectDomainName,
+            ComputerName, target_groups, member_dns, member_sids,
+            total_additions, distinct_groups_modified, distinct_members_added,
+            event_codes_seen, escalation_severity, mitre_technique, alert_name
+    | sort - distinct_groups_modified
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-15m"
+    latest: "now"
+  throttle:
+    field: "SubjectUserName"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Bulk Privilege Escalation — $SubjectUserName$ modified $distinct_groups_modified$ privileged groups"
+        severity: critical
+    - risk:
+        risk_object: "SubjectUserName"
+        risk_object_type: "user"
+        risk_score: 90
+
+  known_false_positives:
+    - "Onboarding a new IT administrator who is being added to multiple groups — should have ticket"
+    - "AD forest consolidation or migration modifying multiple groups in sequence"
+  tuning_guidance: |
+    1. Increase threshold to 3 if IT admins routinely add users to 2 groups together
+    2. Correlate SubjectUserName with known privileged admin account list (allow list)
+    3. Integrate with change management lookup — approved changes should suppress this alert
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Group Added to Privileged Group (Nested Group Privilege Escalation)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects the nesting technique where an attacker-controlled group is added
+#  as a member of a privileged group. Because group nesting is transitive,
+#  all members of the nested group inherit the privileges of the parent group.
+#  This is often used to avoid detection by obscuring individual user additions
+#  and to make removal harder (removing the nested group removes all members
+#  at once but is easy to miss in reviews).
+#
+#  Detection logic: MemberSid of a group object (group SIDs are NEVER in the
+#  S-1-5-21-*-user RID range for users; they can be any SID, but we can
+#  differentiate by checking if the MemberName DN contains "OU=Groups" or
+#  similar, OR by correlating with Event 4754/4731/4727 group creation events).
+#
+#  Confidence  : MEDIUM-HIGH
+#  Severity    : HIGH
+#  FP Rate     : Medium — distribution lists nested in security groups is common
+
+rule_4_nested_group_privilege_escalation:
+  name: "AD Privileged Group — Nested Group Addition (Indirect Privilege Grant)"
+  description: >
+    Detects a security group object being added as a member of a privileged
+    AD group. Group nesting grants all members of the nested group the same
+    privileges as the parent privileged group. Attackers use this to obscure
+    the list of privileged users (membership isn't obvious from group review)
+    and to grant access to many accounts simultaneously. This rule correlates
+    member additions where the member's DN pattern suggests a group object
+    rather than a user account.
+  mitre:
+    tactic: Privilege Escalation
+    technique: T1098.001
+    technique_name: "Account Manipulation: Additional Cloud Credentials"
+  severity: high
+  confidence: 75
+  risk_score: 80
+  data_sources:
+    - "Windows Security Event Log (EventCode 4728, 4732, 4756)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security"
+        EventCode IN (4728, 4732, 4756)
+    | where TargetUserName IN (
+        "Domain Admins",
+        "Enterprise Admins",
+        "Schema Admins",
+        "Administrators",
+        "Account Operators",
+        "Server Operators",
+        "Backup Operators",
+        "Print Operators",
+        "Remote Management Users",
+        "DnsAdmins",
+        "Group Policy Creator Owners",
+        "Protected Users"
+    )
+    ```Detect group-as-member: MemberName DN that includes group-type OU structures```
+    ```or common naming patterns; also catches when MemberSid RID is in group range```
+    | where (
+        match(MemberName, "(?i)OU=Groups") OR
+        match(MemberName, "(?i)OU=Security.Groups") OR
+        match(MemberName, "(?i)CN=.*Group.*,") OR
+        match(MemberName, "(?i)CN=GRP.") OR
+        match(MemberName, "(?i)CN=SG.") OR
+        match(MemberName, "(?i)CN=SG_") OR
+        match(MemberName, "(?i)CN=GRP_")
+    )
+    | where NOT SubjectUserName IN ("svc_provisioning", "svc_idm")
+    | eval hour_of_day=tonumber(strftime(_time, "%H"))
+    | eval day_of_week=strftime(_time, "%A")
+    | eval is_off_hours=if(
+        hour_of_day < 7 OR hour_of_day >= 20
+        OR day_of_week IN ("Saturday", "Sunday"),
+        "YES", "NO"
+    )
+    | stats
+        min(_time) as first_event_time,
+        max(_time) as last_event_time,
+        count,
+        values(TargetUserName) as target_privileged_group,
+        values(MemberName) as nested_group_dn,
+        values(MemberSid) as nested_group_sid,
+        values(is_off_hours) as off_hours_detected
+        by SubjectUserName, SubjectDomainName, ComputerName
+    | eval mitre_technique="T1098.001"
+    | eval alert_name="AD — Nested Group Added to Privileged Group"
+    | table first_event_time, last_event_time, SubjectUserName, SubjectDomainName,
+            ComputerName, target_privileged_group, nested_group_dn, nested_group_sid,
+            off_hours_detected, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "SubjectUserName"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Nested Group Privilege Escalation — $nested_group_dn$ added to $target_privileged_group$"
+        severity: high
+    - risk:
+        risk_object: "SubjectUserName"
+        risk_object_type: "user"
+        risk_score: 80
+
+  known_false_positives:
+    - "Legitimate role-based access control using nested group structures"
+    - "IT teams creating sub-groups within privileged groups for tiered admin access"
+  tuning_guidance: |
+    1. Refine the MemberName regex patterns to match YOUR environment's group naming conventions
+    2. Maintain a lookup of pre-approved nested group structures — exclude from alerting
+    3. Correlate nested group additions with a new group creation event (4727/4731/4754)
+       to detect freshly created groups being immediately added (higher suspicion)
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: AdminSDHolder ACL Modification (Covert Persistent Privilege Grant)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects modifications to the AdminSDHolder object's security descriptor
+#  (nTSecurityDescriptor). The AdminSDHolder container's ACL is propagated
+#  by the SDProp process (every 60 minutes) to ALL protected objects
+#  (domain admins, enterprise admins, schema admins, etc.). An attacker who
+#  modifies AdminSDHolder's DACL grants themselves persistent, covert access
+#  to every protected object in the domain — without appearing as a member
+#  of any privileged group.
+#
+#  ObjectDN for AdminSDHolder:
+#  CN=AdminSDHolder,CN=System,DC=<domain>,DC=<tld>
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very Low — legitimate AdminSDHolder changes are extremely rare
+
+rule_5_adminsdholder_acl_modification:
+  name: "AdminSDHolder ACL Modified — Covert Persistent Privilege via SDProp"
+  description: >
+    Detects modifications to the nTSecurityDescriptor attribute of the
+    AdminSDHolder object. The SDProp process runs every 60 minutes on the
+    PDC Emulator and stamps the AdminSDHolder's ACL onto all AD-protected
+    accounts and groups (those with adminCount=1). By modifying AdminSDHolder's
+    DACL to add an ACE for an attacker-controlled account, the attacker gains
+    persistent rights over ALL privileged objects without being a group member.
+    This is a stealth persistence mechanism that survives group membership
+    cleanup because it operates at the security descriptor level, not membership.
+  mitre:
+    tactic: "Persistence, Privilege Escalation"
+    technique: "T1098.001"
+    technique_name: "Account Manipulation: Additional Cloud Credentials"
+    also_covers: "T1222.001 - File and Directory Permissions Modification"
+  severity: critical
+  confidence: 90
+  risk_score: 95
+  data_sources:
+    - "Windows Security Event Log (EventCode 5136)"
+  prerequisites:
+    - "Audit Directory Service Changes — SUCCESS enabled on all DCs"
+    - "SACL on AdminSDHolder object for nTSecurityDescriptor attribute"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5136
+        AttributeLDAPDisplayName="nTSecurityDescriptor"
+        OperationType="%%14674"
+    ```Match AdminSDHolder object by distinguished name pattern```
+    | where match(ObjectDN, "(?i)CN=AdminSDHolder,CN=System,")
+    ```Exclude SYSTEM and known DC machine accounts (SDProp itself runs as SYSTEM)```
+    | where NOT SubjectUserName IN ("SYSTEM", "-")
+    | where NOT match(SubjectUserName, "\$$")
+    | eval actor=SubjectUserName."@".SubjectDomainName
+    | eval alert_detail="AdminSDHolder nTSecurityDescriptor modified by ".actor.
+        " on ".ComputerName." — SDProp will propagate this ACE to ALL protected objects within 60 minutes"
+    | stats
+        min(_time) as first_event_time,
+        max(_time) as last_event_time,
+        count as modification_count,
+        values(ObjectDN) as adminsdholder_dn,
+        values(OpCorrelationID) as correlation_ids
+        by SubjectUserName, SubjectDomainName, ComputerName
+    | eval mitre_technique="T1098.001"
+    | eval alert_name="CRITICAL — AdminSDHolder ACL Modified"
+    | table first_event_time, last_event_time, SubjectUserName, SubjectDomainName,
+            ComputerName, adminsdholder_dn, modification_count,
+            mitre_technique, alert_name, alert_detail
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "SubjectUserName"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "CRITICAL — AdminSDHolder ACL Modified by $SubjectUserName$"
+        severity: critical
+    - risk:
+        risk_object: "SubjectUserName"
+        risk_object_type: "user"
+        risk_score: 95
+  response_note: >
+    If confirmed malicious, act BEFORE SDProp runs (within 60 minutes of detection).
+    Reset AdminSDHolder security descriptor from a known-good backup immediately.
+    Then audit ALL protected objects for unexpected ACEs inherited from AdminSDHolder.
+
+  known_false_positives:
+    - "AD forest design changes legitimately adjusting AdminSDHolder inheritance"
+    - "Scheduled post-migration cleanup by authorized AD architects"
+  tuning_guidance: |
+    1. This rule has near-zero legitimate trigger rate — treat every alert as high priority
+    2. Ensure your SACL on AdminSDHolder covers the nTSecurityDescriptor attribute
+    3. Baseline the current AdminSDHolder ACL: Run Get-Acl "AD:CN=AdminSDHolder,CN=System,..."
+       and compare against alerts
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Suspicious Group Creation — Masquerading as Privileged Group
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects the creation of a new security group with a name typosquatting or
+#  closely mimicking a known privileged group. Attackers create lookalike groups
+#  (e.g. "Domain Admin" without the 's', "Administratörs" with Unicode substitution)
+#  and then either add this group into the legitimate privileged group (nested)
+#  or configure ACLs/SPN delegations targeting the fake group name.
+#
+#  EventCodes covered:
+#  4727 — A security-enabled global group was created
+#  4731 — A security-enabled local group was created
+#  4754 — A security-enabled universal group was created
+#
+#  Confidence  : MEDIUM
+#  Severity    : MEDIUM to HIGH
+#  FP Rate     : Medium — many orgs create groups with "Admin" in the name
+
+rule_6_masquerade_group_creation:
+  name: "AD Security Group Created with Privileged Group Name Masquerade"
+  description: >
+    Detects creation of new AD security groups whose names closely resemble
+    built-in privileged groups (Domain Admins, Administrators, Enterprise Admins,
+    etc.) by matching on keyword patterns. Attackers create these groups as
+    part of nesting attacks or to trick administrators performing visual reviews.
+    Also fires when groups are created by non-standard accounts outside
+    the identity management workflow.
+  mitre:
+    tactic: Privilege Escalation
+    technique: T1098.001
+    also_covers: "T1036 - Masquerading"
+  severity: medium
+  confidence: 65
+  risk_score: 60
+  data_sources:
+    - "Windows Security Event Log (EventCode 4727, 4731, 4754)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security"
+        EventCode IN (4727, 4731, 4754)
+    ```Exclude the actual legitimate privileged group names — only catch look-alikes```
+    | where NOT TargetUserName IN (
+        "Domain Admins",
+        "Enterprise Admins",
+        "Schema Admins",
+        "Administrators",
+        "Account Operators",
+        "Server Operators",
+        "Print Operators",
+        "Backup Operators",
+        "Remote Management Users",
+        "Group Policy Creator Owners",
+        "DnsAdmins",
+        "Protected Users"
+    )
+    ```Match new groups whose names LOOK LIKE privileged groups```
+    | where (
+        match(TargetUserName, "(?i)domain.?admin") OR
+        match(TargetUserName, "(?i)enterprise.?admin") OR
+        match(TargetUserName, "(?i)schema.?admin") OR
+        match(TargetUserName, "(?i)^admin(s|istrators?)?$") OR
+        match(TargetUserName, "(?i)backup.?oper") OR
+        match(TargetUserName, "(?i)server.?oper") OR
+        match(TargetUserName, "(?i)account.?oper") OR
+        match(TargetUserName, "(?i)print.?oper") OR
+        match(TargetUserName, "(?i)dns.?admin") OR
+        match(TargetUserName, "(?i)protected.?users") OR
+        match(TargetUserName, "(?i)krb.?tgt")
+    )
+    | where NOT SubjectUserName IN ("svc_provisioning", "svc_idm")
+    | where NOT match(SubjectUserName, "\$$")
+    | eval group_type=case(
+        EventCode==4727, "Global Security Group",
+        EventCode==4731, "Local Security Group",
+        EventCode==4754, "Universal Security Group"
+    )
+    | eval hour_of_day=tonumber(strftime(_time, "%H"))
+    | eval day_of_week=strftime(_time, "%A")
+    | eval is_off_hours=if(
+        hour_of_day < 7 OR hour_of_day >= 20
+        OR day_of_week IN ("Saturday", "Sunday"),
+        "YES", "NO"
+    )
+    | stats
+        min(_time) as creation_time,
+        values(TargetUserName) as suspicious_group_names,
+        values(TargetSid) as new_group_sids,
+        values(group_type) as group_types,
+        values(is_off_hours) as off_hours_detected
+        by SubjectUserName, SubjectDomainName, ComputerName
+    | eval mitre_technique="T1098.001 / T1036"
+    | eval alert_name="AD — Masquerade Group Creation Detected"
+    | table creation_time, SubjectUserName, SubjectDomainName, ComputerName,
+            suspicious_group_names, new_group_sids, group_types,
+            off_hours_detected, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "SubjectUserName"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Masquerade Group Created — $suspicious_group_names$ by $SubjectUserName$"
+        severity: medium
+    - risk:
+        risk_object: "SubjectUserName"
+        risk_object_type: "user"
+        risk_score: 60
+
+  known_false_positives:
+    - "Legitimate application groups named 'LocalAdmins_<server>' or 'AdminGrp_<dept>'"
+    - "Testing or staging environments with permissive group naming"
+  tuning_guidance: |
+    1. Review and refine regex patterns against your actual group naming standard
+    2. Suppress specific known-legitimate groups by name (NOT by pattern) after baseline review
+    3. Combine with Rule 4 (nested group) — a masquerade group created then added to a
+       privileged group within 30 minutes is a very high-confidence indicator
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  INVESTIGATION QUERIES — Run manually during incident response
+# ██████████████████████████████████████████████████████████████████████████████
+
+investigation_queries:
+
+  # --- Query A: Full history of a specific privileged group's membership changes ---
+  group_membership_change_history:
+    description: >
+      Show ALL membership changes (add and remove) for a specific privileged
+      group over the last 90 days. Includes actor, member added/removed,
+      timestamp, and source IP via logon join.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode IN (4728, 4729, 4732, 4733, 4756, 4757)
+          TargetUserName="Domain Admins"
+          earliest="-90d"
+      | eval change_type=if(
+          EventCode IN (4728, 4732, 4756), "MEMBER ADDED", "MEMBER REMOVED"
+        )
+      | table _time, change_type, SubjectUserName, SubjectDomainName,
+              MemberName, MemberSid, TargetUserName, ComputerName
+      | sort - _time
+
+  # --- Query B: Who are the current effective members of privileged groups? ---
+  #     (Session reconstruction from events — not a live AD query)
+  membership_delta_analysis:
+    description: >
+      Reconstruct adds and removes over a period to derive net-new privileged
+      group members added during an incident timeframe.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode IN (4728, 4729, 4732, 4733, 4756, 4757)
+          TargetUserName IN (
+              "Domain Admins","Enterprise Admins","Schema Admins","Administrators"
+          )
+          earliest="-7d"
+      | eval change_type=if(
+          EventCode IN (4728, 4732, 4756), "added", "removed"
+        )
+      | stats
+          list(change_type) as changes,
+          count(eval(change_type="added")) as times_added,
+          count(eval(change_type="removed")) as times_removed,
+          first(_time) as first_change,
+          last(_time) as last_change
+          by MemberName, MemberSid, TargetUserName
+      | eval net_status=if(
+          times_added > times_removed, "CURRENTLY A MEMBER (net added)",
+          times_added < times_removed, "REMOVED",
+          "UNCHANGED (balanced)"
+        )
+      | sort TargetUserName, MemberName
+
+  # --- Query C: Actor analysis — all group changes by a suspicious account ---
+  actor_group_change_timeline:
+    description: >
+      Full timeline of all group membership events performed by a specific
+      actor account. Use during investigation to see all their group manipulations.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode IN (4727, 4728, 4729, 4731, 4732, 4733, 4754, 4755, 4756, 4757)
+          SubjectUserName="<SUSPICIOUS_ACCOUNT>"
+      | eval event_description=case(
+          EventCode==4727, "Created global security group",
+          EventCode==4728, "Added member to global security group",
+          EventCode==4729, "Removed member from global security group",
+          EventCode==4731, "Created local security group",
+          EventCode==4732, "Added member to local security group",
+          EventCode==4733, "Removed member from local security group",
+          EventCode==4754, "Created universal security group",
+          EventCode==4756, "Added member to universal security group",
+          EventCode==4757, "Removed member from universal security group"
+        )
+      | table _time, event_description, TargetUserName, MemberName,
+              MemberSid, SubjectLogonId, ComputerName
+      | sort + _time
+
+  # --- Query D: AdminSDHolder protected accounts (adminCount=1) with unexpected ACEs ---
+  #     (This is a PowerShell query for reference — cannot query live AD from Splunk)
+  adminsdholder_audit_powershell:
+    description: >
+      PowerShell command to enumerate all accounts with adminCount=1 and
+      compare their security descriptors against expected ACE templates.
+      Run on a DC during incident investigation.
+    command: |
+      # Get all protected accounts
+      Get-ADObject -LDAPFilter "(adminCount=1)" -Properties nTSecurityDescriptor,distinguishedName |
+        Select-Object Name, DistinguishedName,
+          @{N="ACECount"; E={($_.nTSecurityDescriptor.Access).Count}} |
+        Sort-Object ACECount -Descending
+
+      # Specifically check AdminSDHolder DACL
+      (Get-Acl "AD:CN=AdminSDHolder,CN=System,DC=corp,DC=com").Access |
+        Select-Object IdentityReference, ActiveDirectoryRights, AccessControlType |
+        Where-Object AccessControlType -eq "Allow" |
+        Sort-Object IdentityReference
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RESPONSE PLAYBOOK — Actions upon confirmed privileged group manipulation
+# ██████████████████████████████████████████████████████████████████████████████
+
+response_playbook:
+  name: "AD Privileged Group Membership Manipulation — Incident Response"
+
+  immediate_actions:
+    - step: 1
+      action: "Remove unauthorized member from privileged group"
+      detail: >
+        Identify the unauthorized member (MemberSid/MemberName from the alert)
+        and remove them immediately.
+      command: "Remove-ADGroupMember -Identity 'Domain Admins' -Members <account> -Confirm:$false"
+
+    - step: 2
+      action: "Disable the actor account if it is unauthorized"
+      detail: >
+        If SubjectUserName is not an authorized admin account, disable it
+        immediately to prevent further group modifications.
+      command: "Disable-ADAccount -Identity <SubjectUserName>"
+
+    - step: 3
+      action: "Investigate AdminSDHolder if Rule 5 fired"
+      detail: >
+        If AdminSDHolder was modified, reset the security descriptor from
+        a known-good backup or from a clean domain template BEFORE SDProp
+        runs (within 60 minutes). Then force SDProp to propagate the clean ACL.
+      command: |
+        # Force SDProp to run immediately (run on PDC Emulator)
+        $dn = (Get-ADDomain).DistinguishedName
+        $taskName = "sdprop"
+        Invoke-Command -ComputerName (Get-ADDomainController -Discover -Service PrimaryDC).HostName {
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters" `
+            -Name "RunProtectAdminGroupsTask" -Value 1
+        }
+
+    - step: 4
+      action: "Audit all privileged group memberships"
+      detail: >
+        Compare current privileged group memberships against baseline snapshot.
+        Identify all accounts added since last known-good state.
+      command: |
+        @("Domain Admins","Enterprise Admins","Schema Admins","Administrators") | ForEach-Object {
+          Write-Host "=== $_ ===" -ForegroundColor Cyan
+          Get-ADGroupMember -Identity $_ -Recursive | Select-Object Name, SamAccountName, objectClass
+        }
+
+    - step: 5
+      action: "Review logon events for the unauthorized member"
+      detail: >
+        Check if the unauthorized member has already used the privileges
+        (logon type 2/3/10 on DCs or sensitive servers since being added).
+
+  forensic_actions:
+    - "Correlate SubjectLogonId from group events with Event 4624 to get source IP and workstation"
+    - "Check for DCSync (Event 4662) from the same account — escalation may be prelude to credential dump"
+    - "Review Event 5136 history for AdminSDHolder nTSecurityDescriptor changes in the last 30 days"
+    - "Search for lateral movement from the compromised account (Event 4624 Type 3 on non-DC servers)"
+    - "Check for GPO modifications (Event 5136 on GroupPolicyContainer objects) by the same actor"
+    - "Examine scheduled task and service creation events (Event 4698, 4697) by the actor"

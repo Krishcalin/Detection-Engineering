@@ -1,0 +1,1150 @@
+# ==============================================================================
+#  Golden Ticket Attack Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for Kerberos Golden Ticket forging
+#                (T1558.001). Covers RC4 encryption anomalies, absence of
+#                expected TGT issuance events preceding TGS requests, special
+#                privilege assignments on Kerberos logons, abnormal ticket
+#                lifetimes, and suspicious service-ticket patterns consistent
+#                with Mimikatz kerberos::golden, Impacket ticketer.py, and
+#                Rubeus golden defaults.
+#
+#                Attack path: Attacker obtains KRBTGT NTLM hash (via DCSync,
+#                LSASS dump, or NTDS.dit theft) → forges a TGT offline with
+#                arbitrary PAC (SID history, group memberships, ticket lifetime)
+#                → presents the forged TGT to any DC to obtain service tickets
+#                → moves laterally across the domain without further KDC contact.
+#
+#                Key indicator: The DC validates the forged TGT (KRBTGT hash
+#                matches) but the DC NEVER issued it — so Event 4768 (TGT
+#                issuance) has no record, while Event 4769 (TGS request) fires
+#                using that uncorroborated TGT.
+#
+#  MITRE ATT&CK: T1558.001 - Steal or Forge Kerberos Tickets: Golden Ticket
+#                T1550.003 - Use Alternate Authentication Material: Pass the Ticket
+#  Kill Chain   : Credential Access → Lateral Movement → Domain Dominance
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-04
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES (must be configured BEFORE these rules generate detections):
+#
+#  1. Enable Audit Policy on all Domain Controllers:
+#     Computer Configuration > Windows Settings > Security Settings >
+#       Advanced Audit Policy Configuration > Audit Policies >
+#         Account Logon >
+#           "Audit Kerberos Authentication Service" → Enable SUCCESS and FAILURE
+#           "Audit Kerberos Service Ticket Operations" → Enable SUCCESS and FAILURE
+#         Logon/Logoff >
+#           "Audit Logon" → Enable SUCCESS and FAILURE
+#           "Audit Special Logon" → Enable SUCCESS
+#
+#  2. Ensure Domain Controllers forward Security event logs to Splunk
+#     via Universal Forwarder with sourcetype=XmlWinEventLog:Security
+#     (Events 4768, 4769, 4624, 4672 all generate ONLY on DCs for Kerberos)
+#
+#  3. Set an appropriate Kerberos policy baseline (Default Domain Policy):
+#     Computer Configuration > Windows Settings > Security Settings >
+#       Account Policies > Kerberos Policy:
+#         Maximum lifetime for user ticket (TGT): 10 hours (default)
+#         Maximum lifetime for service ticket: 600 minutes (default)
+#         Maximum lifetime for user ticket renewal: 7 days (default)
+#
+#  4. For RC4 anomaly detection to be meaningful, enforce AES on DCs:
+#     Ensure "Network security: Configure encryption types allowed for Kerberos"
+#     is set to AES128_HMAC_SHA1, AES256_HMAC_SHA1 only (remove RC4_HMAC_MD5)
+#     if legacy systems permit. Document which legacy systems still require RC4.
+#
+# ==============================================================================
+#
+#  FIELD REFERENCE — Windows Security Event XML fields as seen in Splunk
+#  (XmlWinEventLog:Security sourcetype, Splunk Add-on for Microsoft Windows)
+#
+#  Event 4768 — A Kerberos Authentication Ticket (TGT) was requested
+#  -----------------------------------------------------------------------
+#  Field Name            | Description
+#  --------------------- | -----------------------------------------------
+#  TargetUserName        | Account requesting the TGT (AS-REQ subject)
+#  TargetDomainName      | Domain name / Kerberos realm in the request
+#  TargetSid             | SID of the requesting account
+#  ServiceName           | KDC service name (usually "krbtgt")
+#  ServiceSid            | SID of the krbtgt account
+#  TicketOptions         | Kerberos ticket flags (hex bitmask, RFC 4120)
+#                        |   0x40810010 = Forwardable+Renewable+Canonicalize+RenewableOK
+#                        |   0x40810000 = Forwardable+Renewable+Canonicalize
+#  TicketEncryptionType  | Encryption type used for the ticket:
+#                        |   0x11 = AES128-CTS-HMAC-SHA1-96
+#                        |   0x12 = AES256-CTS-HMAC-SHA1-96 (recommended)
+#                        |   0x17 = RC4-HMAC (legacy, Kerberoasting / Golden Ticket indicator)
+#                        |   0x18 = RC4-HMAC-EXP (legacy export, extremely rare)
+#                        |   0x3  = DES-CBC-MD5 (very old, deprecated)
+#  PreAuthType           | Pre-authentication type:
+#                        |   0x2 = ENC_TIMESTAMP (normal)
+#                        |   0x0 = No pre-auth required (AS-REP Roasting indicator)
+#                        |   0x10 = PA-PK-AS-REQ (PKINIT / smartcard)
+#  Status                | Result code hex:
+#                        |   0x0  = Success
+#                        |   0x6  = Username does not exist (KDC_ERR_C_PRINCIPAL_UNKNOWN)
+#                        |   0x12 = Account disabled (KDC_ERR_CLIENT_REVOKED)
+#                        |   0x18 = Wrong password (KDC_ERR_PREAUTH_FAILED)
+#                        |   0x25 = Clock skew too great (KDC_ERR_SKEW)
+#  IpAddress             | Client IP address (may be IPv4 or IPv6)
+#  IpPort                | Client source port
+#  LogonGuid             | GUID correlating this event to subsequent logon events
+#
+#  Event 4769 — A Kerberos Service Ticket (TGS) was requested
+#  -----------------------------------------------------------------------
+#  TargetUserName        | Account that requested the service ticket
+#                        |   Format: "user@DOMAIN.COM"
+#  TargetDomainName      | Domain of the requesting account
+#  ServiceName           | Target service SPN
+#                        |   e.g. "cifs/fileserver01.corp.com"
+#                        |   e.g. "host/server01" for computer tickets
+#  ServiceSid            | SID of the target service account
+#  TicketOptions         | Same hex bitmask flags as 4768
+#  TicketEncryptionType  | Same encryption type values as 4768
+#                        |   0x17 (RC4) in AES-enforced domain = strong anomaly
+#                        |   0x12 (AES256) is expected normal
+#  Status                | 0x0 = Success (ticket issued)
+#                        |   0x1f = Decryption failure (KDC_ERR_SUMTYPE_NOSUPP)
+#                        |   0x3c = Ticket expired (KRB_AP_ERR_TKT_EXPIRED)
+#  IpAddress             | Client IP address making the TGS request
+#  IpPort                | Client source port
+#  TransmittedServices   | Services transmitted (usually "-")
+#  LogonGuid             | GUID that can correlate to the TGT's 4768 and to 4624
+#
+#  Event 4672 — Special Privileges Assigned to New Logon
+#  -----------------------------------------------------------------------
+#  SubjectUserName       | Account receiving special privileges
+#  SubjectDomainName     | Domain of the account
+#  SubjectLogonId        | Logon session ID (hex) — links to Event 4624
+#  PrivilegeList         | Newline-delimited list of SE privileges assigned
+#                        |   SeDebugPrivilege — memory access to other processes
+#                        |   SeTcbPrivilege — act as part of OS
+#                        |   SeBackupPrivilege — bypass file permissions for backup
+#                        |   SeRestorePrivilege — restore files/directories
+#                        |   SeCreateTokenPrivilege — create access tokens
+#                        |   SeAssignPrimaryTokenPrivilege — assign process tokens
+#
+#  Event 4624 — An account was successfully logged on
+#  -----------------------------------------------------------------------
+#  TargetUserName        | Account that logged on (destination account)
+#  TargetDomainName      | Domain of the logged-on account
+#  TargetUserSid         | SID of the logged-on account
+#  LogonType             | 2=Interactive, 3=Network, 4=Batch, 5=Service,
+#                        |   7=Unlock, 9=NewCredentials, 10=RemoteInteractive
+#  AuthenticationPackageName | "Kerberos", "NTLM", "Negotiate"
+#  LogonProcessName      | "Kerberos", "NtLmSsp", "Advapi", "seclogo"
+#  WorkstationName       | Source workstation name
+#  IpAddress             | Source IP address
+#  IpPort                | Source port
+#  Logon_ID              | Logon session ID — correlates to 4672's SubjectLogonId
+#  LogonGuid             | GUID — correlates to 4769 LogonGuid on the DC
+#  TransmittedServices   | Kerberos services from PAC (usually "-")
+#  ElevatedToken         | "%%1842" = Yes, "%%1843" = No
+#
+# ==============================================================================
+#
+#  MIMIKATZ GOLDEN TICKET DEFAULTS (for detection tuning reference)
+#  -----------------------------------------------------------------------
+#  Default ticket validity : 10 years (87,600 hours; RC4 hash with no
+#                            MaxTicketAge enforcement in the forged PAC)
+#  Default username        : Administrator (or any supplied value)
+#  Default RID             : 500
+#  Default groups in PAC   : 513 (Domain Users), 512 (Domain Admins),
+#                            520 (Group Policy Creator Owners),
+#                            518 (Schema Admins), 519 (Enterprise Admins)
+#  Encryption type         : 0x17 (RC4-HMAC) by default when using NTLM hash
+#                            (Can use 0x12 AES256 when --aes256 flag is used)
+#  TicketOptions           : Typically 0x40e10000 (forwardable, renewable,
+#                            pre-auth required, initial)
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: RC4 Kerberos TGT Request in AES-Enforced Environment
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects Event 4768 (TGT request) using RC4 encryption (0x17) in an
+#  environment where AES is enforced. Mimikatz kerberos::golden uses RC4
+#  by default (the KRBTGT NTLM hash). Even if the attacker presents the
+#  forged ticket to get a TGS (which logs 4769, not 4768), the INITIAL
+#  RC4 TGT crafting for Overpass-the-Hash / PKINIT scenarios will log 4768.
+#  Additionally, any tool requesting a REAL TGT with RC4 (e.g., Rubeus
+#  asktgt /rc4) also triggers this.
+#
+#  Confidence  : HIGH (in AES-enforced environments)
+#  Severity    : HIGH
+#  FP Rate     : Low in AES-enforced environments; Medium otherwise
+#  Tools caught: Mimikatz, Rubeus asktgt /rc4, Impacket getTGT.py
+
+rule_1_rc4_tgt_request:
+  name: "Kerberos TGT Request Using RC4 Encryption (Golden Ticket / Overpass-the-Hash)"
+  description: >
+    Detects Event 4768 (TGT issuance) where TicketEncryptionType is 0x17
+    (RC4-HMAC) in environments that enforce AES encryption. Modern Windows
+    domains exclusively issue TGTs with AES256 (0x12) or AES128 (0x11).
+    An RC4 TGT request indicates either a Golden Ticket presented for renewal
+    (RC4 encrypted), an Overpass-the-Hash attack (using stolen NTLM hash to
+    request a Kerberos TGT via RC4), or a legacy system that still requires
+    RC4 (baseline and whitelist these first). Correlates with Event 4624
+    to establish source IP and logon context.
+  mitre:
+    tactic: Credential Access
+    technique: T1558.001
+    technique_name: "Steal or Forge Kerberos Tickets: Golden Ticket"
+    related: "T1550.003 - Use Alternate Authentication Material: Pass the Ticket"
+  severity: high
+  confidence: 80
+  risk_score: 75
+  kill_chain_phase: "Credential Access / Lateral Movement"
+  data_sources:
+    - "Windows Security Event Log (EventCode 4768)"
+    - "Windows Security Event Log (EventCode 4624)"
+  prerequisites:
+    - "Audit Kerberos Authentication Service — SUCCESS enabled on all DCs"
+    - "AES-only Kerberos enforcement policy configured (recommended)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4768
+        TicketEncryptionType IN ("0x17", "0x18")
+        Status="0x0"
+    ```Exclude the krbtgt account itself requesting Kerberos tickets```
+    | where NOT TargetUserName IN ("-", "")
+    | where NOT match(TargetUserName, "(?i)^krbtgt")
+    ```Exclude machine accounts with known RC4 legacy requirements (customize)```
+    | where NOT match(TargetUserName, "\$$")
+    ```Exclude known legacy systems by source IP — build this list from baseline```
+    | where NOT IpAddress IN (
+        "10.0.0.50",
+        "10.0.0.51"
+    )
+    ```Enrich with meaningful encryption type label```
+    | eval encryption_type_name=case(
+        TicketEncryptionType=="0x17", "RC4-HMAC (legacy/attack indicator)",
+        TicketEncryptionType=="0x18", "RC4-HMAC-EXP (export/very legacy)",
+        TicketEncryptionType=="0x12", "AES256-CTS-HMAC-SHA1 (expected)",
+        TicketEncryptionType=="0x11", "AES128-CTS-HMAC-SHA1",
+        TicketEncryptionType=="0x3",  "DES-CBC-MD5 (deprecated)",
+        1==1, "Unknown (".TicketEncryptionType.")"
+    )
+    ```Flag non-standard TicketOptions patterns```
+    | eval ticket_options_note=case(
+        TicketOptions=="0x40810010", "Standard (Forwardable+Renewable+Canonicalize+RenewOK)",
+        TicketOptions=="0x40810000", "Standard (Forwardable+Renewable+Canonicalize)",
+        TicketOptions=="0x40e10000", "Mimikatz-common (Forwardable+Renewable+PreAuth+Initial)",
+        TicketOptions=="0x50800000", "Proxiable+Renewable+Forwardable (unusual)",
+        1==1, "Non-standard options: ".TicketOptions
+    )
+    ```Check pre-auth type — 0x0 means no pre-auth required (AS-REP Roasting indicator too)```
+    | eval preauthtype_note=if(
+        PreAuthType=="0x0" OR PreAuthType=="0",
+        "NO PRE-AUTH (account misconfigured or forged)",
+        "Pre-auth present (type ".PreAuthType.")"
+    )
+    | stats
+        min(_time) as first_event_time,
+        max(_time) as last_event_time,
+        count as rc4_tgt_count,
+        values(TicketEncryptionType) as encryption_types,
+        values(encryption_type_name) as encryption_names,
+        values(TicketOptions) as ticket_options,
+        values(ticket_options_note) as options_notes,
+        values(preauthtype_note) as preauthtype_notes
+        by TargetUserName, TargetDomainName, IpAddress, IpPort, ComputerName
+    ```Join with 4624 to get logon type and auth package```
+    | join type=left IpAddress
+        [
+            search index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4624
+                LogonType=3
+            | stats
+                values(AuthenticationPackageName) as auth_packages,
+                values(WorkstationName) as source_workstations,
+                count as logon_count
+                by IpAddress
+        ]
+    | eval off_hours=if(
+        tonumber(strftime(first_event_time, "%H")) < 7 OR
+        tonumber(strftime(first_event_time, "%H")) >= 20 OR
+        strftime(first_event_time, "%A") IN ("Saturday", "Sunday"),
+        "YES", "NO"
+    )
+    | eval mitre_technique="T1558.001"
+    | eval mitre_tactic="Credential Access"
+    | eval alert_name="Kerberos TGT RC4 Encryption Anomaly"
+    | table first_event_time, last_event_time, TargetUserName, TargetDomainName,
+            IpAddress, IpPort, ComputerName, rc4_tgt_count, encryption_names,
+            options_notes, preauthtype_notes, auth_packages, source_workstations,
+            off_hours, mitre_technique, mitre_tactic, alert_name
+    | sort - rc4_tgt_count
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "TargetUserName"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "RC4 TGT Request — $TargetUserName$ from $IpAddress$"
+        rule_description: >
+          Account $TargetUserName$ requested a Kerberos TGT using RC4 encryption
+          (TicketEncryptionType=$encryption_types$) from $IpAddress$ on DC
+          $ComputerName$. Expected encryption type in AES-enforced environments
+          is 0x12 (AES256). RC4 indicates potential Golden Ticket, Overpass-the-Hash,
+          or legacy misconfiguration.
+        severity: high
+    - risk:
+        risk_object: "TargetUserName"
+        risk_object_type: "user"
+        risk_score: 75
+    - risk:
+        risk_object: "IpAddress"
+        risk_object_type: "system"
+        risk_score: 65
+
+  known_false_positives:
+    - "Legacy Windows systems (pre-2008) that cannot negotiate AES — build IP allowlist"
+    - "Non-Windows Kerberos clients (Linux with MIT Kerberos, certain network appliances)"
+    - "Cross-realm trusts with legacy domains that negotiate down to RC4"
+    - "Service accounts with 'Use DES/RC4 encryption types only' attribute set in AD"
+  tuning_guidance: |
+    1. Build a baseline: Run this query with no threshold for 2 weeks to enumerate all
+       RC4-using accounts, then add legitimate legacy systems to the IP exclusion list
+    2. For each RC4 TGT: confirm whether TargetUserName has msDS-SupportedEncryptionTypes
+       set to restrict to RC4 in AD (legitimate legacy) vs. standard AES-capable accounts
+    3. Use AES256-only enforcement via GPO to reduce FP rate to near-zero in modern environments
+    4. Cross-reference with Kerberoasting rule — Kerberoasting also shows 0x17 but on 4769 (TGS)
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: RC4 Kerberos Service Ticket in AES-Enforced Environment (TGS Level)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Golden Ticket usage is most visible at the TGS level (Event 4769).
+#  When the attacker presents the forged TGT to request a service ticket,
+#  the DC issues a TGS and logs Event 4769. If the forged TGT used RC4
+#  (Mimikatz default), the resulting TGS also uses RC4, visible in
+#  TicketEncryptionType=0x17 of Event 4769.
+#
+#  Unlike Kerberoasting (which requests TGS for SERVICE accounts with SPNs),
+#  Golden Ticket usage typically requests TGS for COMPUTER accounts (CIFS,
+#  HOST, RPCSS) to move laterally to servers.
+#
+#  Confidence  : MEDIUM-HIGH
+#  Severity    : HIGH
+#  FP Rate     : Medium (same RC4 FP sources as Rule 1)
+#  Tools caught: Mimikatz kerberos::golden + kerberos::ptt, Impacket ticketer.py,
+#                Rubeus golden /ptt
+
+rule_2_rc4_tgs_request_golden_ticket:
+  name: "Kerberos TGS Request Using RC4 Encryption — Golden Ticket Usage Pattern"
+  description: >
+    Detects Event 4769 (TGS request) with TicketEncryptionType=0x17 (RC4)
+    where the service being requested is a COMPUTER account service (CIFS,
+    HOST, RPCSS), distinguishing this from Kerberoasting (which targets
+    service account SPNs). When a Golden Ticket forged with RC4 is used to
+    request service tickets, the TGS inherits the RC4 encryption and the
+    event reveals the requesting user, target service, and client IP.
+    This rule enriches with the number of unique hosts targeted to surface
+    lateral movement patterns.
+  mitre:
+    tactic: "Credential Access, Lateral Movement"
+    technique: T1558.001
+    technique_name: "Steal or Forge Kerberos Tickets: Golden Ticket"
+  severity: high
+  confidence: 75
+  risk_score: 80
+  data_sources:
+    - "Windows Security Event Log (EventCode 4769)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+        TicketEncryptionType="0x17"
+        Status="0x0"
+    ```Filter out machine account self-service (computer$ requesting their own tickets)```
+    | where NOT match(TargetUserName, "\$$")
+    | where NOT TargetUserName IN ("-", "")
+    ```Focus on computer-service SPNs (lateral movement targets)```
+    ```ServiceName for computer objects typically: host/, cifs/, rpcss/, ldap/, http/```
+    | eval service_type=case(
+        match(ServiceName, "(?i)^cifs/"),   "CIFS/SMB (file share access)",
+        match(ServiceName, "(?i)^host/"),   "HOST (remote admin/WMI)",
+        match(ServiceName, "(?i)^rpcss/"),  "RPCSS (DCOM/RPC)",
+        match(ServiceName, "(?i)^ldap/"),   "LDAP (directory access)",
+        match(ServiceName, "(?i)^http/"),   "HTTP/WinRM",
+        match(ServiceName, "(?i)^termsrv/"),"TermSrv (RDP)",
+        match(ServiceName, "(?i)^krbtgt"),  "KRBTGT (TGT renewal — abnormal for 4769)",
+        ServiceName=="-", "No service name",
+        1==1, "Other: ".ServiceName
+    )
+    ```Filter out Kerberoasting-style non-computer SPN requests to reduce overlap```
+    ```Kerberoasting targets user/service accounts (no $ suffix in SPN, no computer class)```
+    | where NOT (
+        match(ServiceName, "(?i)^MSSQLSvc/") OR
+        match(ServiceName, "(?i)^HTTP/.*(?<!\\$)$") AND NOT match(ServiceName, "\\$")
+    )
+    ```Correlate RC4 TGS with ABSENCE of a recent RC4 TGT (4768) for same user — Golden Ticket indicator```
+    ```(Handled separately in Rule 3 for precision; here flag for context)```
+    | eval encryption_anomaly=if(
+        TicketEncryptionType=="0x17",
+        "RC4 in likely AES-only environment — ANOMALOUS",
+        "Normal"
+    )
+    | stats
+        min(_time) as first_event_time,
+        max(_time) as last_event_time,
+        count as tgs_request_count,
+        dc(ServiceName) as unique_services_targeted,
+        dc(IpAddress) as unique_source_ips,
+        values(ServiceName) as services_requested,
+        values(service_type) as service_types,
+        values(IpAddress) as source_ips,
+        values(TicketOptions) as ticket_options_seen
+        by TargetUserName, TargetDomainName, ComputerName
+    ```Flag high-frequency service ticket requests (lateral movement scanning)```
+    | eval lateral_movement_indicator=case(
+        unique_services_targeted >= 10, "HIGH — Mass lateral movement",
+        unique_services_targeted >= 5,  "MEDIUM — Multiple targets",
+        unique_services_targeted >= 2,  "LOW — Multiple services",
+        1==1, "SINGLE target"
+    )
+    | eval off_hours=if(
+        tonumber(strftime(first_event_time, "%H")) < 7 OR
+        tonumber(strftime(first_event_time, "%H")) >= 20 OR
+        strftime(first_event_time, "%A") IN ("Saturday", "Sunday"),
+        "YES", "NO"
+    )
+    | eval mitre_technique="T1558.001"
+    | eval alert_name="RC4 TGS Request — Potential Golden Ticket Usage"
+    | table first_event_time, last_event_time, TargetUserName, TargetDomainName,
+            ComputerName, services_requested, service_types, unique_services_targeted,
+            source_ips, tgs_request_count, lateral_movement_indicator,
+            off_hours, ticket_options_seen, mitre_technique, alert_name
+    | sort - unique_services_targeted
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-15m"
+    latest: "now"
+  throttle:
+    field: "TargetUserName"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "RC4 TGS — $TargetUserName$ requested $unique_services_targeted$ services via $tgs_request_count$ tickets"
+        severity: high
+    - risk:
+        risk_object: "TargetUserName"
+        risk_object_type: "user"
+        risk_score: 80
+
+  known_false_positives:
+    - "Legacy Windows workstations (XP, 2003) accessing file shares via CIFS with RC4"
+    - "Non-Windows Samba clients with default RC4 Kerberos configuration"
+    - "Some Java applications using Kerberos with RC4 negotiation"
+  tuning_guidance: |
+    1. Correlate with Rule 3 (4769 without preceding 4768) — the combination is very high confidence
+    2. Build an RC4 allowlist by ServiceName+IpAddress pairs from baseline analysis
+    3. If `unique_services_targeted >= 5` fires without a business justification, escalate immediately
+    4. Check if TargetUserName is a high-value account (admin, DA) — privilege + RC4 = critical
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: TGS Request Without Preceding TGT Issuance (Forged TGT Indicator)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  This is the most specific Golden Ticket indicator available from Windows
+#  event logs: Event 4769 (TGS request) fires for a user account, but there
+#  is NO corresponding Event 4768 (TGT issuance) for that user in the lookback
+#  window on the same DC. Normal Kerberos flow: AS-REQ → 4768 → KDC issues TGT
+#  → client sends TGT in TGS-REQ → 4769. A forged TGT bypasses the AS-REQ
+#  entirely — the DC never issued it, so 4768 never fires.
+#
+#  IMPORTANT LIMITATIONS AND CAVEATS:
+#  - TGT lifetime = 10 hours default; 4768 may be in an earlier search window
+#    Use a lookback of 10+ hours to reduce FPs from normal TGT lifetime
+#  - Multi-DC environments: 4768 may fire on a different DC than 4769
+#    Expand search across ALL DCs in the same Splunk query for accuracy
+#  - Log gaps or late-arriving events can cause false positives
+#  - This rule is best used as part of a risk score, not a standalone alert
+#
+#  Confidence  : MEDIUM (due to limitations above)
+#  Severity    : HIGH
+#  FP Rate     : Medium — lookback window tuning is critical
+#  Tools caught: Mimikatz kerberos::golden /ptt, Impacket ticketer.py,
+#                Rubeus golden /ptt, any golden ticket injection
+
+rule_3_tgs_without_tgt:
+  name: "Kerberos TGS Request Without Preceding TGT Issuance (Forged TGT — Golden Ticket)"
+  description: >
+    Correlates Event 4769 (TGS request) against Event 4768 (TGT issuance)
+    over a 10-hour lookback window across ALL Domain Controllers. A Golden
+    Ticket bypasses the KDC AS-REQ step entirely — the DC never issues the
+    forged TGT, so Event 4768 is absent while Event 4769 fires normally.
+    The absence of a 4768 for the same TargetUserName within the TGT lifetime
+    window strongly suggests the TGT was forged offline.
+    NOTE: This rule uses a subsearch/NOT approach — performance-test against
+    your DC log volume before deploying at full scale. For very high-volume
+    environments, consider a lookup-based approach (generate TGT list into a
+    lookup, then compare against TGS events).
+  mitre:
+    tactic: Credential Access
+    technique: T1558.001
+    technique_name: "Steal or Forge Kerberos Tickets: Golden Ticket"
+  severity: high
+  confidence: 65
+  risk_score: 80
+  data_sources:
+    - "Windows Security Event Log (EventCode 4768)"
+    - "Windows Security Event Log (EventCode 4769)"
+
+  search: |
+    ```Step 1: Collect all TGS requests (4769) in the last 5 minutes```
+    ```Only for user accounts (exclude computer accounts ending in $)```
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+        Status="0x0"
+    | where NOT match(TargetUserName, "\$$")
+    | where NOT match(TargetUserName, "@.*\\$$")
+    | where NOT TargetUserName IN ("-", "", "ANONYMOUS LOGON")
+    ```Normalize TargetUserName — strip domain suffix for correlation```
+    | eval tgs_user=lower(replace(TargetUserName, "@.*$", ""))
+    | eval tgs_domain=TargetDomainName
+    | eval tgs_time=_time
+    | stats
+        min(_time) as first_tgs_time,
+        max(_time) as last_tgs_time,
+        count as tgs_count,
+        values(ServiceName) as services_requested,
+        values(TicketEncryptionType) as encryption_types,
+        values(IpAddress) as source_ips,
+        values(TicketOptions) as ticket_options
+        by tgs_user, tgs_domain, ComputerName
+    ```Step 2: Check if a TGT was issued for these users in the last 10 hours```
+    ```(TGT max lifetime = 10 hours = 36000 seconds)```
+    | join type=left tgs_user
+        [
+            search index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4768
+                Status="0x0"
+                earliest="-10h"
+            | where NOT match(TargetUserName, "\$$")
+            | eval tgs_user=lower(replace(TargetUserName, "@.*$", ""))
+            | stats
+                max(_time) as last_tgt_time,
+                count as tgt_count,
+                values(TicketEncryptionType) as tgt_enc_types,
+                values(IpAddress) as tgt_source_ips
+                by tgs_user
+            | eval has_tgt="YES"
+        ]
+    ```Only keep records where NO TGT was found in the 10-hour window```
+    | where isnull(has_tgt) OR has_tgt!="YES"
+    ```Exclude service-to-service Kerberos delegations that may not have 4768```
+    | where NOT match(services_requested, "(?i)^krbtgt")
+    ```Exclude known Kerberos-constrained delegation service accounts```
+    | where NOT tgs_user IN (
+        "svc_kcd_proxy",
+        "svc_delegation"
+    )
+    ```Flag RC4 encryption in missing-TGT scenarios (highest confidence golden ticket)```
+    | eval rc4_with_no_tgt=if(
+        like(encryption_types, "%0x17%") AND isnull(has_tgt),
+        "CRITICAL — RC4 TGS with no TGT issuance record",
+        "HIGH — TGS with no TGT issuance record"
+    )
+    | eval tgt_absence_window_hours=10
+    | eval mitre_technique="T1558.001"
+    | eval alert_name="Kerberos TGS Without Preceding TGT — Potential Golden Ticket"
+    | table first_tgs_time, last_tgs_time, tgs_user, tgs_domain, ComputerName,
+            services_requested, source_ips, encryption_types, ticket_options,
+            tgs_count, tgt_absence_window_hours, rc4_with_no_tgt,
+            mitre_technique, alert_name
+    | sort - tgs_count
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "tgs_user"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "TGS Without TGT — $tgs_user$ ($rc4_with_no_tgt$)"
+        severity: high
+    - risk:
+        risk_object: "tgs_user"
+        risk_object_type: "user"
+        risk_score: 80
+
+  known_false_positives:
+    - "Event log forwarding delays — 4768 arrives late; expand lookback window to 12 hours"
+    - "TGT issued on a different DC than where TGS was requested (multi-DC environments)"
+    - "Cross-realm Kerberos trusts — 4768 fires in the foreign realm, not the local DC"
+    - "S4U2Self (Service For User to Self) delegations — service accounts may get TGS without TGT"
+    - "Kerberos FAST pre-authentication may generate slightly different event patterns"
+  tuning_guidance: |
+    1. CRITICAL: Run a baseline to understand your normal TGT→TGS lag in your environment
+    2. If your DCs are in different sites with different Splunk forwarder latencies, increase
+       the join lookback (earliest="-12h") to accommodate collection delays
+    3. Exclude well-known delegation accounts explicitly by name
+    4. Combine this rule with Rule 1 (RC4 TGT) and Rule 2 (RC4 TGS) for high-confidence alerts
+    5. The Lookup+Stats pattern is more performant than join for large environments:
+       Generate a lookup of tgt_users each cycle, then compare against 4769 events
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Special Privilege Logon Correlated with Kerberos Network Logon
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects Event 4672 (special privileges — typically SeDebugPrivilege +
+#  high-sensitivity privilege set) occurring within seconds of a Kerberos
+#  Type 3 (network) logon (Event 4624), where the account does NOT have
+#  a corresponding 4768 TGT issuance in the lookback window.
+#  A valid Golden Ticket presented to a target server triggers:
+#   1. Event 4769 on the DC (TGS request for the target server's SPN)
+#   2. Event 4624 (Type 3 Kerberos) on the target server
+#   3. Event 4672 (special privileges) on the target server if the
+#      forged PAC includes admin SIDs (Mimikatz default includes DA SIDs)
+#
+#  The combination of 4624 Type 3 Kerberos + 4672 with SeDebugPrivilege on
+#  a sensitive server, for an account with NO 4768 on any DC in the window,
+#  is a very strong Golden Ticket indicator.
+#
+#  Confidence  : MEDIUM-HIGH
+#  Severity    : HIGH
+#  FP Rate     : Medium — legitimate DA remote logons also generate this pattern
+#  Tools caught: Any golden ticket used to authenticate to a sensitive server
+
+rule_4_special_priv_kerberos_logon_no_tgt:
+  name: "Special Privilege Kerberos Logon Without TGT Issuance — Golden Ticket Usage"
+  description: >
+    Correlates Event 4672 (special privileges assigned) with Event 4624
+    (Type 3 Kerberos network logon) on sensitive servers (DCs, admin servers)
+    for accounts that have NO corresponding Event 4768 (TGT issuance) on any
+    DC in the past 10 hours. A forged Golden Ticket used to laterally access
+    a privileged server grants the PAC-embedded admin SIDs (Domain Admins 512,
+    Enterprise Admins 519), triggering Event 4672 with high-sensitivity
+    privileges. The absence of 4768 distinguishes forged-TGT access from
+    legitimate DA remote logons.
+  mitre:
+    tactic: "Credential Access, Lateral Movement"
+    technique: T1558.001
+    technique_name: "Steal or Forge Kerberos Tickets: Golden Ticket"
+  severity: high
+  confidence: 70
+  risk_score: 85
+  data_sources:
+    - "Windows Security Event Log (EventCode 4624)"
+    - "Windows Security Event Log (EventCode 4672)"
+    - "Windows Security Event Log (EventCode 4768)"
+
+  search: |
+    ```Collect special privilege logons with Kerberos Type 3```
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4624
+        LogonType=3
+        AuthenticationPackageName="Kerberos"
+    | where NOT match(TargetUserName, "\$$")
+    | where NOT TargetUserName IN ("ANONYMOUS LOGON", "-", "")
+    ```Normalize username```
+    | eval norm_user=lower(TargetUserName)
+    ```Join with 4672 on same Logon_ID```
+    | join type=inner Logon_ID
+        [
+            search index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4672
+            ```Focus on logons with high-sensitivity privilege set```
+            | where (
+                like(PrivilegeList, "%SeDebugPrivilege%") OR
+                like(PrivilegeList, "%SeTcbPrivilege%") OR
+                like(PrivilegeList, "%SeBackupPrivilege%") OR
+                like(PrivilegeList, "%SeRestorePrivilege%") OR
+                like(PrivilegeList, "%SeCreateTokenPrivilege%") OR
+                like(PrivilegeList, "%SeAssignPrimaryTokenPrivilege%")
+            )
+            | rename SubjectLogonId as Logon_ID
+            | fields Logon_ID, PrivilegeList, SubjectUserName, SubjectDomainName
+        ]
+    ```Normalize for TGT correlation```
+    | eval norm_user=lower(TargetUserName)
+    | stats
+        min(_time) as logon_time,
+        max(_time) as last_event_time,
+        count as event_count,
+        values(IpAddress) as source_ips,
+        values(WorkstationName) as source_workstations,
+        values(Logon_ID) as logon_ids,
+        values(PrivilegeList) as privilege_lists,
+        values(LogonGuid) as logon_guids
+        by norm_user, TargetDomainName, ComputerName
+    ```Check for TGT on ANY DC in the last 10 hours for this user```
+    | join type=left norm_user
+        [
+            search index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4768
+                Status="0x0"
+                earliest="-10h"
+            | where NOT match(TargetUserName, "\$$")
+            | eval norm_user=lower(replace(TargetUserName, "@.*$", ""))
+            | stats max(_time) as last_tgt_time by norm_user
+            | eval has_tgt="YES"
+        ]
+    | where isnull(has_tgt) OR has_tgt!="YES"
+    ```Filter to sensitive server types (customize with your asset categories)```
+    | lookup dc_ip_list.csv ip as ComputerName OUTPUT role as server_role
+    | eval server_is_sensitive=if(
+        isnotnull(server_role) AND server_role IN ("domain_controller","tier0_admin"),
+        "YES", "UNKNOWN"
+    )
+    | eval privilege_severity=case(
+        like(privilege_lists, "%SeTcbPrivilege%") OR
+        like(privilege_lists, "%SeCreateTokenPrivilege%"), "CRITICAL",
+        like(privilege_lists, "%SeDebugPrivilege%") AND
+        like(privilege_lists, "%SeBackupPrivilege%"), "HIGH",
+        like(privilege_lists, "%SeDebugPrivilege%"), "HIGH",
+        1==1, "MEDIUM"
+    )
+    | eval mitre_technique="T1558.001"
+    | eval alert_name="Special Priv Kerberos Logon With No TGT — Golden Ticket Indicator"
+    | table logon_time, last_event_time, norm_user, TargetDomainName, ComputerName,
+            source_ips, source_workstations, privilege_lists, privilege_severity,
+            server_is_sensitive, logon_ids, mitre_technique, alert_name
+    | sort - privilege_severity
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "norm_user"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Special Priv Kerberos Logon No TGT — $norm_user$ on $ComputerName$"
+        severity: high
+    - risk:
+        risk_object: "norm_user"
+        risk_object_type: "user"
+        risk_score: 85
+
+  known_false_positives:
+    - "Legitimate Domain Admin remote logons where 4768 occurred on a different DC or outside the 10h window"
+    - "Planned maintenance during off-hours where admin logged on before this rule's lookback"
+    - "Service accounts with high privileges that authenticate via Kerberos S4U2Self"
+  tuning_guidance: |
+    1. Maintain an asset lookup (dc_ip_list.csv) with tier-0 server categories
+    2. Increase lookback to -12h if log forwarding latency causes TGT events to arrive late
+    3. Combine with Rule 3 (TGS without TGT) for very high-confidence correlation
+    4. Suppress accounts that appear regularly in 4672 on DCs (known DA maintenance accounts)
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Kerberos Service Tickets for krbtgt Service (Abnormal TGT Use)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects Event 4769 where ServiceName = "krbtgt" or ServiceName contains
+#  the krbtgt service. Normally, 4769 fires for non-TGT services. A 4769
+#  for the krbtgt service indicates ticket renewal or abnormal TGT-level
+#  operations. Mimikatz and some golden ticket tools may generate this
+#  pattern when renewing or manipulating TGT tickets at the service level.
+#
+#  Separately, any request where TargetUserName is a known protected/sensitive
+#  account (krbtgt, Administrator, DA accounts) AND TicketEncryptionType is
+#  RC4 is a very strong indicator.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL (when combined with RC4)
+#  FP Rate     : Low
+
+rule_5_krbtgt_service_ticket_anomaly:
+  name: "Kerberos Ticket Request Targeting krbtgt Service — Abnormal TGT Manipulation"
+  description: >
+    Detects Event 4769 (TGS request) where the ServiceName field contains
+    "krbtgt", which should not normally appear in TGS requests (4769 is for
+    service tickets, not TGT renewals). Additionally catches ticket requests
+    where TargetUserName matches the domain Administrator account (RID 500
+    pattern) combined with RC4 encryption — Mimikatz defaults to using
+    Administrator as the username when forging golden tickets, making any
+    RC4 TGS from "administrator" highly suspicious in AES-enforced environments.
+  mitre:
+    tactic: Credential Access
+    technique: T1558.001
+    technique_name: "Steal or Forge Kerberos Tickets: Golden Ticket"
+  severity: critical
+  confidence: 85
+  risk_score: 90
+  data_sources:
+    - "Windows Security Event Log (EventCode 4769)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+        Status="0x0"
+    ```Filter to anomalous patterns — krbtgt service TGS OR admin account + RC4```
+    | where (
+        match(ServiceName, "(?i)krbtgt")
+        OR (
+            match(TargetUserName, "(?i)^administrator@") AND
+            TicketEncryptionType="0x17"
+        )
+        OR (
+            match(TargetUserName, "(?i)^administrator$") AND
+            TicketEncryptionType="0x17"
+        )
+    )
+    ```Exclude legitimate krbtgt service for TGT renewals from known-good DCs```
+    | where NOT IpAddress IN ("127.0.0.1", "::1")
+    | lookup dc_ip_list.csv ip as IpAddress OUTPUT role as src_role
+    | where isnull(src_role) OR src_role!="domain_controller"
+    ```Classify the anomaly type```
+    | eval anomaly_type=case(
+        match(ServiceName, "(?i)krbtgt"),
+            "KRBTGT as service target (abnormal TGT-level operation)",
+        match(TargetUserName, "(?i)administrator") AND TicketEncryptionType="0x17",
+            "Administrator account using RC4 (Mimikatz golden ticket default username)",
+        1==1, "Unknown pattern"
+    )
+    | stats
+        min(_time) as first_event_time,
+        max(_time) as last_event_time,
+        count as request_count,
+        values(ServiceName) as service_names,
+        values(TicketEncryptionType) as enc_types,
+        values(TicketOptions) as ticket_options,
+        values(anomaly_type) as anomaly_types,
+        values(IpAddress) as source_ips
+        by TargetUserName, TargetDomainName, ComputerName
+    | eval mitre_technique="T1558.001"
+    | eval alert_name="CRITICAL — krbtgt Service Ticket / Admin RC4 TGS Anomaly"
+    | table first_event_time, last_event_time, TargetUserName, TargetDomainName,
+            ComputerName, service_names, enc_types, ticket_options,
+            source_ips, request_count, anomaly_types,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "TargetUserName"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "CRITICAL — krbtgt TGS Anomaly — $TargetUserName$ on $ComputerName$"
+        severity: critical
+    - risk:
+        risk_object: "TargetUserName"
+        risk_object_type: "user"
+        risk_score: 90
+
+  known_false_positives:
+    - "The built-in Administrator account legitimately logging in with RC4 from legacy systems"
+    - "Kerberos TGT renewal packets that mis-classify as 4769 on some platforms"
+  tuning_guidance: |
+    1. This rule has very few legitimate triggers — treat all alerts as high priority
+    2. If the built-in Administrator account is regularly used (not recommended), add
+       a separate approved-host list to scope this to unexpected source IPs
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Abnormal Kerberos Ticket Encryption Mix — AES TGT with RC4 TGS
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects a specific Golden Ticket indicator pattern where a user's TGT was
+#  requested using AES (0x12) in Event 4768, but subsequent TGS requests
+#  (Event 4769) for the SAME user use RC4 (0x17). This can happen when an
+#  attacker has RC4-encrypted the golden ticket but the environment issued
+#  an AES TGT — indicating the RC4 TGS is coming from a separately injected
+#  forged ticket, not derived from the legitimate TGT.
+#
+#  Confidence  : MEDIUM
+#  Severity    : HIGH
+#  FP Rate     : Low-Medium
+
+rule_6_tgt_tgs_encryption_mismatch:
+  name: "Kerberos Encryption Type Mismatch — AES TGT but RC4 TGS (Forged Ticket Indicator)"
+  description: >
+    Detects cases where the same user account has an AES TGT issuance record
+    (4768 with TicketEncryptionType=0x12) in the last 10 hours, but their
+    TGS requests (4769) use RC4 (0x17). This mismatch is anomalous because
+    legitimate Kerberos behavior derives TGS encryption from the TGT's
+    session key. An RC4 TGS when the TGT was AES suggests the TGS was
+    obtained using a separately forged/injected RC4 golden ticket running
+    concurrently with the legitimate session.
+  mitre:
+    tactic: Credential Access
+    technique: T1558.001
+    technique_name: "Steal or Forge Kerberos Tickets: Golden Ticket"
+  severity: high
+  confidence: 70
+  risk_score: 85
+  data_sources:
+    - "Windows Security Event Log (EventCode 4768)"
+    - "Windows Security Event Log (EventCode 4769)"
+
+  search: |
+    ```Collect TGS requests with RC4 encryption from non-machine accounts```
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+        TicketEncryptionType="0x17"
+        Status="0x0"
+    | where NOT match(TargetUserName, "\$$")
+    | where NOT TargetUserName IN ("-", "")
+    | eval norm_user=lower(replace(TargetUserName, "@.*$", ""))
+    | stats
+        min(_time) as tgs_time,
+        count as rc4_tgs_count,
+        values(ServiceName) as services,
+        values(IpAddress) as tgs_source_ips
+        by norm_user, TargetDomainName, ComputerName
+    ```Join with TGT events for the same user — look for AES TGTs```
+    | join type=inner norm_user
+        [
+            search index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4768
+                TicketEncryptionType IN ("0x11", "0x12")
+                Status="0x0"
+                earliest="-10h"
+            | where NOT match(TargetUserName, "\$$")
+            | eval norm_user=lower(replace(TargetUserName, "@.*$", ""))
+            | stats
+                max(_time) as tgt_time,
+                values(TicketEncryptionType) as tgt_enc_types,
+                count as aes_tgt_count,
+                values(IpAddress) as tgt_source_ips
+                by norm_user
+            | eval has_aes_tgt="YES"
+        ]
+    ```Only alert when BOTH conditions met: AES TGT exists AND RC4 TGS fires```
+    | where has_aes_tgt="YES"
+    ```Calculate time delta between TGT and TGS```
+    | eval tgt_tgs_delta_minutes=round((tgs_time - tgt_time) / 60, 1)
+    | eval anomaly_detail=norm_user." had AES TGT (enc=".tgt_enc_types.
+        ") but used RC4 for TGS ".tgt_tgs_delta_minutes." minutes later — encryption mismatch suggests forged ticket"
+    | eval mitre_technique="T1558.001"
+    | eval alert_name="Kerberos TGT/TGS Encryption Mismatch — Forged Ticket Indicator"
+    | table tgs_time, tgt_time, norm_user, TargetDomainName, ComputerName,
+            services, tgs_source_ips, tgt_source_ips,
+            tgt_enc_types, rc4_tgs_count, tgt_tgs_delta_minutes,
+            anomaly_detail, mitre_technique, alert_name
+    | sort - rc4_tgs_count
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-15m"
+    latest: "now"
+  throttle:
+    field: "norm_user"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "TGT/TGS Encryption Mismatch — AES TGT vs RC4 TGS for $norm_user$"
+        severity: high
+    - risk:
+        risk_object: "norm_user"
+        risk_object_type: "user"
+        risk_score: 85
+
+  known_false_positives:
+    - "Very rare scenario; primary FP is log collection ordering where RC4 TGS appears
+       to precede the AES TGT in Splunk due to ingestion timing — verify _time vs index time"
+  tuning_guidance: |
+    1. Verify _time values reflect actual event timestamp, not Splunk index time
+    2. This pattern is rare even in large environments — treat as high-fidelity
+    3. Investigate tgt_source_ips vs tgs_source_ips: if they differ, it strongly
+       suggests two separate sessions/tickets running in parallel (forged + legitimate)
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  INVESTIGATION QUERIES — Run manually during incident response
+# ██████████████████████████████████████████████████████████████████████████████
+
+investigation_queries:
+
+  # --- Query A: Full Kerberos timeline for a suspicious account ---
+  kerberos_account_timeline:
+    description: >
+      Reconstruct the complete Kerberos activity timeline for a suspected
+      compromised account — all TGT requests, TGS requests, logons, and
+      special privilege assignments.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode IN (4768, 4769, 4624, 4672, 4771)
+          TargetUserName="<SUSPICIOUS_ACCOUNT>*"
+          earliest="-48h"
+      | eval event_type=case(
+          EventCode==4768, "TGT Request (AS-REQ)",
+          EventCode==4769, "TGS Request",
+          EventCode==4624, "Logon (Type ".LogonType.")",
+          EventCode==4672, "Special Privileges Assigned",
+          EventCode==4771, "TGT Request FAILED"
+        )
+      | table _time, event_type, EventCode, TargetUserName,
+              ServiceName, TicketEncryptionType, TicketOptions,
+              IpAddress, Status, ComputerName, PrivilegeList
+      | sort + _time
+
+  # --- Query B: Enumerate all RC4 Kerberos events in the last 24 hours (baseline) ---
+  rc4_baseline:
+    description: >
+      Baseline query to identify all RC4 Kerberos events. Run before deploying
+      detection rules to understand which accounts/systems legitimately use RC4.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode IN (4768, 4769)
+          TicketEncryptionType IN ("0x17", "0x18", "0x3")
+          Status="0x0"
+          earliest="-24h"
+      | eval event_type=if(EventCode==4768, "TGT (4768)", "TGS (4769)")
+      | stats
+          count,
+          dc(ServiceName) as unique_services,
+          values(IpAddress) as source_ips,
+          values(TicketEncryptionType) as enc_types,
+          min(_time) as first_seen,
+          max(_time) as last_seen
+          by TargetUserName, TargetDomainName, event_type, ComputerName
+      | sort - count
+
+  # --- Query C: Detect Golden Ticket by LogonGuid cross-correlation ---
+  logonguid_tgt_correlation:
+    description: >
+      Correlate Event 4769 LogonGuid back to the TGT's 4768 event.
+      If 4769's LogonGuid does not match any 4768 LogonGuid for the same
+      user in the lookback window, the TGT may be forged.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+          Status="0x0"
+          earliest="-2h"
+      | where NOT match(TargetUserName, "\$$")
+      | where LogonGuid!="{00000000-0000-0000-0000-000000000000}"
+      | table _time, TargetUserName, ServiceName, TicketEncryptionType,
+              IpAddress, LogonGuid, ComputerName
+      | join type=left LogonGuid
+          [
+              search index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4768
+                  Status="0x0" earliest="-10h"
+              | rename TargetUserName as tgt_user
+              | table LogonGuid, tgt_user, IpAddress, TicketEncryptionType
+              | eval tgt_confirmed="YES"
+          ]
+      | where isnull(tgt_confirmed)
+      | table _time, TargetUserName, ServiceName, TicketEncryptionType,
+              IpAddress, LogonGuid, ComputerName
+
+  # --- Query D: All TGS requests from a specific source IP (lateral movement map) ---
+  lateral_movement_from_ip:
+    description: >
+      Enumerate all Kerberos service ticket requests from a specific IP address.
+      Used to map lateral movement footprint after a golden ticket is confirmed.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+          Status="0x0"
+          IpAddress="<ATTACKER_IP>"
+          earliest="-24h"
+      | stats
+          count,
+          dc(ServiceName) as unique_services,
+          values(ServiceName) as services_accessed,
+          values(TargetUserName) as users,
+          values(TicketEncryptionType) as enc_types,
+          min(_time) as first_seen,
+          max(_time) as last_seen
+          by ComputerName, IpAddress
+      | sort - count
+
+  # --- Query E: Ticket option anomaly survey ---
+  ticket_options_survey:
+    description: >
+      Survey TicketOptions values in TGS requests to identify non-standard
+      flag combinations. Mimikatz forged tickets often use
+      0x40e10000 or other atypical combinations.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4769
+          Status="0x0"
+          earliest="-24h"
+      | where NOT TicketOptions IN (
+          "0x40810010", "0x40810000", "0x40800010", "0x60810010",
+          "0x50800000", "0x40a10000"
+        )
+      | where NOT match(TargetUserName, "\$$")
+      | stats
+          count,
+          values(TargetUserName) as users,
+          values(ServiceName) as services,
+          values(IpAddress) as source_ips
+          by TicketOptions, ComputerName
+      | sort - count
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RESPONSE PLAYBOOK — Actions upon confirmed Golden Ticket detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+response_playbook:
+  name: "Golden Ticket Attack — Incident Response Procedure"
+  description: >
+    A confirmed Golden Ticket attack means the attacker holds the KRBTGT
+    NTLM hash and can forge TGTs indefinitely until the KRBTGT password is
+    rotated TWICE (Kerberos ticket lifetime must expire between resets).
+
+  immediate_actions:
+    - step: 1
+      action: "Isolate confirmed attacker source hosts"
+      detail: >
+        Network-isolate all systems from which suspicious RC4 TGS/TGT
+        events originated (IpAddress values in the alert). Use EDR
+        network containment. Do NOT shut down — preserve volatile memory.
+
+    - step: 2
+      action: "Identify compromised KRBTGT hash source"
+      detail: >
+        Determine HOW the attacker obtained the KRBTGT hash. Check for:
+        - DCSync events (Event 4662 with replication rights) in the last 30 days
+        - LSASS dump events on DCs (Sysmon Event 10 targeting lsass.exe)
+        - NTDS.dit extraction (Volume Shadow Copy access, ntdsutil, vssadmin)
+        Correlate with same source IPs from the golden ticket events.
+
+    - step: 3
+      action: "Reset the KRBTGT password (twice with 12-hour gap)"
+      detail: >
+        CRITICAL: Reset the KRBTGT account password twice. The first reset
+        invalidates tickets encrypted with the OLD hash. After 10 hours
+        (default TGT max lifetime), all legitimate TGTs have been renewed
+        with the new key. A second reset then invalidates any tickets
+        that were renewed during the window between first and second reset.
+        After BOTH resets, all pre-existing golden tickets are invalid.
+      commands:
+        - "# First reset (run on PDC Emulator)"
+        - "Set-ADAccountPassword -Identity krbtgt -Reset -NewPassword (ConvertTo-SecureString -AsPlainText 'NewRandomPassword1!' -Force)"
+        - "# Wait 10+ hours, then:"
+        - "Set-ADAccountPassword -Identity krbtgt -Reset -NewPassword (ConvertTo-SecureString -AsPlainText 'NewRandomPassword2!' -Force)"
+      reference: "https://docs.microsoft.com/en-us/windows-server/identity/ad-ds/manage/forest-recovery-guide/ad-forest-recovery-resetting-the-krbtgt-password"
+
+    - step: 4
+      action: "Reset all Tier 0 account passwords"
+      detail: >
+        Reset passwords for ALL accounts that were included in the forged
+        PAC (Domain Admins, Enterprise Admins, Schema Admins, Administrator).
+        Mimikatz embeds DA SIDs by default — those accounts may have been
+        impersonated throughout the attack.
+
+    - step: 5
+      action: "Enable AES-only Kerberos enforcement"
+      detail: >
+        Configure "Network security: Configure encryption types allowed for
+        Kerberos" GPO to enforce AES128+AES256 only. This prevents future
+        RC4 golden tickets from appearing legitimate and triggers detection
+        rules immediately on any RC4 usage.
+
+  forensic_actions:
+    - "Collect memory from attacker source hosts — look for Mimikatz, Rubeus, or Impacket artifacts"
+    - "Review Event 4769 history for 30 days back with TargetUserName of compromised accounts"
+    - "Map all servers accessed via golden ticket (IpAddress values from 4769 events)"
+    - "Check for DCSync (Event 4662) to confirm how KRBTGT hash was obtained"
+    - "Search for persistence: scheduled tasks (4698), WMI subscriptions (5860), new services (4697)"
+    - "Review Active Directory for new privileged accounts or group membership changes after attack window"
+    - "Check all Tier 0 servers for new local accounts (Event 4720) or admin group additions (Event 4732)"
+    - "Examine Splunk index for any log gaps or forwarding interruptions (attacker may have disabled logging)"

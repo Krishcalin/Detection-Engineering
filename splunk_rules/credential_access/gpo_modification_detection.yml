@@ -1,0 +1,1545 @@
+# ==============================================================================
+#  GPO Modification Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for malicious Group Policy Object (GPO)
+#                modification attacks. Covers LDAP-layer GPO object changes
+#                (Event 5136/5137), SYSVOL file modification (Sysmon Event 11),
+#                PowerShell GroupPolicy module abuse, and native GPMC-based
+#                attacks using SharpGPOAbuse, StandIn, and PowerSploit GPO
+#                cmdlets.
+#
+#                GPOs (Group Policy Objects) control security settings, software
+#                deployment, login scripts, scheduled tasks, and registry settings
+#                for all computers and users in a domain or OU. A single GPO
+#                linked to the Domain root executes on EVERY domain-joined machine.
+#                Adversaries modify GPOs to achieve mass lateral movement, mass
+#                persistence, or domain-wide defense disabling — a single change
+#                can weaponize an entire Active Directory forest.
+#
+#                Attack paths:
+#                  a) Add malicious startup/logon script via GPO → executes on boot/login
+#                  b) Deploy malicious scheduled task via GPO → executes on all targets
+#                  c) Modify security settings → disable Windows Defender, firewall
+#                  d) Modify registry via GPO → persistence on all domain machines
+#                  e) Software Installation GPO → deploy malware via MSI/EXE
+#
+#  MITRE ATT&CK: T1484.001 — Domain Policy Modification: Group Policy Object
+#  Related      : T1059.001 — PowerShell (GroupPolicy module abuse)
+#                 T1053.005 — Scheduled Task/Job: Scheduled Task (via GPO)
+#                 T1037.001 — Boot or Logon Initialization Scripts: Logon Script
+#                 T1562.001 — Impair Defenses: Disable or Modify Tools (via GPO)
+#  Kill Chain   : Persistence, Defense Evasion, Lateral Movement, Execution
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-04
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES (must be configured BEFORE these rules will generate detections):
+#
+#  1. Enable Advanced Audit Policy on ALL Domain Controllers:
+#     Computer Configuration > Windows Settings > Security Settings >
+#       Advanced Audit Policy Configuration > Audit Policies:
+#
+#       DS Access > "Audit Directory Service Changes" → Enable SUCCESS
+#         (generates Events 5136, 5137, 5138, 5141 for AD object modifications)
+#       DS Access > "Audit Directory Service Access"  → Enable SUCCESS
+#         (generates Event 4662 for AD object access)
+#       Detailed Tracking > "Audit Process Creation"  → Enable SUCCESS
+#         (generates Event 4688 for process creation including gpmc.msc, powershell)
+#       Policy Change > "Audit Audit Policy Change"   → Enable SUCCESS
+#         (generates Event 4739 for domain policy changes)
+#
+#  2. Enable Command Line Logging in Process Creation events (Event 4688):
+#     Computer Configuration > Administrative Templates > System >
+#       Audit Process Creation >
+#         "Include command line in process creation events" → Enabled
+#
+#  3. Enable PowerShell Script Block Logging on Domain Controllers and admin workstations:
+#     Computer Configuration > Administrative Templates > Windows Components >
+#       Windows PowerShell >
+#         "Turn on PowerShell Script Block Logging" → Enabled
+#
+#  4. Deploy Sysmon on ALL Domain Controllers with SYSVOL file monitoring:
+#     Sysmon Event 11 — File Creation in SYSVOL paths
+#     Required Sysmon Config for SYSVOL monitoring:
+#       <RuleGroup name="FileCreate" groupRelation="or">
+#         <FileCreate onmatch="include">
+#           <TargetFilename condition="contains">SYSVOL</TargetFilename>
+#           <TargetFilename condition="contains">\\Policies\\</TargetFilename>
+#           <TargetFilename condition="end with">scripts.ini</TargetFilename>
+#           <TargetFilename condition="end with">psscripts.ini</TargetFilename>
+#           <TargetFilename condition="end with">GptTmpl.inf</TargetFilename>
+#           <TargetFilename condition="end with">ScheduledTasks.xml</TargetFilename>
+#           <TargetFilename condition="end with">Registry.pol</TargetFilename>
+#           <TargetFilename condition="end with">GPT.INI</TargetFilename>
+#         </FileCreate>
+#       </RuleGroup>
+#     Note: The DFS-R replication service (DFSR) will also write to SYSVOL —
+#     exclude the DFSR process from Sysmon FileCreate rules.
+#
+#  5. Configure SACL on the SYSVOL Policies directory for Event 4663:
+#     This provides a secondary detection layer independent of Sysmon.
+#     Note: SYSVOL generates high volume; Sysmon filtering is more practical.
+#
+#  6. Forward ALL of the following log sources from DCs to Splunk:
+#     - sourcetype=XmlWinEventLog:Security          (Events 5136, 5137, 4739, 4688, 4662)
+#     - sourcetype=XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+#     - sourcetype=XmlWinEventLog:Microsoft-Windows-PowerShell/Operational
+#
+# ==============================================================================
+#
+#  Key LDAP Fields in Event 5136 (Directory Service Object Modified)
+#  as they appear in Splunk sourcetype=XmlWinEventLog:Security:
+#
+#  Field Name                       | Description
+#  -------------------------------- | ---------------------------------------------------
+#  SubjectUserName                  | Account that made the change (SAM name, e.g. jdoe)
+#  SubjectDomainName                | Domain of the modifying account (e.g. CORP)
+#  SubjectUserSid                   | SID of the modifying account
+#  SubjectLogonId                   | Logon session ID of the modifying account
+#  DSName                           | Directory Service name (e.g. corp.example.com)
+#  DSType                           | Directory service type (%%14676 = Active Directory DS)
+#  ObjectDN                         | Distinguished Name of the modified object
+#                                   | Example:
+#                                   | CN={31B2F340-016D-11D2-945F-00C04FB984F9},
+#                                   |   CN=Policies,CN=System,DC=corp,DC=example,DC=com
+#  ObjectGUID                       | GUID of the modified AD object
+#  ObjectClass                      | Class of the modified object (e.g. groupPolicyContainer)
+#  AttributeLDAPDisplayName         | LDAP name of the modified attribute (see below)
+#  AttributeSyntaxOID               | OID of the attribute syntax
+#  AttributeValue                   | New value of the modified attribute
+#  OperationType                    | %%14675 = Add value
+#                                   | %%14676 = Delete value
+#                                   | %%14674 = Modify (used with delete + add pair)
+#  OpCorrelationID                  | GUID correlating the delete + add pair for a single change
+#
+#  Key AttributeLDAPDisplayName values for GPO changes:
+#  Attribute                        | Description
+#  -------------------------------- | ---------------------------------------------------
+#  gPCFileSysPath                   | UNC path to the GPO's SYSVOL folder
+#                                   | Example: \\corp.example.com\SysVol\corp.example.com\
+#                                   |           Policies\{31B2F340-016D-11D2-945F-00C04FB984F9}
+#  gPCFunctionalityVersion          | Internal version flag (0=user disabled, 1=comp, 2=user, 3=both)
+#  versionNumber                    | Incremented each time the GPO is modified
+#  flags                            | 0=both enabled, 1=user disabled, 2=comp disabled, 3=all disabled
+#  displayName                      | Human-readable GPO name
+#  nTSecurityDescriptor             | GPO ACL changes (delegation modifications)
+#  gPLink                           | OU object attribute: links a GPO to an OU/domain
+#                                   | Example: [LDAP://cn={GUID},cn=policies,cn=system,...;0]
+#  gPOptions                        | Enforcement/block inheritance options on the OU link
+#
+#  Key Event 5137 fields (Object Created — new GPO created):
+#  Same fields as 5136 except no OperationType (creation, not modification)
+#
+#  Key Event 5141 fields (Object Deleted):
+#  ObjectDN, SubjectUserName, SubjectDomainName — which GPO was deleted by whom
+#
+# ==============================================================================
+#
+#  GPO DN Format Reference:
+#
+#  GPO object in AD:
+#    CN={<GPO-GUID>},CN=Policies,CN=System,DC=<domain>,DC=<tld>
+#    Example:
+#    CN={31B2F340-016D-11D2-945F-00C04FB984F9},CN=Policies,CN=System,DC=corp,DC=example,DC=com
+#
+#  Well-known built-in GPO GUIDs (Default GPOs — should NEVER be modified by users):
+#    {31B2F340-016D-11D2-945F-00C04FB984F9}  — Default Domain Policy
+#    {6AC1786C-016F-11D2-945F-00C04FB984F9}  — Default Domain Controllers Policy
+#
+#  GPO link on an OU (stored in gPLink attribute of the OU object):
+#    [LDAP://cn={<GPO-GUID>},cn=policies,cn=system,DC=corp,DC=example,DC=com;0]
+#    Flags: ;0=not enforced, ;1=disabled, ;2=enforced (cannot be blocked by child OU)
+#
+# ==============================================================================
+#
+#  SYSVOL Path Patterns:
+#
+#  UNC Path (from another host):
+#    \\<domain>\SYSVOL\<domain>\Policies\{<GPO-GUID>}\
+#    Example:
+#    \\corp.example.com\SYSVOL\corp.example.com\Policies\{31B2F340-016D-11D2-945F-00C04FB984F9}\
+#
+#  Local path on Domain Controller:
+#    C:\Windows\SYSVOL\sysvol\<domain>\Policies\{<GPO-GUID>}\
+#    OR (DFS-R replication staging):
+#    C:\Windows\SYSVOL_DFSR\sysvol\<domain>\Policies\{<GPO-GUID>}\
+#
+#  Key files within a GPO folder:
+#    GPT.INI                         — GPO version tracking (versionNumber)
+#    {Machine|User}\Scripts\scripts.ini     — Startup/Shutdown/Logon/Logoff scripts
+#    {Machine|User}\Scripts\psscripts.ini   — PowerShell startup/logon scripts
+#    {Machine|User}\Microsoft\Windows NT\SecEdit\GptTmpl.inf   — Security template
+#    {Machine|User}\Preferences\ScheduledTasks\ScheduledTasks.xml — Scheduled tasks
+#    {Machine|User}\Preferences\Registry\Registry.pol           — Registry settings
+#    {Machine|User}\Applications\                               — Software installation
+#
+# ==============================================================================
+#
+#  Attack Tool Reference:
+#
+#  Tool                   | Command Pattern                                      | Event IDs
+#  ---------------------- | ---------------------------------------------------- | ----------------
+#  SharpGPOAbuse          | SharpGPOAbuse.exe --AddLocalAdmin --GPOName "..."    | 4688/Sysmon 1
+#                         | SharpGPOAbuse.exe --AddComputerTask --TaskName "..." |
+#  PowerSploit            | Set-DomainObject -Identity "CN={GUID}..." -Set @{..} | 4104, Sysmon 1
+#                         | New-GPO / Set-GPO / New-GPLink (GroupPolicy module)  |
+#  StandIn                | StandIn.exe --gpo --filter "GPOName" --ntaccount ...  | 4688/Sysmon 1
+#  Native GPMC            | via gpmc.msc (mmc.exe spawning gpedit processes)      | 4688, 5136
+#  RSAT GroupPolicy PS    | Import-Module GroupPolicy; Set-GPRegistryValue ...    | 4104, 5136
+#  Direct file write      | Write-Content to SYSVOL\...\scripts.ini              | Sysmon 11
+#  ADSISearcher/LDAP      | [ADSISearcher] or System.DirectoryServices.* calls   | 4104, 5136
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: GPO Modification by Unauthorized Account
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Core detection: Event 5136 fires whenever an AD GPO object attribute is
+#  modified. This rule correlates GPO changes with the identity of the modifier
+#  and flags changes by accounts that are NOT members of the expected GPO
+#  administration groups (Domain Admins, Group Policy Creator Owners, or
+#  designated GPO admins). Any GPO modification by an unexpected account is
+#  a high-confidence indicator of either a compromised privileged account or
+#  a privilege escalation attack.
+#
+#  Confidence  : HIGH
+#  Severity    : HIGH
+#  FP Rate     : Medium — IT admins legitimately modify GPOs; requires allowlist
+
+rule_1_gpo_modification_unauthorized:
+  name: "GPO Modification — Change by Unexpected Account"
+  description: >
+    Detects modification of a Group Policy Object in Active Directory via
+    Windows Security Event 5136 (Directory Service Object Modified). Fires
+    when the modifying account (SubjectUserName) is not on the expected list
+    of GPO administrators. The ObjectDN field contains the GPO's distinguished
+    name in the format CN={GUID},CN=Policies,CN=System,DC=..., and the
+    AttributeLDAPDisplayName field identifies what was changed (gPCFileSysPath,
+    versionNumber, displayName, nTSecurityDescriptor, flags, or gPCFunctionalityVersion).
+    Any modification to a GPO's security settings, path, or version outside
+    an approved change window warrants investigation.
+  mitre:
+    tactic: "Defense Evasion, Privilege Escalation"
+    technique: T1484.001
+    technique_name: "Domain Policy Modification: Group Policy Object"
+  severity: high
+  confidence: 80
+  risk_score: 82
+  kill_chain_phase: "Persistence / Lateral Movement"
+  data_sources:
+    - "Windows Security Event Log (Event ID 5136) — Directory Service Object Modified"
+  prerequisites:
+    - "Audit Directory Service Changes — Success enabled on all DCs"
+    - "Security event logs forwarded to Splunk from all DCs"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5136
+    ```Filter to GPO objects — ObjectClass=groupPolicyContainer and Policies path in DN```
+    | where
+        ObjectClass="groupPolicyContainer"
+        OR like(ObjectDN, "%CN=Policies,CN=System,%")
+    ```Exclude purely machine-driven replication events (no SubjectUserName)```
+    | where isnotnull(SubjectUserName) AND SubjectUserName!="" AND SubjectUserName!="-"
+    ```Exclude DC machine accounts performing AD replication```
+    | where NOT match(SubjectUserName, "\$$")
+    ```Identify the GPO GUID from the ObjectDN```
+    | rex field=ObjectDN
+        "CN=\{(?<gpo_guid>[0-9A-Fa-f\-]{36})\},CN=Policies,CN=System,(?<domain_dn>.*)"
+    ```Flag modifications to the default built-in GPOs (highest risk)```
+    | eval is_default_gpo=case(
+        gpo_guid="31B2F340-016D-11D2-945F-00C04FB984F9",
+            "YES — Default Domain Policy",
+        gpo_guid="6AC1786C-016F-11D2-945F-00C04FB984F9",
+            "YES — Default Domain Controllers Policy",
+        1==1, "NO — custom GPO"
+      )
+    ```Classify what was changed by AttributeLDAPDisplayName```
+    | eval change_category=case(
+        AttributeLDAPDisplayName="gPCFileSysPath",
+            "SYSVOL_PATH — GPO folder location changed (suspicious)",
+        AttributeLDAPDisplayName="versionNumber",
+            "VERSION — GPO content updated (normal with content changes)",
+        AttributeLDAPDisplayName="displayName",
+            "NAME — GPO renamed",
+        AttributeLDAPDisplayName="nTSecurityDescriptor",
+            "ACL — GPO permissions changed (delegation modification)",
+        AttributeLDAPDisplayName="flags",
+            "FLAGS — GPO enabled/disabled state changed",
+        AttributeLDAPDisplayName="gPCFunctionalityVersion",
+            "FUNCTIONALITY_VERSION — GPO version flags changed",
+        1==1,  "OTHER: ".AttributeLDAPDisplayName
+      )
+    ```Determine operation type```
+    | eval operation=case(
+        OperationType="%%14675", "Value Added",
+        OperationType="%%14676", "Value Deleted",
+        OperationType="%%14674", "Value Modified",
+        1==1, OperationType
+      )
+    ```Exclude known GPO admin accounts (customize per environment)```
+    | search NOT SubjectUserName IN ("gpoadmin", "svc_gpo_mgmt", "ansible_deploy",
+                                      "puppet_agent", "chef_client")
+    ```Aggregate modifications per GPO per session```
+    | stats
+        count as change_count,
+        values(change_category) as attributes_changed,
+        values(operation) as operations,
+        values(AttributeValue) as new_values,
+        min(_time) as first_change,
+        max(_time) as last_change
+        by SubjectUserName, SubjectDomainName, SubjectLogonId,
+           gpo_guid, ObjectDN, is_default_gpo, ComputerName
+    ```Elevate severity for default GPO changes```
+    | eval alert_severity=case(
+        is_default_gpo!="NO", "CRITICAL — default domain GPO modified",
+        like(attributes_changed, "%ACL%"), "HIGH — GPO permissions changed",
+        like(attributes_changed, "%SYSVOL_PATH%"), "CRITICAL — GPO path hijack possible",
+        1==1, "HIGH"
+      )
+    | eval mitre_technique="T1484.001"
+    | eval mitre_tactic="Defense Evasion / Privilege Escalation"
+    | eval alert_name="GPO Modification — Unexpected Account Change"
+    | table first_change, last_change, SubjectUserName, SubjectDomainName,
+            ComputerName, gpo_guid, ObjectDN, is_default_gpo,
+            attributes_changed, operations, new_values, change_count,
+            alert_severity, SubjectLogonId, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "SubjectUserName"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "GPO Modified by $SubjectUserName$ — GPO {$gpo_guid$} — $alert_severity$"
+        rule_description: >
+          Group Policy Object {$gpo_guid$} was modified on $ComputerName$ by
+          $SubjectUserName$@$SubjectDomainName$ (Session: $SubjectLogonId$).
+          Attributes changed: $attributes_changed$. Operations: $operations$.
+          Is default GPO: $is_default_gpo$.
+          Alert level: $alert_severity$.
+          Verify this change is authorized. If it adds a script, scheduled task,
+          or security setting, treat as potential T1484.001 attack.
+        severity: high
+        drilldown_search: >
+          index=wineventlog EventCode=5136
+          SubjectUserName="$SubjectUserName$" SubjectLogonId="$SubjectLogonId$"
+    - risk:
+        risk_object: "SubjectUserName"
+        risk_object_type: "user"
+        risk_score: 82
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 60
+
+  known_false_positives:
+    - "Legitimate IT admins deploying software, security baselines, or configuration changes via GPMC"
+    - "Automated GPO management tools (Ansible, Puppet, Chef with AD integration)"
+    - "SCCM/Intune co-management modifying security or certificate GPOs"
+    - "Microsoft Endpoint Manager GPO-based policy deployments"
+  tuning_guidance: |
+    1. Create a lookup table of authorized GPO administrators:
+       gpo_admins.csv (columns: username, domain, team)
+       Add Domain Admins, Group Policy Creator Owners, and designated GPO management accounts
+    2. Replace the IN clause with a lookup:
+       | lookup gpo_admins.csv username as SubjectUserName OUTPUT team as gpo_admin_team
+       | where isnull(gpo_admin_team)
+    3. Consider adding a time-of-day filter to reduce noise during business hours:
+       | where date_hour < 7 OR date_hour > 19 (alert on after-hours changes only)
+    4. Default Domain Policy and Default Domain Controllers Policy changes are ALWAYS critical —
+       never add these to exclusions without management approval
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: New GPO Created and Immediately Linked to Domain or Critical OU
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Creating a new GPO is not inherently malicious — it is a normal admin
+#  operation. However, creating AND linking a new GPO to the Domain root or
+#  a critical OU (e.g., Domain Controllers OU) within a short time window
+#  is a high-confidence attack indicator. A new GPO linked to the Domain root
+#  executes on every machine in the domain. This rule correlates Event 5137
+#  (GPO created) with Event 5136 on the OU object's gPLink attribute being
+#  modified to include the new GPO's GUID.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL (domain-root link) / HIGH (OU link)
+#  FP Rate     : Low — GPO creation + immediate linking is unusual in legitimate workflows
+
+rule_2_new_gpo_linked_domain_root:
+  name: "GPO Attack — New GPO Created and Linked to Domain Root or DC OU"
+  description: >
+    Correlates GPO creation (Event 5137 on a groupPolicyContainer object) with
+    a GPO link being added to the Domain root or Domain Controllers OU
+    (Event 5136 on the gPLink attribute of the domain or OU object) within
+    a 15-minute window. The gPLink attribute modification is in the format
+    [LDAP://cn={GPO-GUID},cn=policies,cn=system,DC=...;enforcement_flag].
+    A new GPO linked to the Domain root (OU with DN matching DC=domain,DC=tld)
+    or the Domain Controllers OU applies to ALL machines or ALL DCs respectively.
+    This is the highest-blast-radius GPO attack scenario.
+  mitre:
+    tactic: "Defense Evasion, Privilege Escalation, Lateral Movement"
+    technique: T1484.001
+    technique_name: "Domain Policy Modification: Group Policy Object"
+  severity: critical
+  confidence: 90
+  risk_score: 95
+  data_sources:
+    - "Windows Security Event Log (Event ID 5137) — Directory Service Object Created"
+    - "Windows Security Event Log (Event ID 5136) — gPLink attribute modified on OU"
+  prerequisites:
+    - "Audit Directory Service Changes — Success enabled on all DCs"
+
+  search: |
+    ```Step 1: Collect GPO creation events (5137)```
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5137
+        ObjectClass="groupPolicyContainer"
+    | rex field=ObjectDN
+        "CN=\{(?<new_gpo_guid>[0-9A-Fa-f\-]{36})\},CN=Policies,CN=System,(?<domain_dn>.*)"
+    | eval new_gpo_guid=upper(new_gpo_guid)
+    | stats
+        min(_time) as gpo_created_time,
+        values(SubjectUserName) as creator_account,
+        values(SubjectDomainName) as creator_domain,
+        values(ObjectDN) as new_gpo_dn,
+        values(ComputerName) as dc_where_created
+        by new_gpo_guid
+    ```Step 2: Join with gPLink modifications to find where the GPO was linked```
+    | join type=inner new_gpo_guid
+        [
+            search index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5136
+                AttributeLDAPDisplayName="gPLink"
+                (OperationType="%%14675" OR OperationType="%%14674")
+            ```gPLink value contains the GPO GUID in the format [LDAP://cn={GUID},...;N]```
+            | rex field=AttributeValue
+                "\{(?<linked_gpo_guid>[0-9A-Fa-f\-]{36})\}"
+            | eval linked_gpo_guid=upper(linked_gpo_guid)
+            ```Determine the scope of the GPO link from the ObjectDN (what OU was linked)```
+            | eval link_target_type=case(
+                ```Domain root: ObjectDN matches DC=domain,DC=tld pattern only```
+                match(ObjectDN, "^DC=[^,]+,DC=[^,]+$"),
+                    "DOMAIN_ROOT — applies to ALL domain machines",
+                match(ObjectDN, "^DC=[^,]+,DC=[^,]+,DC=[^,]+$"),
+                    "DOMAIN_ROOT — applies to ALL domain machines",
+                ```Domain Controllers OU```
+                like(lower(ObjectDN), "%ou=domain controllers,%"),
+                    "DOMAIN_CONTROLLERS_OU — applies to ALL DCs",
+                ```Any OU```
+                like(ObjectDN, "OU=%"),
+                    "OU — ".ObjectDN,
+                1==1,
+                    "UNKNOWN: ".ObjectDN
+              )
+            | eval gp_link_operation=case(
+                OperationType="%%14675", "Link Added",
+                OperationType="%%14676", "Link Removed",
+                OperationType="%%14674", "Link Modified",
+                1==1, OperationType
+              )
+            | eval link_enforcement=case(
+                like(AttributeValue, "%;0]"), "Not Enforced",
+                like(AttributeValue, "%;2]"), "ENFORCED — cannot be blocked",
+                like(AttributeValue, "%;1]"), "Disabled",
+                1==1, "Unknown enforcement flag"
+              )
+            | stats
+                min(_time) as link_time,
+                values(link_target_type) as link_targets,
+                values(ObjectDN) as linked_to_dns,
+                values(SubjectUserName) as linker_account,
+                values(link_enforcement) as enforcement_flags,
+                values(gp_link_operation) as link_operations
+                by linked_gpo_guid
+            | rename linked_gpo_guid as new_gpo_guid
+        ]
+    ```Calculate time between creation and linking```
+    | eval time_to_link_minutes=round((link_time - gpo_created_time) / 60, 1)
+    ```Flag high-blast-radius links```
+    | eval blast_radius=case(
+        like(link_targets, "%DOMAIN_ROOT%"), "MAXIMUM — all domain machines affected",
+        like(link_targets, "%DOMAIN_CONTROLLERS%"), "CRITICAL — all domain controllers affected",
+        like(link_targets, "%OU%"), "HIGH — OU-scoped, check OU membership count",
+        1==1, "UNKNOWN"
+      )
+    ```Flag rapid creation-to-link (attack pattern vs. planned admin work)```
+    | eval creation_pattern=case(
+        time_to_link_minutes < 5,  "RAPID (<5 min) — consistent with scripted attack",
+        time_to_link_minutes < 30, "FAST (<30 min) — review for planned change ticket",
+        1==1, "NORMAL — ".time_to_link_minutes." minutes"
+      )
+    | eval final_severity=case(
+        like(blast_radius, "%MAXIMUM%") AND like(creation_pattern, "%RAPID%"), "CRITICAL",
+        like(blast_radius, "%CRITICAL%"), "CRITICAL",
+        like(blast_radius, "%MAXIMUM%"), "HIGH",
+        1==1, "HIGH"
+      )
+    | eval mitre_technique="T1484.001"
+    | eval alert_name="New GPO Linked to Domain Root or Critical OU"
+    | table gpo_created_time, link_time, time_to_link_minutes, creation_pattern,
+            new_gpo_guid, new_gpo_dn, creator_account, creator_domain,
+            link_targets, linked_to_dns, enforcement_flags,
+            blast_radius, final_severity, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-30m"
+    latest: "now"
+    window: "15m"
+  throttle:
+    field: "new_gpo_guid"
+    period: "2h"
+  actions:
+    - notable_event:
+        rule_title: "New GPO Linked to $link_targets$ — $blast_radius$ — by $creator_account$"
+        rule_description: >
+          New GPO {$new_gpo_guid$} was created by $creator_account$ and linked to
+          $linked_to_dns$ within $time_to_link_minutes$ minutes.
+          Blast radius: $blast_radius$.
+          Pattern: $creation_pattern$.
+          Enforcement: $enforcement_flags$.
+          If this GPO contains scripts, scheduled tasks, or security settings,
+          ALL affected machines will execute the policy on next Group Policy refresh
+          (default every 90 minutes + 0-30 minute random offset, or on reboot/login).
+        severity: critical
+    - risk:
+        risk_object: "creator_account"
+        risk_object_type: "user"
+        risk_score: 95
+
+  known_false_positives:
+    - "New security baseline GPO deployment by IT operations team"
+    - "Automated GPO deployment as part of a change management workflow"
+    - "New software deployment GPO linked to a large OU"
+  tuning_guidance: |
+    1. Correlate every alert with a change management ticket — if no ticket exists, escalate
+    2. Add a lookup for high-sensitivity OUs (HR, Finance, IT, Domain Controllers) to classify
+       blast radius more precisely
+    3. The time_to_link_minutes field is key: < 5 minutes almost always indicates scripted attack
+    4. After confirming a malicious GPO link, immediately run gpupdate /force on affected machines
+       to remove the policy, then revoke the GPO link from GPMC
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Malicious Script File Added to SYSVOL GPO Directory
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Attackers add malicious scripts to SYSVOL to achieve mass execution via GPO.
+#  The files that trigger script execution when modified are:
+#  - scripts.ini (Startup/Shutdown/Logon/Logoff scripts)
+#  - psscripts.ini (PowerShell equivalents of the above)
+#  Any file written to a SYSVOL GPO Scripts directory by a non-DC process
+#  (i.e., not the DFS-R replication service) is highly suspicious.
+#
+#  Confidence  : HIGH (non-DFS process writing to SYSVOL Scripts)
+#  Severity    : CRITICAL
+#  FP Rate     : Low — SYSVOL script modifications are rare in normal operations
+
+rule_3_sysvol_script_modification:
+  name: "GPO Attack — Malicious Script File Written to SYSVOL GPO Directory"
+  description: >
+    Detects file creation or modification events for key GPO content files
+    in the SYSVOL Policies directory via Sysmon Event 11. The files monitored
+    are scripts.ini and psscripts.ini (which define startup/logon scripts),
+    GptTmpl.inf (security template), ScheduledTasks.xml, and Registry.pol.
+    Writing to these files is the payload delivery mechanism for GPO-based
+    attacks — once committed to SYSVOL, the content replicates to all DCs via
+    DFS-R and executes on all affected machines at next Group Policy refresh.
+    Legitimate modifications occur through the GPMC GUI (triggering a
+    GroupPolicyObjectEditor COM process) or through RSAT PowerShell cmdlets.
+    Direct file writes by cmd.exe, PowerShell, or unknown processes are highly
+    suspicious.
+  mitre:
+    tactic: "Persistence, Defense Evasion, Execution"
+    technique: T1484.001
+    technique_name: "Domain Policy Modification: Group Policy Object"
+  related_techniques:
+    - T1037.001: "Boot or Logon Initialization Scripts: Logon Script"
+    - T1053.005: "Scheduled Task/Job: Scheduled Task (via GPO)"
+  severity: critical
+  confidence: 85
+  risk_score: 90
+  data_sources:
+    - "Sysmon Event ID 11 — File Creation"
+  prerequisites:
+    - "Sysmon deployed on ALL Domain Controllers"
+    - "Sysmon FileCreate rule configured for SYSVOL path and GPO script file names"
+    - "Sysmon logs forwarded to Splunk"
+
+  search: |
+    index=wineventlog
+        sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        EventCode=11
+    ```Match files in SYSVOL Policies directory```
+    | where
+        (
+            like(lower(TargetFilename), "%\\sysvol\\%\\policies\\%")
+            OR like(lower(TargetFilename), "%\\sysvol_dfsr\\%\\policies\\%")
+        )
+        AND (
+            like(lower(TargetFilename), "%scripts.ini")
+            OR like(lower(TargetFilename), "%psscripts.ini")
+            OR like(lower(TargetFilename), "%gpttmpl.inf")
+            OR like(lower(TargetFilename), "%scheduledtasks.xml")
+            OR like(lower(TargetFilename), "%registry.pol")
+            OR like(lower(TargetFilename), "%gpt.ini")
+        )
+    ```Exclude legitimate DFS-R replication service```
+    | where NOT (
+        like(lower(Image), "%\\dfsr.exe")
+        OR like(lower(Image), "%\\dfsrs.exe")
+        OR like(lower(Image), "%\\dfsvc.exe")
+    )
+    ```Exclude legitimate GPMC editor process```
+    | where NOT (
+        like(lower(Image), "%\\gpedit.dll")
+        OR like(lower(Image), "%\\mmc.exe")
+        OR like(lower(Image), "%\\gpclientserv.dll")
+    )
+    ```Classify the file type to understand the attack vector```
+    | eval file_attack_vector=case(
+        like(lower(TargetFilename), "%scripts.ini")
+            AND NOT like(lower(TargetFilename), "%ps"),
+            "STARTUP_SCRIPT — cmd/batch script will execute on all targets",
+        like(lower(TargetFilename), "%psscripts.ini"),
+            "POWERSHELL_SCRIPT — PS script will execute on all targets",
+        like(lower(TargetFilename), "%gpttmpl.inf"),
+            "SECURITY_TEMPLATE — security settings changed (possible defense disabling)",
+        like(lower(TargetFilename), "%scheduledtasks.xml"),
+            "SCHEDULED_TASK — task will be created on all targets",
+        like(lower(TargetFilename), "%registry.pol"),
+            "REGISTRY — registry key will be set on all targets",
+        like(lower(TargetFilename), "%gpt.ini"),
+            "GPT_VERSION — GPO version counter (normal side-effect of any change)",
+        1==1, "UNKNOWN GPO FILE"
+      )
+    ```Extract the GPO GUID from the path```
+    | rex field=TargetFilename
+        "\\\\Policies\\\\(?i)\{(?<gpo_guid>[0-9A-Fa-f\-]{36})\}\\\\"
+    | eval gpo_guid=upper(coalesce(gpo_guid, "GUID_NOT_EXTRACTED"))
+    ```Determine if modifying Machine or User policy```
+    | eval gpo_section=case(
+        like(lower(TargetFilename), "%\\machine\\%"), "Machine Policy",
+        like(lower(TargetFilename), "%\\user\\%"),    "User Policy",
+        1==1, "Unknown Section"
+      )
+    ```Classify the writing process for context```
+    | eval writing_process_class=case(
+        like(lower(Image), "%\\powershell.exe"),     "PowerShell — HIGH RISK",
+        like(lower(Image), "%\\cmd.exe"),             "cmd.exe — HIGH RISK",
+        like(lower(Image), "%\\wscript.exe"),         "WScript — HIGH RISK",
+        like(lower(Image), "%\\cscript.exe"),         "CScript — HIGH RISK",
+        like(lower(Image), "%\\python.exe"),          "Python — HIGH RISK",
+        like(lower(Image), "%\\nc.exe"),              "Netcat — CRITICAL RISK",
+        like(lower(Image), "%\\mmc.exe"),             "GPMC/MMC — LIKELY LEGITIMATE",
+        like(lower(Image), "%\\dfsr.exe"),            "DFS-R — REPLICATION (exclude)",
+        1==1, "Unknown Process: ".Image
+      )
+    | eval actor_account=coalesce(User, SubjectUserName)
+    | eval src_host=coalesce(Computer, ComputerName)
+    | eval final_severity=case(
+        like(writing_process_class, "%CRITICAL%"), "CRITICAL",
+        like(writing_process_class, "%HIGH RISK%"), "CRITICAL",
+        like(file_attack_vector, "%STARTUP_SCRIPT%"), "CRITICAL",
+        like(file_attack_vector, "%POWERSHELL_SCRIPT%"), "CRITICAL",
+        like(file_attack_vector, "%SCHEDULED_TASK%"), "CRITICAL",
+        like(file_attack_vector, "%SECURITY_TEMPLATE%"), "HIGH",
+        1==1, "HIGH"
+      )
+    | eval mitre_technique="T1484.001"
+    | eval alert_name="GPO SYSVOL Script File Modified"
+    | table _time, src_host, actor_account, Image, writing_process_class,
+            TargetFilename, gpo_guid, gpo_section, file_attack_vector,
+            final_severity, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "gpo_guid"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "SYSVOL Script Modified — GPO {$gpo_guid$} | $file_attack_vector$ | by $actor_account$"
+        rule_description: >
+          File $TargetFilename$ (GPO {$gpo_guid$} — $gpo_section$) was written to SYSVOL
+          on $src_host$ by $actor_account$ via $Image$.
+          Attack vector: $file_attack_vector$.
+          Writing process: $writing_process_class$.
+          The script/configuration will replicate to all DCs and execute on all GPO-affected
+          machines at next Group Policy refresh. Immediate investigation required.
+        severity: critical
+    - risk:
+        risk_object: "actor_account"
+        risk_object_type: "user"
+        risk_score: 90
+    - risk:
+        risk_object: "src_host"
+        risk_object_type: "system"
+        risk_score: 85
+
+  known_false_positives:
+    - "DFS-R replication service writing SYSVOL content — excluded by process name filter"
+    - "GPMC (mmc.exe) used by legitimate admins to modify GPO scripts — appears in GPMC process"
+    - "SCCM/Intune pushing GPO content — identify the agent process and add to exclusion"
+    - "Legitimate GPO management via RSAT PowerShell (Set-GPRegistryValue, etc.) — by known admin accounts"
+  tuning_guidance: |
+    1. The DFS-R exclusion is critical — without it, this rule will fire on every DC
+       as SYSVOL content replicates between DCs
+    2. Monitor for gpt.ini-only changes by trusted process/account combinations — these
+       may be noisy; consider filtering gpt.ini to only alert when writing_process_class is HIGH RISK
+    3. If using RSAT PS cmdlets for legitimate GPO management, the writing process will be
+       powershell.exe — add an account-based exclusion for the authorized GPO admin account
+    4. The key signal is writing_process_class=HIGH RISK by an unexpected account —
+       the combination of PowerShell + non-admin account writing to SYSVOL is near-certain attack
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: SharpGPOAbuse and PowerSploit GPO Attack Tool Detection
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects execution of known GPO attack tools (SharpGPOAbuse, StandIn) and
+#  suspicious GPO-related PowerShell patterns (PowerSploit's Set-DomainObject,
+#  native GroupPolicy module abuse with add-task or add-script patterns).
+#  These tools use specific command-line flags that are not seen in legitimate
+#  GPO administration workflows.
+#
+#  Confidence  : VERY HIGH (tool-specific signatures)
+#  Severity    : CRITICAL
+#  FP Rate     : Very Low — tool names and flags are highly specific
+
+rule_4_gpo_attack_tools:
+  name: "GPO Attack — SharpGPOAbuse / PowerSploit GPO Tool Execution"
+  description: >
+    Detects execution of SharpGPOAbuse.exe, StandIn.exe, and PowerSploit
+    Group Policy abuse cmdlets. These tools modify GPOs programmatically
+    using LDAP and direct SYSVOL file writes to add malicious scheduled tasks,
+    local admin accounts, startup scripts, or registry keys to existing GPOs
+    without using the GPMC GUI. SharpGPOAbuse flags include --AddLocalAdmin,
+    --AddComputerTask, --AddUserTask, --AddComputerScript, --AddUserScript,
+    --AddEnvVar. PowerSploit patterns include Set-GPOImmediateTask,
+    Get-DomainGPO followed by Set-DomainObject modifications.
+  mitre:
+    tactic: "Persistence, Defense Evasion, Privilege Escalation"
+    technique: T1484.001
+    technique_name: "Domain Policy Modification: Group Policy Object"
+  severity: critical
+  confidence: 95
+  risk_score: 97
+  data_sources:
+    - "Windows Security Event Log (Event ID 4688)"
+    - "Sysmon Event ID 1"
+    - "PowerShell Operational Log (Event ID 4104)"
+  prerequisites:
+    - "Event 4688 with CommandLine populated OR Sysmon Event 1"
+    - "PowerShell Script Block Logging enabled"
+
+  search: |
+    (
+        ```Process creation detection for SharpGPOAbuse and StandIn executables```
+        (
+            (
+                (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688)
+                OR
+                (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                    EventCode=1)
+            )
+            | eval cmd_line=coalesce(CommandLine, "")
+            | eval image=coalesce(NewProcessName, Image, "")
+            | eval actor_account=coalesce(SubjectUserName, User)
+            | eval src_host=coalesce(ComputerName, Computer)
+            ```SharpGPOAbuse specific binary names and flags```
+            | where
+                like(lower(image), "%sharpgpoabuse%")
+                OR like(lower(cmd_line), "%sharpgpoabuse%")
+                OR like(lower(cmd_line), "%--addlocaladmin%")
+                OR like(lower(cmd_line), "%--addcomputertask%")
+                OR like(lower(cmd_line), "%--addusertask%")
+                OR like(lower(cmd_line), "%--addcomputerscript%")
+                OR like(lower(cmd_line), "%--adduserscript%")
+                OR like(lower(cmd_line), "%--addenvvar%")
+                ```StandIn GPO flags```
+                OR (like(lower(image), "%standin%") AND like(lower(cmd_line), "%--gpo%"))
+            | eval detection_source="process_creation"
+            | eval tool_detected=case(
+                like(lower(image), "%sharpgpoabuse%") OR
+                like(lower(cmd_line), "%sharpgpoabuse%"), "SharpGPOAbuse",
+                like(lower(image), "%standin%"),            "StandIn",
+                like(lower(cmd_line), "%--addlocaladmin%"), "SharpGPOAbuse (--AddLocalAdmin)",
+                like(lower(cmd_line), "%--addcomputertask%"),"SharpGPOAbuse (--AddComputerTask)",
+                like(lower(cmd_line), "%--addusertask%"),   "SharpGPOAbuse (--AddUserTask)",
+                like(lower(cmd_line), "%--addcomputerscript%"),"SharpGPOAbuse (--AddComputerScript)",
+                1==1, "Unknown GPO Attack Tool"
+              )
+        )
+        OR
+        ```PowerShell Script Block detection for PowerSploit and GroupPolicy module abuse```
+        (
+            index=wineventlog
+                sourcetype="XmlWinEventLog:Microsoft-Windows-PowerShell/Operational"
+                EventCode=4104
+            | eval src_host=coalesce(ComputerName, Computer)
+            | eval actor_account=coalesce(UserName, SubjectUserName)
+            | eval cmd_line=ScriptBlockText
+            | where
+                ```PowerSploit GPO cmdlets```
+                like(lower(ScriptBlockText), "%set-gpoimmediate%")
+                OR like(lower(ScriptBlockText), "%set-domainobject%gpo%")
+                OR like(lower(ScriptBlockText), "%get-domaingpo%")
+                ```Native GroupPolicy module suspicious patterns```
+                OR (
+                    like(lower(ScriptBlockText), "%import-module grouppolicy%")
+                    AND (
+                        like(lower(ScriptBlockText), "%set-gpregistryvalue%")
+                        OR like(lower(ScriptBlockText), "%new-gplink%")
+                        OR like(lower(ScriptBlockText), "%set-gplink%")
+                        OR like(lower(ScriptBlockText), "%new-gpo%")
+                    )
+                )
+                ```Direct LDAP manipulation of GPO objects```
+                OR (
+                    like(lower(ScriptBlockText), "%cn=policies,cn=system%")
+                    AND like(lower(ScriptBlockText), "%gplink%")
+                )
+            | eval detection_source="powershell_scriptblock"
+            | eval tool_detected=case(
+                like(lower(ScriptBlockText), "%set-gpoimmediate%"),
+                    "PowerSploit Set-GPOImmediateTask",
+                like(lower(ScriptBlockText), "%set-domainobject%"),
+                    "PowerSploit Set-DomainObject (GPO modification)",
+                like(lower(ScriptBlockText), "%get-domaingpo%"),
+                    "PowerView Get-DomainGPO",
+                1==1, "Suspicious GPO PowerShell Pattern"
+              )
+        )
+    )
+    | eval parent_process=coalesce(ParentProcessName, ParentImage, "N/A")
+    | eval gpo_name_targeted=case(
+        like(cmd_line, "%--gpona%") OR like(cmd_line, "%--gponame%"),
+            replace(cmd_line, ".*--[Gg][Pp][Oo][Nn]ame\s+\"?([^\"]+)\"?.*", "\1"),
+        1==1, "not_extracted_from_cmdline"
+      )
+    | eval mitre_technique="T1484.001"
+    | eval alert_name="GPO Attack Tool Detected — ".tool_detected
+    | table _time, src_host, actor_account, detection_source, tool_detected,
+            gpo_name_targeted, image, cmd_line, parent_process,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_host"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "GPO Attack Tool — $tool_detected$ on $src_host$ by $actor_account$"
+        severity: critical
+    - risk:
+        risk_object: "actor_account"
+        risk_object_type: "user"
+        risk_score: 97
+    - risk:
+        risk_object: "src_host"
+        risk_object_type: "system"
+        risk_score: 92
+
+  known_false_positives:
+    - "Security team running authorized red team exercises using SharpGPOAbuse"
+    - "GroupPolicy PowerShell module used by administrators for legitimate GPO management"
+  tuning_guidance: |
+    1. SharpGPOAbuse and StandIn are offensive tools — their presence on any machine
+       outside a red team engagement is always worth investigating
+    2. For the PowerShell patterns, the combination of Get-DomainGPO + Set-DomainObject
+       is the highest-confidence sequence (enumeration followed by modification)
+    3. If your organization uses PowerShell for GPO management, narrow the PS rule to
+       focus on off-hours activity or on accounts not in the authorized GPO admin group
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Default Domain Policy or Default DC Policy Modified
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The two default GPOs — Default Domain Policy and Default Domain Controllers
+#  Policy — apply to the domain root and Domain Controllers OU respectively.
+#  These GPOs are created during domain setup and should almost NEVER be
+#  modified after initial configuration. Any modification to these specific
+#  GPOs is extremely high risk because they apply to the entire domain.
+#  Attackers target these GPOs for maximum blast radius.
+#
+#  Confidence  : VERY HIGH — default GPO modifications are almost never legitimate
+#  Severity    : CRITICAL
+#  FP Rate     : Very Low — changes to default GPOs should be change-controlled
+
+rule_5_default_gpo_modified:
+  name: "GPO Attack — Default Domain Policy or Default DC Policy Modified"
+  description: >
+    Detects any modification to the Default Domain Policy
+    ({31B2F340-016D-11D2-945F-00C04FB984F9}) or the Default Domain Controllers
+    Policy ({6AC1786C-016F-11D2-945F-00C04FB984F9}) via Event 5136. These GPOs
+    apply to the domain root and the Domain Controllers OU respectively and
+    should be treated as read-only infrastructure after initial domain deployment.
+    The CIS and DISA benchmarks explicitly recommend against modifying these
+    default GPOs (use separate baseline GPOs instead). Any modification to
+    these GPOs is a critical change-control event regardless of the account.
+    Common attack patterns include adding startup scripts to run malware on
+    ALL machines, disabling Windows Defender/firewall settings via the
+    Default Domain Policy.
+  mitre:
+    tactic: "Defense Evasion, Privilege Escalation, Lateral Movement"
+    technique: T1484.001
+    technique_name: "Domain Policy Modification: Group Policy Object"
+  related_techniques:
+    - T1562.001: "Impair Defenses: Disable or Modify Tools"
+    - T1037.001: "Boot or Logon Initialization Scripts"
+  severity: critical
+  confidence: 92
+  risk_score: 96
+  data_sources:
+    - "Windows Security Event Log (Event ID 5136)"
+    - "Sysmon Event ID 11 — SYSVOL file writes for these GPO GUIDs"
+  prerequisites:
+    - "Audit Directory Service Changes — Success enabled on all DCs"
+
+  search: |
+    (
+        ```Event 5136 — Default GPO AD object modification```
+        (
+            index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5136
+            | where
+                like(ObjectDN, "%31B2F340-016D-11D2-945F-00C04FB984F9%")
+                OR like(ObjectDN, "%6AC1786C-016F-11D2-945F-00C04FB984F9%")
+            | eval detection_source="AD_object_change_5136"
+            | eval src_host=ComputerName
+            | eval actor_account=SubjectUserName
+            | eval actor_domain=SubjectDomainName
+            | eval change_detail=AttributeLDAPDisplayName." = ".AttributeValue
+        )
+        OR
+        ```Sysmon Event 11 — SYSVOL file write for these default GPO paths```
+        (
+            index=wineventlog
+                sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                EventCode=11
+            | where
+                like(upper(TargetFilename), "%31B2F340-016D-11D2-945F-00C04FB984F9%")
+                OR like(upper(TargetFilename), "%6AC1786C-016F-11D2-945F-00C04FB984F9%")
+            | where NOT (
+                like(lower(Image), "%dfsr.exe") OR like(lower(Image), "%dfsrs.exe")
+              )
+            | eval detection_source="SYSVOL_file_write_sysmon11"
+            | eval src_host=Computer
+            | eval actor_account=User
+            | eval actor_domain="N/A"
+            | eval change_detail="File written: ".TargetFilename." by ".Image
+        )
+    )
+    | eval gpo_identity=case(
+        like(upper(coalesce(ObjectDN, TargetFilename, "")),
+            "%31B2F340-016D-11D2-945F-00C04FB984F9%"),
+            "DEFAULT DOMAIN POLICY — applies to ALL domain machines",
+        like(upper(coalesce(ObjectDN, TargetFilename, "")),
+            "%6AC1786C-016F-11D2-945F-00C04FB984F9%"),
+            "DEFAULT DOMAIN CONTROLLERS POLICY — applies to ALL DCs",
+        1==1, "UNKNOWN DEFAULT GPO"
+      )
+    | eval operation=case(
+        OperationType="%%14675", "Attribute Added",
+        OperationType="%%14676", "Attribute Deleted",
+        OperationType="%%14674", "Attribute Modified",
+        isnull(OperationType), "File Written to SYSVOL",
+        1==1, OperationType
+      )
+    ```Detect security-disabling changes specifically (highest priority)```
+    | eval security_impacting=if(
+        like(lower(change_detail), "%defender%")
+        OR like(lower(change_detail), "%firewall%")
+        OR like(lower(change_detail), "%auditpol%")
+        OR like(lower(change_detail), "%disableantispyware%")
+        OR like(lower(change_detail), "%scripts%")
+        OR like(lower(change_detail), "%scheduledtask%"),
+        "YES — CRITICAL: security/script change to default GPO",
+        "POSSIBLE — review change_detail for security impact"
+      )
+    | stats
+        count as change_count,
+        values(change_detail) as changes_made,
+        values(operation) as operations,
+        values(detection_source) as detection_sources,
+        values(security_impacting) as security_impact,
+        min(_time) as first_seen,
+        max(_time) as last_seen
+        by src_host, actor_account, actor_domain, gpo_identity
+    | eval mitre_technique="T1484.001"
+    | eval alert_name="Default GPO Modified — ".gpo_identity
+    | table first_seen, last_seen, src_host, actor_account, actor_domain,
+            gpo_identity, operations, changes_made, security_impact,
+            change_count, detection_sources, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "gpo_identity"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "DEFAULT GPO MODIFIED — $gpo_identity$ by $actor_account$ on $src_host$"
+        rule_description: >
+          $gpo_identity$ was modified on $src_host$ by $actor_account$@$actor_domain$.
+          Changes: $changes_made$.
+          Security impact assessment: $security_impact$.
+          This GPO applies to ALL domain machines or ALL Domain Controllers.
+          If this change is not in a change management ticket, treat as a
+          critical security incident immediately.
+        severity: critical
+    - risk:
+        risk_object: "actor_account"
+        risk_object_type: "user"
+        risk_score: 96
+    - risk:
+        risk_object: "src_host"
+        risk_object_type: "system"
+        risk_score: 88
+
+  known_false_positives:
+    - "Initial AD deployment by Microsoft-certified infrastructure team (extremely rare post-deployment)"
+    - "CIS/DISA baseline remediation specifically targeting default GPOs (should use separate GPO per best practice)"
+    - "Legacy AD migration using ADMT that modifies default GPO settings"
+  tuning_guidance: |
+    1. These default GPOs should NEVER be modified in a mature environment
+    2. If you have a legitimate use case, add a very narrow exclusion (specific account + specific attribute)
+    3. Any alert on this rule should be escalated to change management for validation
+    4. Consider adding a separate, lower-severity alert for ANY account (including admins)
+       to ensure change management accountability
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: GPO Modification to Disable Security Controls
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  A specific and highly impactful variant of GPO attack: modifying GPO security
+#  templates (GptTmpl.inf) or registry policy files (Registry.pol) to disable
+#  Windows Defender, firewall, audit logging, or other defenses. This achieves
+#  T1562 (Impair Defenses) at scale across all domain machines via T1484.001.
+#  Detected by monitoring SYSVOL content for known security-disabling keys
+#  and by monitoring Event 4739 (Domain Policy Changed).
+#
+#  Confidence  : HIGH (specific security-disabling keys in GPO content)
+#  Severity    : CRITICAL
+#  FP Rate     : Low — security policy disabling via GPO is unusual outside a breach
+
+rule_6_gpo_security_disabling:
+  name: "GPO Attack — Security Controls Disabled via GPO Policy"
+  description: >
+    Detects PowerShell script block logging events and SYSVOL file activity
+    indicating a GPO is being used to disable Windows Defender, Windows
+    Firewall, audit logging, or UAC at scale across the domain. Also detects
+    Event 4739 (Domain Policy Changed) which fires when password policy, account
+    lockout policy, or Kerberos policy is modified via GPO — indicating an
+    attacker weakening authentication controls. The most dangerous patterns:
+    DisableAntiSpyware=1 (disable Defender), EnableFirewall=0 (disable firewall),
+    AuditSystem=0 (disable audit logging) in GPO security templates.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: T1484.001
+    technique_name: "Domain Policy Modification: Group Policy Object"
+  related_techniques:
+    - T1562.001: "Impair Defenses: Disable or Modify Tools"
+    - T1562.004: "Impair Defenses: Disable or Modify System Firewall"
+  severity: critical
+  confidence: 88
+  risk_score: 94
+  data_sources:
+    - "Windows Security Event Log (Event ID 4739) — Domain Policy Changed"
+    - "PowerShell Operational Log (Event ID 4104)"
+    - "Sysmon Event ID 11 — GptTmpl.inf modification"
+  prerequisites:
+    - "Event 4739: Policy Change > Audit Other Policy Change Events → Success"
+    - "Sysmon Event 11 with SYSVOL FileCreate rules"
+    - "PowerShell Script Block Logging enabled"
+
+  search: |
+    (
+        ```Vector A: Domain Policy Change Event (Event 4739) — password/lockout/Kerberos policy```
+        (
+            index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4739
+            | eval detection_vector="domain_policy_change_4739"
+            | eval src_host=ComputerName
+            | eval actor_account=SubjectUserName
+            | eval security_impact_detail=
+                "Domain policy changed — SubjectDomainName: ".SubjectDomainName.
+                " | DomainPolicyChanged: ".DomainPolicyChanged
+        )
+        OR
+        ```Vector B: GptTmpl.inf file modification in SYSVOL (security template)```
+        (
+            index=wineventlog
+                sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                EventCode=11
+                TargetFilename="*GptTmpl.inf*"
+            | where NOT (
+                like(lower(Image), "%dfsr.exe") OR like(lower(Image), "%dfsrs.exe")
+              )
+            | eval detection_vector="gpttmpl_inf_write_sysmon11"
+            | eval src_host=Computer
+            | eval actor_account=User
+            | eval security_impact_detail=
+                "GptTmpl.inf written to SYSVOL by ".Image.
+                " | Path: ".TargetFilename
+        )
+        OR
+        ```Vector C: PowerShell setting known security-disabling registry keys via GPO cmdlets```
+        (
+            index=wineventlog
+                sourcetype="XmlWinEventLog:Microsoft-Windows-PowerShell/Operational"
+                EventCode=4104
+            | where
+                ```Disable Defender via GPO registry key```
+                like(lower(ScriptBlockText), "%disableantispyware%")
+                OR like(lower(ScriptBlockText), "%disableantivirus%")
+                OR like(lower(ScriptBlockText), "%disablerealtimemonitoring%")
+                ```Disable Firewall```
+                OR like(lower(ScriptBlockText), "%enablefirewall%")
+                OR like(lower(ScriptBlockText), "%disablefirewall%")
+                ```Disable audit logging via GPO```
+                OR (
+                    like(lower(ScriptBlockText), "%auditsystem%")
+                    AND like(lower(ScriptBlockText), "%set-gpregistryvalue%")
+                )
+                ```Disable UAC via GPO```
+                OR like(lower(ScriptBlockText), "%enablelua%")
+                ```Disable SmartScreen```
+                OR like(lower(ScriptBlockText), "%enablesmartscreen%")
+            | eval detection_vector="powershell_security_disabling_4104"
+            | eval src_host=coalesce(ComputerName, Computer)
+            | eval actor_account=coalesce(UserName, SubjectUserName)
+            | eval security_impact_detail="PS script block with security-disabling GPO registry key"
+            | eval script_preview=substr(ScriptBlockText, 1, 500)
+        )
+    )
+    | eval mitre_technique="T1484.001 / T1562"
+    | eval alert_name="GPO Security Disabling — ".detection_vector
+    | table _time, src_host, actor_account, detection_vector, security_impact_detail,
+            coalesce(script_preview, "N/A") as script_preview,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_host"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "GPO Security Disabling — $detection_vector$ on $src_host$ by $actor_account$"
+        severity: critical
+    - risk:
+        risk_object: "actor_account"
+        risk_object_type: "user"
+        risk_score: 94
+    - risk:
+        risk_object: "src_host"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "Event 4739 fires during legitimate password/lockout policy reviews — correlate with change ticket"
+    - "CIS benchmark remediation scripts modifying password policy via GPO"
+    - "GptTmpl.inf modifications for legitimate security hardening (firewall rules, rights assignments)"
+  tuning_guidance: |
+    1. Event 4739 is the most reliable vector — it fires whenever domain-level password,
+       lockout, or Kerberos policy changes, which are rare and should always be change-controlled
+    2. For the PowerShell vector, focus on the DisableAntiSpyware and EnableFirewall=0 patterns —
+       these have near-zero legitimate use cases outside a security bypass attack
+    3. GptTmpl.inf writes should be correlated with the specific content being written for
+       higher accuracy — if log content capture is available, check for 'DisableAntiSpyware=1'
+       within the file
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: GPO Modification Multi-Stage Correlation (Kill Chain)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Correlates multiple GPO attack signals on the same host within a 30-minute
+#  window. A single versionNumber increment on a GPO might be legitimate;
+#  combined with a SYSVOL script file write and a GPO-to-OU link addition from
+#  the same account in the same session is almost certainly an attack.
+#
+#  Confidence  : VERY HIGH (multi-indicator)
+#  Severity    : CRITICAL
+#  FP Rate     : Very Low — multi-indicator correlation dramatically reduces FP
+
+rule_7_gpo_attack_kill_chain:
+  name: "GPO Attack — Multi-Stage Kill Chain Detected"
+  description: >
+    Correlates multiple GPO attack indicators across a 30-minute window
+    on the same Domain Controller from the same session. The kill chain for
+    a GPO-based attack is: (1) GPO object created or version changed in AD
+    (Event 5136/5137), (2) malicious payload written to SYSVOL (Sysmon 11
+    on scripts.ini, ScheduledTasks.xml, etc.), (3) GPO linked to a target
+    OU or domain root (Event 5136 on gPLink attribute). Each step in isolation
+    may have a legitimate explanation. All three together from the same account
+    is a definitive attack sequence. The rule scores each indicator and fires
+    when the combined score meets the threshold.
+  mitre:
+    tactic: "Persistence, Defense Evasion, Privilege Escalation, Lateral Movement"
+    technique: T1484.001
+    technique_name: "Domain Policy Modification: Group Policy Object"
+  severity: critical
+  confidence: 95
+  risk_score: 97
+  data_sources:
+    - "Windows Security Event Log (Events 5136, 5137)"
+    - "Sysmon Event ID 11 — SYSVOL file writes"
+    - "Sysmon Event ID 1 — GPO attack tool execution"
+  prerequisites:
+    - "All GPO detection prerequisites from Rules 1-6 above"
+
+  search: |
+    ```Collect all GPO attack indicators — assign scores```
+    (
+        ```Indicator A: GPO created (Event 5137) — score 2```
+        (
+            index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5137
+                ObjectClass="groupPolicyContainer"
+            | eval indicator="gpo_created"
+            | eval indicator_score=2
+            | eval indicator_detail="New GPO created: ".ObjectDN
+            | eval src_host=ComputerName
+            | eval actor_account=SubjectUserName
+        )
+        OR
+        ```Indicator B: GPO attribute modified (Event 5136) — score 1```
+        (
+            index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5136
+            | where ObjectClass="groupPolicyContainer"
+                  OR like(ObjectDN, "%CN=Policies,CN=System,%")
+            | where NOT match(SubjectUserName, "\$$")
+            | eval indicator="gpo_attribute_modified"
+            | eval indicator_score=1
+            | eval indicator_detail="GPO attribute changed: ".AttributeLDAPDisplayName.
+                " on ".ObjectDN
+            | eval src_host=ComputerName
+            | eval actor_account=SubjectUserName
+        )
+        OR
+        ```Indicator C: GPO link added to OU or domain root (Event 5136 on gPLink) — score 3```
+        (
+            index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5136
+                AttributeLDAPDisplayName="gPLink"
+                (OperationType="%%14675" OR OperationType="%%14674")
+            | eval indicator="gpo_linked_to_ou"
+            | eval indicator_score=3
+            | eval indicator_detail="GPO linked to: ".ObjectDN." | value: ".AttributeValue
+            | eval src_host=ComputerName
+            | eval actor_account=SubjectUserName
+        )
+        OR
+        ```Indicator D: SYSVOL script/task file written — score 3```
+        (
+            index=wineventlog
+                sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                EventCode=11
+            | where
+                (like(lower(TargetFilename), "%\\sysvol\\%\\policies\\%")
+                 OR like(lower(TargetFilename), "%\\sysvol_dfsr\\%\\policies\\%"))
+                AND (
+                    like(lower(TargetFilename), "%scripts.ini")
+                    OR like(lower(TargetFilename), "%psscripts.ini")
+                    OR like(lower(TargetFilename), "%scheduledtasks.xml")
+                    OR like(lower(TargetFilename), "%gpttmpl.inf")
+                )
+            | where NOT (
+                like(lower(Image), "%dfsr.exe") OR like(lower(Image), "%dfsrs.exe")
+              )
+            | eval indicator="sysvol_payload_written"
+            | eval indicator_score=3
+            | eval indicator_detail="SYSVOL script written: ".TargetFilename." by ".Image
+            | eval src_host=Computer
+            | eval actor_account=User
+        )
+        OR
+        ```Indicator E: GPO attack tool executed — score 4```
+        (
+            (
+                (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688)
+                OR
+                (index=wineventlog
+                    sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                    EventCode=1)
+            )
+            | where
+                like(lower(coalesce(NewProcessName, Image, "")), "%sharpgpoabuse%")
+                OR like(lower(coalesce(CommandLine, "")), "%sharpgpoabuse%")
+                OR like(lower(coalesce(CommandLine, "")), "%--addlocaladmin%")
+                OR like(lower(coalesce(CommandLine, "")), "%--addcomputertask%")
+            | eval indicator="gpo_attack_tool_detected"
+            | eval indicator_score=4
+            | eval indicator_detail="Attack tool: ".coalesce(NewProcessName, Image).
+                " | cmd: ".coalesce(CommandLine, "N/A")
+            | eval src_host=coalesce(ComputerName, Computer)
+            | eval actor_account=coalesce(SubjectUserName, User)
+        )
+    )
+    ```Aggregate indicators by host and account over 30-minute window```
+    | bin _time span=30m
+    | stats
+        sum(indicator_score) as total_score,
+        values(indicator) as indicators_fired,
+        values(indicator_detail) as indicator_details,
+        count as total_events,
+        min(_time) as first_seen,
+        max(_time) as last_seen
+        by src_host, actor_account, _time
+    ```Alert when total score >= 3 (catches even single high-confidence indicators)```
+    | where total_score >= 3
+    ```Exclude machine accounts```
+    | where NOT match(actor_account, "\$$")
+    | eval threat_level=case(
+        total_score >= 8,  "CRITICAL — complete GPO attack kill chain",
+        total_score >= 5,  "CRITICAL — multiple GPO attack stages observed",
+        total_score >= 3,  "HIGH — GPO attack indicator detected"
+      )
+    | eval indicator_count=mvcount(indicators_fired)
+    | eval mitre_technique="T1484.001"
+    | eval alert_name="GPO Attack Kill Chain — Multi-Stage Detection"
+    | table first_seen, last_seen, src_host, actor_account,
+            indicators_fired, indicator_count, indicator_details,
+            total_score, threat_level, total_events, mitre_technique, alert_name
+    | sort - total_score
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-40m"
+    latest: "now"
+    window: "30m"
+  throttle:
+    field: "actor_account"
+    period: "2h"
+  actions:
+    - notable_event:
+        rule_title: "GPO Attack Kill Chain — Score $total_score$ — $actor_account$ on $src_host$"
+        rule_description: >
+          GPO attack kill chain detected on $src_host$ by $actor_account$.
+          Threat score: $total_score$. Indicators: $indicators_fired$.
+          $threat_level$
+          Details: $indicator_details$
+        severity: critical
+    - risk:
+        risk_object: "actor_account"
+        risk_object_type: "user"
+        risk_score: 97
+    - risk:
+        risk_object: "src_host"
+        risk_object_type: "system"
+        risk_score: 95
+
+  known_false_positives:
+    - "Automated baseline deployment creating multiple GPOs and linking them in rapid succession"
+    - "Large-scale AD restructuring involving GPO reorganization by an authorized admin team"
+  tuning_guidance: |
+    1. Adjust indicator scoring if certain combinations are common in your environment
+    2. The indicator_details field lists the exact commands and file paths — review to confirm
+    3. A score of 7+ (e.g., new GPO + SYSVOL payload + OU link) is near-certain attack
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  INVESTIGATION QUERIES — Run manually during incident response
+# ██████████████████████████████████████████████████████████████████████████████
+
+investigation_queries:
+
+  # --- Query A: Enumerate all GPO modifications in the past 7 days ---
+  gpo_modification_history:
+    description: >
+      List all GPO modifications over the past 7 days to establish a baseline
+      and identify any unauthorized changes. Run this before deploying rules.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode IN (5136, 5137, 5141)
+          (ObjectClass="groupPolicyContainer" OR ObjectDN="*CN=Policies,CN=System*")
+          earliest=-7d
+      | where NOT match(SubjectUserName, "\$$")
+      | rex field=ObjectDN
+          "CN=\{(?<gpo_guid>[0-9A-Fa-f\-]{36})\},CN=Policies,CN=System,(?<domain_dn>.*)"
+      | stats
+          count as total_changes,
+          dc(SubjectUserName) as unique_modifiers,
+          values(SubjectUserName) as who_modified,
+          values(AttributeLDAPDisplayName) as attributes_changed,
+          min(_time) as first_change,
+          max(_time) as last_change
+          by gpo_guid, ObjectDN, EventCode
+      | eval event_type=case(
+          EventCode=5136, "Modified",
+          EventCode=5137, "Created",
+          EventCode=5141, "Deleted"
+        )
+      | table gpo_guid, ObjectDN, event_type, total_changes, unique_modifiers,
+              who_modified, attributes_changed, first_change, last_change
+      | sort - total_changes
+
+  # --- Query B: Show all GPO links added/removed in the past 7 days ---
+  gpo_link_changes:
+    description: >
+      List all GPO-to-OU link modifications (gPLink attribute changes) to
+      understand which GPOs have been linked, unlinked, or had enforcement changed.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5136
+          AttributeLDAPDisplayName="gPLink"
+          earliest=-7d
+      | rex field=AttributeValue
+          "\{(?<linked_gpo_guid>[0-9A-Fa-f\-]{36})\}"
+      | eval operation=case(
+          OperationType="%%14675", "Link Added",
+          OperationType="%%14676", "Link Removed",
+          OperationType="%%14674", "Link Modified",
+          1==1, OperationType
+        )
+      | stats
+          count,
+          values(operation) as operations,
+          values(SubjectUserName) as actors,
+          min(_time) as first_seen,
+          max(_time) as last_seen
+          by linked_gpo_guid, ObjectDN
+      | table linked_gpo_guid, ObjectDN, operations, actors, count, first_seen, last_seen
+      | sort - count
+
+  # --- Query C: SYSVOL changes in the past 24 hours (non-DFS-R processes) ---
+  sysvol_changes_recent:
+    description: >
+      List all SYSVOL Policies directory file creation events in the past
+      24 hours excluding DFS-R replication. Use to spot unauthorized GPO
+      content changes.
+    search: |
+      index=wineventlog
+          sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=11
+          (TargetFilename="*\\SYSVOL\\*\\Policies\\*"
+           OR TargetFilename="*\\SYSVOL_DFSR\\*\\Policies\\*")
+          NOT (Image="*\\dfsr.exe" OR Image="*\\dfsrs.exe")
+          earliest=-24h
+      | rex field=TargetFilename
+          "\\\\Policies\\\\(?i)\{(?<gpo_guid>[0-9A-Fa-f\-]{36})\}\\\\"
+      | table _time, Computer, User, Image, TargetFilename, gpo_guid
+      | sort _time
+
+  # --- Query D: Full session reconstruction for a GPO attack ---
+  gpo_attack_session_reconstruction:
+    description: >
+      Given an account and time window from a GPO attack alert, reconstruct
+      all AD and host activity in that session for incident forensics.
+    search: |
+      index=wineventlog
+          (SubjectUserName="<ACTOR_ACCOUNT>" OR User="<ACTOR_ACCOUNT>")
+          EventCode IN (5136, 5137, 5141, 4688, 4624, 4662)
+          earliest="<ALERT_TIME_MINUS_1h>"
+          latest="<ALERT_TIME_PLUS_1h>"
+      | eval event_type=case(
+          EventCode=5136, "AD Object Modified",
+          EventCode=5137, "AD Object Created",
+          EventCode=5141, "AD Object Deleted",
+          EventCode=4688, "Process Created",
+          EventCode=4624, "Logon",
+          EventCode=4662, "Directory Access",
+          1==1, "Event ".EventCode
+        )
+      | sort _time
+      | table _time, event_type, EventCode, ComputerName,
+              coalesce(SubjectUserName, User) as actor,
+              coalesce(ObjectDN, NewProcessName, "") as target,
+              coalesce(AttributeLDAPDisplayName, CommandLine, "") as detail
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RESPONSE PLAYBOOK — Actions upon confirmed GPO modification attack
+# ██████████████████████████████████████████████████████████████████████████████
+
+response_playbook:
+  name: "GPO Modification Attack — Incident Response Procedure"
+  description: >
+    Step-by-step response when a GPO modification attack is confirmed.
+    The key urgency factor: Group Policy refreshes every 90 minutes + random
+    offset on clients (immediately on manual gpupdate). Every second until
+    the malicious GPO is removed, more machines may execute the payload.
+
+  immediate_actions:
+    - step: 1
+      action: "Identify the malicious GPO and its scope"
+      detail: >
+        From the alert: identify the GPO GUID, the ObjectDN, and which OUs
+        or the Domain root it is linked to. Use GPMC or:
+        Get-GPO -Guid "<GPO-GUID>" | Get-GPOReport -ReportType XML
+        Determine: (a) which machines are affected, (b) what the payload is
+        (startup script, scheduled task, registry setting, security template).
+
+    - step: 2
+      action: "Unlink the malicious GPO from all OUs immediately"
+      detail: >
+        Use GPMC or PowerShell to remove the GPO link (not delete the GPO —
+        preserve it for forensics):
+        Remove-GPLink -Guid "<GPO-GUID>" -Target "<OU-DN>"
+        Remove-GPLink -Guid "<GPO-GUID>" -Target "<Domain-DN>"
+        This prevents the payload from reaching new machines on next refresh.
+
+    - step: 3
+      action: "Disable the malicious GPO"
+      detail: >
+        After unlinking, disable the GPO to prevent reactivation:
+        (Get-GPO -Guid "<GPO-GUID>").GpoStatus = "AllSettingsDisabled"
+        Do NOT delete until forensics are complete.
+
+    - step: 4
+      action: "Force Group Policy removal on affected machines"
+      detail: >
+        Run gpupdate /force on all machines that may have received the
+        malicious policy. For a domain-root-linked GPO, this may be
+        all domain machines — use SCCM/Intune for bulk execution.
+        If the payload was a startup script, it may already have run on
+        machines that rebooted since the GPO was linked.
+
+    - step: 5
+      action: "Disable the attacker's account"
+      detail: >
+        Disable the account identified in the alert (actor_account / SubjectUserName).
+        Reset its password and review all sessions and actions in the past 7 days.
+
+    - step: 6
+      action: "Scope the blast — identify which machines received the policy"
+      detail: >
+        Check Event 4703/4704 on endpoints (token-level policy application),
+        or check the affected machines for the payload artifacts
+        (scheduled tasks: schtasks /query, startup scripts: check registry run keys,
+        added local admins: net localgroup Administrators).
+
+    - step: 7
+      action: "Remove payload artifacts from affected machines"
+      detail: >
+        If a scheduled task was deployed via GPO: it persists in
+        C:\Windows\System32\Tasks\ even after GPO removal.
+        Delete it manually via schtasks /Delete or Task Scheduler.
+        If a startup script was deployed: it persists in the registry.
+        If local admin was added: remove via net localgroup Administrators.
+
+  forensic_actions:
+    - "Archive the malicious GPO report: Get-GPOReport -Guid <GUID> -ReportType XML"
+    - "Preserve SYSVOL content for the malicious GPO GUID before removal"
+    - "Check Event 4624 for the attacker's logon sessions (source IP, logon type)"
+    - "Check for lateral movement from the attacker's account to other systems"
+    - "Audit GPO delegation: Get-GPPermissions -Guid <GUID> for unauthorized delegations"
+    - "Check AdminSDHolder object for GPO-granted unexpected permissions"
+    - "Review whether other GPOs were also modified or created in the same session"
+    - "Search endpoint logs for execution of the payload script/task before GPO removal"

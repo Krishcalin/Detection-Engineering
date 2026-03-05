@@ -1,0 +1,1440 @@
+# ==============================================================================
+#  NTDS.dit Extraction Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for Active Directory database (NTDS.dit)
+#                extraction attacks. Covers VSS shadow copy abuse, ntdsutil IFM,
+#                diskshadow LOLBin, esentutl VSS copy, and PowerShell WMI-based
+#                shadow copy creation on Domain Controllers.
+#
+#                NTDS.dit is the Active Directory domain database stored at
+#                C:\Windows\NTDS\ntds.dit on every Domain Controller. It contains
+#                the password hashes for ALL domain accounts. Since the file is
+#                locked by the SYSTEM (NTDS service), attackers use Volume Shadow
+#                Copy Service (VSS) to access a snapshot copy, then extract it
+#                offline with tools like Impacket secretsdump or DSInternals.
+#                Combined with the SYSTEM registry hive
+#                (HKLM\SYSTEM\CurrentControlSet\Services\NTDS), the attacker can
+#                decrypt every hash in the domain — equivalent to a full DCSync.
+#
+#  MITRE ATT&CK: T1003.003 — OS Credential Dumping: NTDS
+#  Related      : T1059.001 — PowerShell (WMI shadow copy creation)
+#                 T1059.003 — Windows Command Shell (vssadmin, diskshadow)
+#                 T1490     — Inhibit System Recovery (VSS deletion, post-exfil)
+#  Kill Chain   : Credential Access → Domain Dominance → Lateral Movement
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-04
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES (must be configured BEFORE these rules will generate detections):
+#
+#  1. Enable Advanced Audit Policy on ALL Domain Controllers:
+#     Computer Configuration > Windows Settings > Security Settings >
+#       Advanced Audit Policy Configuration > Audit Policies:
+#
+#       Detailed Tracking > "Audit Process Creation"    → Enable SUCCESS
+#       Detailed Tracking > "Audit Process Termination" → Enable SUCCESS
+#       Object Access     > "Audit File System"         → Enable SUCCESS, FAILURE
+#       DS Access         > "Audit Directory Service Access" → Enable SUCCESS
+#
+#  2. Enable Command Line Logging in Process Creation events (Event 4688):
+#     Computer Configuration > Administrative Templates > System >
+#       Audit Process Creation >
+#         "Include command line in process creation events" → Enabled
+#     Without this, Event 4688 shows only the executable path, NOT the arguments.
+#     Arguments like "create full", "/vss", "/s script.dsh" will be invisible.
+#
+#  3. Deploy Sysmon on all Domain Controllers (strongly recommended):
+#     Sysmon Event 1  — Process creation with full command line and parent info
+#     Sysmon Event 7  — Image load (DLL loading, catches vssapi.dll in odd processes)
+#     Sysmon Event 11 — File creation (catches ntds.dit copy to non-standard paths)
+#     Sysmon Event 13 — Registry value set (HKLM\SYSTEM\NTDS path access)
+#     Sysmon Config:
+#       <RuleGroup name="FileCreate" groupRelation="or">
+#         <FileCreate onmatch="include">
+#           <TargetFilename condition="contains">ntds.dit</TargetFilename>
+#           <TargetFilename condition="contains">SYSTEM.hiv</TargetFilename>
+#           <TargetFilename condition="contains">ntds.jfm</TargetFilename>
+#         </FileCreate>
+#       </RuleGroup>
+#
+#  4. Configure SACL on NTDS.dit for Security Event 4663 (Object Access Auditing):
+#     Run on the Domain Controller as Domain Admin:
+#       $acl = Get-Acl -Path "C:\Windows\NTDS\ntds.dit" -Audit
+#       $auditRule = New-Object System.Security.AccessControl.FileSystemAuditRule(
+#           "Everyone", "ReadData,ReadAttributes", "None", "None", "Success")
+#       $acl.AddAuditRule($auditRule)
+#       Set-Acl -Path "C:\Windows\NTDS\ntds.dit" $acl
+#     This generates Event 4663 whenever the file is opened — even via VSS.
+#
+#  5. Enable PowerShell Script Block Logging on Domain Controllers:
+#     Computer Configuration > Administrative Templates > Windows Components >
+#       Windows PowerShell >
+#         "Turn on PowerShell Script Block Logging" → Enabled
+#     Required for detecting WMI-based shadow copy creation via PowerShell.
+#     Logs to sourcetype=XmlWinEventLog:Microsoft-Windows-PowerShell/Operational
+#
+#  6. Forward ALL of the following log sources from DCs to Splunk:
+#     - sourcetype=XmlWinEventLog:Security          (Events 4688, 4663, 5136, 4104)
+#     - sourcetype=XmlWinEventLog:System            (Event 7036 — VSS service state)
+#     - sourcetype=XmlWinEventLog:Application       (Event 8222 — VSS shadow created)
+#     - sourcetype=XmlWinEventLog:Microsoft-Windows-PowerShell/Operational
+#     - sourcetype=XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+#
+# ==============================================================================
+#
+#  Attack Tool Reference
+#
+#  Tool / Technique               | Command Pattern                                     | Event IDs
+#  ------------------------------ | --------------------------------------------------- | ----------------
+#  vssadmin create shadow         | vssadmin create shadow /for=C:\                     | 4688/Sysmon 1
+#  ntdsutil IFM                   | ntdsutil "activate instance ntds" "ifm" ...         | 4688/Sysmon 1
+#  diskshadow /s (LOLBin)         | diskshadow.exe /s C:\temp\shadow.dsh                | 4688/Sysmon 1
+#  esentutl VSS copy              | esentutl /y /vss C:\Windows\NTDS\ntds.dit /d ...    | 4688/Sysmon 1
+#  PowerShell WMI VSS             | (Get-WmiObject Win32_ShadowCopy).Create(...)        | 4104/Sysmon 1
+#  Direct file copy from shadow   | copy \\?\GLOBALROOT\Device\HarddiskVolumeSS...\... | 4688/Sysmon 1
+#  SYSTEM hive export (reg save)  | reg save HKLM\SYSTEM C:\temp\SYSTEM.hiv             | 4688/Sysmon 1
+#  File creation of ntds.dit      | ntds.dit appears outside C:\Windows\NTDS\           | Sysmon 11
+#  ntds.dit direct access attempt | Any process opens C:\Windows\NTDS\ntds.dit          | 4663
+#
+# ==============================================================================
+#
+#  Field Name Reference — Windows Security Events (XmlWinEventLog:Security)
+#
+#  Event 4688 (Process Creation):
+#    SubjectUserName     — account that launched the process
+#    SubjectDomainName   — domain of the account
+#    SubjectLogonId      — logon session ID
+#    NewProcessName      — full path of the new process (e.g. C:\Windows\System32\ntdsutil.exe)
+#    NewProcessId        — PID of the new process (hex)
+#    ProcessId           — PID of the parent process (hex)
+#    ParentProcessName   — full path of the parent process
+#    CommandLine         — full command line (requires audit policy setting above)
+#    TokenElevationType  — %%1936=full, %%1937=limited, %%1938=elevated
+#
+#  Event 4663 (Object Access — File):
+#    SubjectUserName     — account accessing the file
+#    SubjectDomainName   — domain of the account
+#    SubjectLogonId      — logon session ID
+#    ObjectName          — full path of the object accessed
+#    ObjectType          — "File" for file system objects
+#    ProcessName         — process accessing the file
+#    AccessMask          — hex access mask (0x1 = ReadData, 0x20000 = ReadAttributes)
+#    HandleId            — handle to the object
+#
+#  Sysmon Event 1 (Process Creation) — sourcetype=XmlWinEventLog:Microsoft-Windows-Sysmon/Operational:
+#    Image               — full path of process (equivalent to NewProcessName)
+#    CommandLine         — full command line (always populated by Sysmon)
+#    ParentImage         — full path of parent process
+#    ParentCommandLine   — command line of parent
+#    User                — DOMAIN\username
+#    LogonId             — logon session ID
+#    ProcessId           — PID
+#    ParentProcessId     — parent PID
+#    Hashes              — SHA1/MD5/SHA256 of the executable
+#    IntegrityLevel      — System/High/Medium/Low
+#
+#  Sysmon Event 11 (File Creation):
+#    TargetFilename      — full path of the file created
+#    Image               — process that created the file
+#    User                — DOMAIN\username
+#    ProcessId           — PID
+#
+#  Sysmon Event 7 (Image Load / DLL Load):
+#    Image               — process loading the DLL
+#    ImageLoaded         — full path of the DLL
+#    Signed              — TRUE/FALSE
+#    Signature           — certificate signer
+#
+#  Application Event 8222 (VSS — Shadow Copy Created):
+#    No standard field names; message contains snapshot volume info
+#
+#  System Event 7036 (Service State Change):
+#    ServiceName         — name of the service (e.g. "Volume Shadow Copy")
+#    param2              — "running" or "stopped"
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: ntdsutil IFM Execution on Domain Controller
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  ntdsutil with "ifm" (Install-From-Media) sub-command is the most direct and
+#  commonly abused built-in Windows tool for extracting NTDS.dit. While it has
+#  a legitimate use case (provisioning RODCs), it should never be invoked
+#  interactively or from an unusual parent process like cmd.exe or PowerShell.
+#  The IFM output folder contains ntds.dit + SYSTEM + SECURITY hive copies —
+#  the complete offline cracking package.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very Low — legitimate RODC deployments are planned and rare
+#  Tools caught: ntdsutil.exe (native), Impacket (calls ntdsutil remotely)
+
+rule_1_ntdsutil_ifm_execution:
+  name: "NTDS.dit Extraction — ntdsutil IFM Execution on Domain Controller"
+  description: >
+    Detects execution of ntdsutil.exe with the "ifm" (Install From Media)
+    sub-command on a Domain Controller. The IFM feature was designed to
+    provision Read-Only Domain Controllers (RODCs) by exporting a copy of the
+    AD database. Adversaries abuse it to extract NTDS.dit and the registry
+    hives needed for offline hash extraction. The command "ntdsutil activate
+    instance ntds ifm create full <path>" writes ntds.dit, SYSTEM, and
+    SECURITY hive files to the target directory. This combination is the
+    complete offline cracking package and should never be invoked outside
+    a planned RODC provisioning operation.
+  mitre:
+    tactic: Credential Access
+    technique: T1003.003
+    technique_name: "OS Credential Dumping: NTDS"
+  severity: critical
+  confidence: 95
+  risk_score: 98
+  kill_chain_phase: "Actions on Objectives"
+  data_sources:
+    - "Windows Security Event Log (Event ID 4688) — Process Creation"
+    - "Sysmon Event ID 1 — Process Creation"
+  prerequisites:
+    - "Event 4688 with CommandLine populated (requires audit policy + GPO setting)"
+    - "OR: Sysmon deployed on Domain Controllers with Event ID 1"
+    - "Security and Sysmon logs forwarded to Splunk from all DCs"
+
+  search: |
+    (
+        (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+            (NewProcessName="*\\ntdsutil.exe" OR NewProcessName="*\\ntdsutil")
+        )
+        OR
+        (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+            (Image="*\\ntdsutil.exe" OR Image="*\\ntdsutil")
+        )
+    )
+    | eval process_path=coalesce(NewProcessName, Image)
+    | eval cmd_line=coalesce(CommandLine, CommandLine)
+    | eval parent_process=coalesce(ParentProcessName, ParentImage)
+    | eval actor_account=coalesce(SubjectUserName, User)
+    | eval logon_session=coalesce(SubjectLogonId, LogonId)
+    | eval src_host=coalesce(ComputerName, Computer)
+    ```Match IFM-specific command line arguments```
+    | where
+        like(lower(cmd_line), "%ifm%")
+        OR like(lower(cmd_line), "%create full%")
+        OR like(lower(cmd_line), "%create sysvol full%")
+        OR like(lower(cmd_line), "%activate instance ntds%")
+    ```Exclude SYSTEM account doing legitimate maintenance (very rare — alert anyway)```
+    | eval account_context=case(
+        like(actor_account, "%$"), "machine_account",
+        actor_account IN ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE"), "local_system",
+        1==1, "interactive_or_service"
+      )
+    ```Extract output path from command line if present```
+    | rex field=cmd_line "(?i)create\s+(?:sysvol\s+)?full\s+(?<ifm_output_path>\S+)"
+    | eval ifm_output_path=coalesce(ifm_output_path, "path_not_captured")
+    | eval severity_assessment=case(
+        account_context="interactive_or_service", "CRITICAL — interactive ntdsutil IFM",
+        account_context="machine_account", "HIGH — machine account IFM (verify backup software)",
+        1==1, "HIGH"
+      )
+    | eval mitre_technique="T1003.003"
+    | eval mitre_tactic="Credential Access"
+    | eval alert_name="NTDS.dit Extraction — ntdsutil IFM"
+    | table _time, src_host, actor_account, account_context, process_path,
+            parent_process, cmd_line, ifm_output_path, logon_session,
+            severity_assessment, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "src_host"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "ntdsutil IFM — NTDS Extraction on $src_host$ by $actor_account$"
+        rule_description: >
+          ntdsutil.exe was executed with IFM arguments on Domain Controller
+          $src_host$ by account $actor_account$. The IFM output at
+          $ifm_output_path$ likely contains ntds.dit and registry hive copies
+          sufficient for offline password hash extraction of all domain accounts.
+          Treat as CRITICAL unless confirmed part of an approved RODC deployment.
+        severity: critical
+        drilldown_search: >
+          index=wineventlog (EventCode=4688 OR EventCode=1)
+          (NewProcessName="*ntdsutil*" OR Image="*ntdsutil*")
+          ComputerName="$src_host$"
+    - risk:
+        risk_object: "actor_account"
+        risk_object_type: "user"
+        risk_score: 98
+    - risk:
+        risk_object: "src_host"
+        risk_object_type: "system"
+        risk_score: 95
+
+  known_false_positives:
+    - "RODC (Read-Only DC) provisioning by AD infrastructure team using ntdsutil IFM"
+    - "AD database defragmentation via ntdsutil 'compact to' — different sub-command, NOT IFM"
+    - "Windows Server Backup using ntdsutil for AD-aware backup (rare — usually uses VSS directly)"
+  tuning_guidance: |
+    1. RODC provisioning is a planned, infrequent operation — correlate with change tickets
+    2. The command "ntdsutil compact to" is used for DB defrag and does NOT extract NTDS.dit —
+       if you see this, it is safe to suppress using a NOT like(cmd_line, "%compact to%") filter
+    3. If backup software uses ntdsutil, identify its service account and add to exclusion
+    4. Alert should fire even for SYSTEM — legitimate use is extremely rare and should be verified
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: vssadmin Shadow Copy Creation on a Domain Controller
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  vssadmin is the built-in VSS administration utility. Creating a shadow copy
+#  on a DC is the first step in extracting NTDS.dit via VSS. While backup
+#  software legitimately uses VSS, direct invocation of vssadmin on a DC by
+#  any account other than a known backup service account is highly suspicious.
+#  This rule enriches the alert by correlating with subsequent file copy or
+#  ntds.dit access events within a 15-minute window.
+#
+#  Confidence  : MEDIUM-HIGH (standalone) / HIGH (with file copy correlation)
+#  Severity    : HIGH (standalone) / CRITICAL (with ntds.dit copy)
+#  FP Rate     : Medium — backup software on DCs uses VSS; exclude known agents
+
+rule_2_vssadmin_shadow_on_dc:
+  name: "NTDS.dit Extraction — vssadmin Shadow Copy Creation on Domain Controller"
+  description: >
+    Detects creation of a VSS shadow copy on a Domain Controller using
+    vssadmin.exe. Shadow copies are the primary mechanism for bypassing the
+    SYSTEM lock on NTDS.dit — attackers create a shadow copy of the C: volume,
+    then copy ntds.dit from the shadow. While legitimate backup software uses
+    VSS, it does NOT invoke vssadmin.exe interactively; it uses the VSS COM API
+    directly. Interactive vssadmin execution on a DC, especially by a non-backup
+    service account, is a strong NTDS extraction indicator. The rule enriches
+    with any subsequent ntds.dit copy events in the same session window to
+    elevate confidence from HIGH to CRITICAL.
+  mitre:
+    tactic: Credential Access
+    technique: T1003.003
+    technique_name: "OS Credential Dumping: NTDS"
+  severity: high
+  confidence: 75
+  risk_score: 80
+  data_sources:
+    - "Windows Security Event Log (Event ID 4688) — Process Creation"
+    - "Sysmon Event ID 1 — Process Creation"
+    - "Sysmon Event ID 11 — File Creation (ntds.dit copy correlation)"
+    - "Windows Application Event Log (Event ID 8222) — VSS Snapshot Created"
+  prerequisites:
+    - "Event 4688 with CommandLine populated OR Sysmon Event 1 on DCs"
+    - "Sysmon Event 11 configured to capture ntds.dit file creation events"
+
+  search: |
+    (
+        (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+            (NewProcessName="*\\vssadmin.exe" OR NewProcessName="*\\vssadmin")
+        )
+        OR
+        (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+            (Image="*\\vssadmin.exe")
+        )
+    )
+    | eval process_path=coalesce(NewProcessName, Image)
+    | eval cmd_line=coalesce(CommandLine, CommandLine)
+    | eval parent_process=coalesce(ParentProcessName, ParentImage)
+    | eval actor_account=coalesce(SubjectUserName, User)
+    | eval logon_session=coalesce(SubjectLogonId, LogonId)
+    | eval src_host=coalesce(ComputerName, Computer)
+    ```Filter to shadow copy creation operations only```
+    | where
+        like(lower(cmd_line), "%create shadow%")
+        OR like(lower(cmd_line), "%createshadow%")
+    ```Exclude known backup service accounts (customize per environment)```
+    | search NOT actor_account IN ("veeambackup", "commvault", "netbackup_svc",
+                                    "arcserve_svc", "tsm_agent", "DP_AGENT")
+    ```Exclude purely machine accounts running scheduled backups at known times```
+    | eval cmd_lower=lower(cmd_line)
+    | eval shadow_target=case(
+        like(cmd_lower, "%/for=c%"),  "C: drive (NTDS likely)",
+        like(cmd_lower, "%/for=d%"),  "D: drive",
+        like(cmd_lower, "%/for=%"),   "unknown drive",
+        1==1,                         "no target specified (defaults to C:)"
+      )
+    | stats
+        count as shadow_create_count,
+        values(cmd_line) as commands_run,
+        values(parent_process) as parent_processes,
+        values(shadow_target) as shadow_targets,
+        min(_time) as first_seen,
+        max(_time) as last_seen
+        by src_host, actor_account, logon_session
+    ```Correlate with ntds.dit file creation events in a 15-minute window```
+    | appendcols
+        [
+            search index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                EventCode=11 TargetFilename="*ntds.dit*"
+                NOT TargetFilename="C:\\Windows\\NTDS\\ntds.dit"
+            | stats count as ntds_copy_events, values(TargetFilename) as ntds_copy_paths
+              by Computer
+            | rename Computer as src_host
+        ]
+    | eval ntds_copied=if(isnotnull(ntds_copy_events) AND ntds_copy_events > 0, "YES", "NO")
+    | eval final_severity=if(ntds_copied="YES", "CRITICAL — ntds.dit copy confirmed", "HIGH — shadow copy only")
+    | eval mitre_technique="T1003.003"
+    | eval alert_name="NTDS.dit Extraction — vssadmin on DC"
+    | table first_seen, last_seen, src_host, actor_account, logon_session,
+            shadow_create_count, commands_run, shadow_targets, parent_processes,
+            ntds_copied, ntds_copy_paths, final_severity,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-20m"
+    latest: "now"
+    window: "15m"
+  throttle:
+    field: "src_host"
+    period: "2h"
+  actions:
+    - notable_event:
+        rule_title: "vssadmin on DC — $src_host$ by $actor_account$ (ntds copied: $ntds_copied$)"
+        severity: high
+    - risk:
+        risk_object: "actor_account"
+        risk_object_type: "user"
+        risk_score: 80
+    - risk:
+        risk_object: "src_host"
+        risk_object_type: "system"
+        risk_score: 75
+
+  known_false_positives:
+    - "Veeam, Commvault, Veritas NetBackup, Arcserve, HP Data Protector — use VSS on DCs"
+    - "Windows Server Backup (wbadmin.exe) — invokes VSS but via its own process, not vssadmin directly"
+    - "SCCM client software inventory — uses VSS for open file backup of AD artifacts"
+    - "Disk management or storage team scripts running vssadmin list for inventory"
+  tuning_guidance: |
+    1. Add your backup software service accounts to the exclusion list
+    2. If backup software is excluded, any remaining vssadmin execution is highly suspicious
+    3. Correlate with the ntds.dit copy events — if ntds_copied=YES, escalate to CRITICAL
+       regardless of the account (backup software should not copy ntds.dit to temp locations)
+    4. Establish a baseline: run a longer-term query to see which accounts normally use vssadmin
+       on your DCs before deploying this rule with throttling
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: diskshadow LOLBin NTDS Extraction on Domain Controller
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  diskshadow.exe is a signed Microsoft binary (LOLBin) that can create VSS
+#  shadow copies and expose them as mounted drive letters via a script file.
+#  Its scripted mode (/s) is essentially never used in legitimate administration
+#  — WMIC and vssadmin are far more common. The /s flag is a near-certain
+#  indicator of either a red team exercise or actual attack. The attack chain:
+#  1) Write a script file (diskshadow.dsh or .txt)
+#  2) diskshadow /s script.dsh → creates shadow, exposes as Z: (or any letter)
+#  3) robocopy/xcopy Z:\Windows\NTDS\ntds.dit <output>
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very Low — /s flag is rare in legitimate use
+
+rule_3_diskshadow_lolbin:
+  name: "NTDS.dit Extraction — diskshadow LOLBin Script Execution on DC"
+  description: >
+    Detects use of diskshadow.exe with the /s (script) flag on a Domain
+    Controller. diskshadow is a signed Microsoft binary capable of creating
+    VSS shadow copies and exposing them as drive letters via a script file —
+    a technique used by threat actors to access locked NTDS.dit without
+    triggering standard vssadmin monitoring. The scripted execution path
+    (/s script.dsh) is not used in normal Windows administration. Legitimate
+    diskshadow invocations use the interactive mode or are called programmatically
+    by backup software, not via /s with a user-created script file.
+  mitre:
+    tactic: Credential Access
+    technique: T1003.003
+    technique_name: "OS Credential Dumping: NTDS"
+  related_techniques:
+    - T1218: "System Binary Proxy Execution (signed MS binary)"
+  severity: critical
+  confidence: 90
+  risk_score: 93
+  data_sources:
+    - "Windows Security Event Log (Event ID 4688)"
+    - "Sysmon Event ID 1"
+    - "Sysmon Event ID 11 — script file creation preceding diskshadow execution"
+  prerequisites:
+    - "Event 4688 with CommandLine populated OR Sysmon Event 1 on DCs"
+
+  search: |
+    (
+        (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+            NewProcessName="*\\diskshadow.exe"
+        )
+        OR
+        (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+            Image="*\\diskshadow.exe"
+        )
+    )
+    | eval process_path=coalesce(NewProcessName, Image)
+    | eval cmd_line=coalesce(CommandLine, CommandLine)
+    | eval parent_process=coalesce(ParentProcessName, ParentImage)
+    | eval actor_account=coalesce(SubjectUserName, User)
+    | eval logon_session=coalesce(SubjectLogonId, LogonId)
+    | eval src_host=coalesce(ComputerName, Computer)
+    ```/s (script) flag is the primary indicator of LOLBin abuse```
+    | where like(lower(cmd_line), "%/s %") OR like(lower(cmd_line), "%-s %")
+    ```Extract the script file path from command line```
+    | rex field=cmd_line "(?i)/s\s+(?<shadow_script_path>\S+)"
+    | eval shadow_script_path=coalesce(shadow_script_path, "path_not_captured")
+    ```Classify parent process context for confidence scoring```
+    | eval parent_context=case(
+        like(lower(parent_process), "%cmd.exe"),          "cmd.exe — interactive shell",
+        like(lower(parent_process), "%powershell.exe"),   "PowerShell — scripted execution",
+        like(lower(parent_process), "%wscript.exe"),      "WScript — script execution",
+        like(lower(parent_process), "%cscript.exe"),      "CScript — script execution",
+        like(lower(parent_process), "%svchost.exe"),      "svchost — possibly scheduled task",
+        1==1,                                              "other: ".parent_process
+      )
+    | eval confidence_level=case(
+        parent_context IN ("cmd.exe — interactive shell",
+                           "PowerShell — scripted execution"), "HIGH — interactive attacker",
+        parent_context IN ("WScript — script execution",
+                           "CScript — script execution"),      "HIGH — dropped script execution",
+        parent_context="svchost — possibly scheduled task",    "MEDIUM — verify scheduled task",
+        1==1,                                                  "MEDIUM"
+      )
+    | eval mitre_technique="T1003.003 / T1218"
+    | eval alert_name="NTDS.dit Extraction — diskshadow LOLBin"
+    | table _time, src_host, actor_account, parent_process, parent_context,
+            process_path, cmd_line, shadow_script_path, logon_session,
+            confidence_level, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_host"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "diskshadow LOLBin — NTDS Extraction on $src_host$ by $actor_account$"
+        severity: critical
+    - risk:
+        risk_object: "actor_account"
+        risk_object_type: "user"
+        risk_score: 93
+    - risk:
+        risk_object: "src_host"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "Legitimate diskshadow interactive mode usage (no /s flag) — not caught by this rule"
+    - "Scripted disaster recovery runbooks that use diskshadow /s for VSS snapshots"
+    - "Storage management teams using diskshadow for disk management operations"
+  tuning_guidance: |
+    1. The /s flag is the discriminating indicator — without it, diskshadow is less suspicious
+    2. Review any triggered alert immediately — this is a very low-volume, high-signal rule
+    3. Check Sysmon Event 11 for the script file creation preceding the diskshadow execution
+       (the script file is often written to C:\temp\ or the user's %APPDATA%)
+    4. Cross-reference the shadow_script_path with the actual file content if available
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: esentutl VSS Copy of NTDS.dit
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  esentutl.exe is the Extensible Storage Engine utility, a signed Windows binary
+#  used for Jet/ESE database operations. The /y (copy) combined with /vss (Volume
+#  Shadow Service copy mode) creates a copy of a locked file via VSS without
+#  needing to invoke vssadmin separately. This is a single-command NTDS extraction
+#  technique: esentutl /y /vss C:\Windows\NTDS\ntds.dit /d C:\temp\ntds.dit
+#
+#  Confidence  : VERY HIGH — /vss flag on ntds.dit path is essentially unambiguous
+#  Severity    : CRITICAL
+#  FP Rate     : Negligible — no legitimate administration workflow uses this
+
+rule_4_esentutl_vss_copy:
+  name: "NTDS.dit Extraction — esentutl VSS Copy of NTDS Database"
+  description: >
+    Detects esentutl.exe executed with the /y (copy) and /vss (Volume Shadow
+    Service copy) flags targeting the NTDS database path. esentutl is the
+    Extensible Storage Engine utility used to maintain ESE/Jet databases.
+    The /y /vss combination creates a VSS-backed copy of a locked file —
+    specifically designed to bypass the SYSTEM lock on NTDS.dit — in a single
+    command without requiring separate shadow copy creation. This technique
+    requires no external tools, leaves minimal footprint, and is a known
+    LOLBAS (Living Off the Land Binary) technique. Any execution of this
+    exact command pattern is a near-certain credential extraction attempt.
+  mitre:
+    tactic: Credential Access
+    technique: T1003.003
+    technique_name: "OS Credential Dumping: NTDS"
+  related_techniques:
+    - T1218: "System Binary Proxy Execution (signed MS binary)"
+  severity: critical
+  confidence: 98
+  risk_score: 99
+  data_sources:
+    - "Windows Security Event Log (Event ID 4688)"
+    - "Sysmon Event ID 1"
+  prerequisites:
+    - "Event 4688 with CommandLine populated OR Sysmon Event 1 on DCs"
+
+  search: |
+    (
+        (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+            NewProcessName="*\\esentutl.exe"
+        )
+        OR
+        (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+            Image="*\\esentutl.exe"
+        )
+    )
+    | eval process_path=coalesce(NewProcessName, Image)
+    | eval cmd_line=coalesce(CommandLine, CommandLine)
+    | eval parent_process=coalesce(ParentProcessName, ParentImage)
+    | eval actor_account=coalesce(SubjectUserName, User)
+    | eval logon_session=coalesce(SubjectLogonId, LogonId)
+    | eval src_host=coalesce(ComputerName, Computer)
+    | eval cmd_lower=lower(cmd_line)
+    ```Primary indicator: /vss flag (VSS copy mode)```
+    | where like(cmd_lower, "%/vss%")
+    ```Check for NTDS path as source```
+    | eval targets_ntds=if(
+        like(cmd_lower, "%ntds.dit%") OR like(cmd_lower, "%\\ntds\\%"),
+        "YES", "NO"
+      )
+    ```Check for /y (copy operation) flag```
+    | eval has_copy_flag=if(like(cmd_lower, "%/y%"), "YES", "NO")
+    ```Extract destination path from /d flag```
+    | rex field=cmd_line "(?i)/d\s+(?<output_path>\S+)"
+    | eval output_path=coalesce(output_path, "destination_not_captured")
+    | eval attack_profile=case(
+        targets_ntds="YES" AND has_copy_flag="YES",
+          "CONFIRMED — esentutl /y /vss copying ntds.dit",
+        targets_ntds="YES",
+          "HIGH — /vss targeting NTDS path",
+        has_copy_flag="YES",
+          "HIGH — esentutl VSS copy (check source path)",
+        1==1,
+          "MEDIUM — esentutl with /vss (check command line)"
+      )
+    | eval mitre_technique="T1003.003"
+    | eval alert_name="NTDS.dit Extraction — esentutl VSS Copy"
+    | table _time, src_host, actor_account, parent_process, cmd_line,
+            targets_ntds, has_copy_flag, output_path, attack_profile,
+            logon_session, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_host"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "esentutl VSS Copy — NTDS Extraction on $src_host$ by $actor_account$"
+        severity: critical
+    - risk:
+        risk_object: "actor_account"
+        risk_object_type: "user"
+        risk_score: 99
+    - risk:
+        risk_object: "src_host"
+        risk_object_type: "system"
+        risk_score: 97
+
+  known_false_positives:
+    - "Virtually none — esentutl /vss is not used in any legitimate administrative workflow"
+    - "Theoretical: AD database recovery tools that happen to use esentutl /y /vss"
+  tuning_guidance: |
+    1. This rule has near-zero false positives — treat every alert as a true positive
+       until proven otherwise
+    2. If you see an alert here, immediately check for subsequent file copy events
+       (Sysmon 11) and network connections (exfiltration of the extracted ntds.dit)
+    3. Also check for SYSTEM hive copy: "reg save HKLM\SYSTEM" in the same session
+       (attackers need both ntds.dit AND SYSTEM hive to decrypt hashes offline)
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: PowerShell WMI Shadow Copy Creation on Domain Controller
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Attackers use PowerShell + WMI to create VSS shadow copies programmatically,
+#  avoiding direct invocation of vssadmin.exe. The WMI Win32_ShadowCopy class
+#  Create method creates a shadow copy identical to vssadmin but without the
+#  obvious vssadmin process. This is commonly used by red teams and more
+#  sophisticated threat actors. Key PowerShell patterns:
+#  - (Get-WmiObject -Class Win32_ShadowCopy).Create("C:\","ClientAccessible")
+#  - $shadow = ([WMICLASS]"root\cimv2:Win32_ShadowCopy").Create("C:\","ClientAccessible")
+#  - Get-CimInstance Win32_ShadowCopy | ... (for listing/accessing existing shadows)
+#
+#  Confidence  : HIGH (exact WMI pattern match)
+#  Severity    : CRITICAL
+#  FP Rate     : Low — WMI-based VSS creation is unusual on DCs
+
+rule_5_powershell_wmi_shadow_copy:
+  name: "NTDS.dit Extraction — PowerShell WMI Shadow Copy Creation on DC"
+  description: >
+    Detects PowerShell script block logging events containing Win32_ShadowCopy
+    WMI class usage for creating volume shadow copies on a Domain Controller.
+    This is an evasion variant of the vssadmin technique — it achieves the
+    same result (VSS snapshot enabling NTDS.dit access) without invoking
+    vssadmin.exe, which is more commonly monitored. PowerShell Script Block
+    Logging (Event 4104) captures the actual PowerShell code before
+    obfuscation is decoded, making this detection reliable even against
+    encoded/obfuscated scripts.
+  mitre:
+    tactic: Credential Access
+    technique: T1003.003
+    technique_name: "OS Credential Dumping: NTDS"
+  related_techniques:
+    - T1059.001: "Command and Scripting Interpreter: PowerShell"
+    - T1047: "Windows Management Instrumentation"
+  severity: critical
+  confidence: 85
+  risk_score: 90
+  data_sources:
+    - "PowerShell Operational Log Event 4104 (Script Block Logging)"
+  prerequisites:
+    - "PowerShell Script Block Logging enabled on Domain Controllers"
+    - "XmlWinEventLog:Microsoft-Windows-PowerShell/Operational forwarded to Splunk"
+
+  search: |
+    index=wineventlog
+        sourcetype="XmlWinEventLog:Microsoft-Windows-PowerShell/Operational"
+        EventCode=4104
+    ```Match WMI shadow copy creation patterns```
+    | where
+        like(lower(ScriptBlockText), "%win32_shadowcopy%")
+        AND (
+            like(lower(ScriptBlockText), "%.create(%")
+            OR like(lower(ScriptBlockText), "%win32_shadowcopy%clientaccessible%")
+            OR like(lower(ScriptBlockText), "%[wmiclass]%shadowcopy%")
+        )
+    ```Also catch access to existing shadow volumes targeting NTDS```
+    | eval also_accesses_ntds=if(
+        like(lower(ScriptBlockText), "%ntds%") OR
+        like(lower(ScriptBlockText), "%globalroot%harddisk%"),
+        "YES", "NO"
+      )
+    ```Also detect shadow copy path exposure patterns```
+    | eval exposes_shadow_volume=if(
+        like(lower(ScriptBlockText), "%deviceobject%") OR
+        like(lower(ScriptBlockText), "%shadowpath%") OR
+        like(lower(ScriptBlockText), "%globalroot%"),
+        "YES", "NO"
+      )
+    | eval src_host=coalesce(ComputerName, Computer)
+    | eval actor_account=coalesce(UserName, SubjectUserName)
+    | eval confidence_level=case(
+        also_accesses_ntds="YES", "CRITICAL — shadow copy + NTDS reference",
+        exposes_shadow_volume="YES", "HIGH — shadow created and volume path extracted",
+        1==1, "HIGH — WMI shadow copy creation on DC"
+      )
+    ```Truncate script block for display (may be large)```
+    | eval script_preview=substr(ScriptBlockText, 1, 500)
+    | eval mitre_technique="T1003.003 / T1059.001 / T1047"
+    | eval alert_name="NTDS.dit Extraction — PS WMI Shadow Copy"
+    | table _time, src_host, actor_account, script_preview,
+            also_accesses_ntds, exposes_shadow_volume, confidence_level,
+            ScriptBlockId, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_host"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "PS WMI Shadow Copy on DC — $src_host$ by $actor_account$"
+        severity: critical
+    - risk:
+        risk_object: "actor_account"
+        risk_object_type: "user"
+        risk_score: 90
+    - risk:
+        risk_object: "src_host"
+        risk_object_type: "system"
+        risk_score: 88
+
+  known_false_positives:
+    - "Backup software with PowerShell components that use WMI for VSS on DCs"
+    - "AD health monitoring scripts that check shadow copy status using Win32_ShadowCopy"
+    - "Storage administration scripts that list shadow copies (no .Create() call — adjust filter)"
+  tuning_guidance: |
+    1. Narrow the rule to focus on .Create() method calls if list-only operations are noisy:
+       add: AND like(lower(ScriptBlockText), "%.create(")
+    2. Scripts that ONLY read Win32_ShadowCopy (Get-WmiObject without Create) are lower risk
+       — consider a separate, lower-severity rule for read-only WMI shadow queries on DCs
+    3. Correlate with subsequent Sysmon Event 11 file creation events for ntds.dit copies
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: NTDS.dit File Creation Outside Standard NTDS Directory (Sysmon)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  This is the highest-confidence, lowest-noise NTDS extraction detection.
+#  The legitimate NTDS.dit file lives ONLY at C:\Windows\NTDS\ntds.dit and is
+#  never created or copied to any other location by Windows itself. Any Sysmon
+#  file creation event for a file named ntds.dit outside of C:\Windows\NTDS\ is
+#  unambiguously the result of an extraction attempt. This catches ALL extraction
+#  techniques (vssadmin, ntdsutil, diskshadow, esentutl) at the point of output.
+#
+#  Confidence  : CRITICAL
+#  Severity    : CRITICAL
+#  FP Rate     : Near-Zero — there is no legitimate reason for ntds.dit outside NTDS dir
+
+rule_6_ntds_file_copy_sysmon:
+  name: "NTDS.dit Extraction — ntds.dit File Created Outside NTDS Directory"
+  description: >
+    Detects creation of a file named ntds.dit at any path OTHER than
+    C:\Windows\NTDS\ntds.dit. This is the definitive output-stage indicator
+    for ALL NTDS extraction techniques — regardless of whether the attacker
+    used vssadmin, ntdsutil IFM, diskshadow, esentutl, or a direct shadow
+    copy access. The NTDS.dit file is only legitimately present in
+    C:\Windows\NTDS\ on a Domain Controller. Any copy to a temp directory,
+    user profile, network share, or USB is an extraction event. This rule
+    requires Sysmon Event 11 (File Creation) with TargetFilename monitoring
+    configured for the ntds.dit filename pattern.
+  mitre:
+    tactic: Credential Access
+    technique: T1003.003
+    technique_name: "OS Credential Dumping: NTDS"
+  severity: critical
+  confidence: 99
+  risk_score: 100
+  data_sources:
+    - "Sysmon Event ID 11 — File Creation"
+  prerequisites:
+    - "Sysmon deployed on ALL Domain Controllers"
+    - "Sysmon configuration includes FileCreate rule for ntds.dit filename pattern"
+    - "Sysmon logs forwarded to Splunk: sourcetype=XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+
+  # --- Sysmon Config Required ---
+  # Add to your Sysmon configuration XML under <FileCreate>:
+  #   <RuleGroup name="FileCreate" groupRelation="or">
+  #     <FileCreate onmatch="include">
+  #       <TargetFilename condition="contains">ntds.dit</TargetFilename>
+  #       <TargetFilename condition="contains">ntds.jfm</TargetFilename>
+  #       <TargetFilename condition="contains">edb.log</TargetFilename>
+  #     </FileCreate>
+  #   </RuleGroup>
+
+  search: |
+    index=wineventlog
+        sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        EventCode=11
+        TargetFilename="*ntds.dit*"
+    ```Exclude the legitimate NTDS directory — alert on ALL other locations```
+    | where NOT (
+        like(lower(TargetFilename), "c:\\windows\\ntds\\ntds.dit")
+        OR like(lower(TargetFilename), "c:\\windows\\ntds\\ntds.dit.tmp")
+    )
+    ```Also catch shadow copy path access patterns```
+    | eval is_shadow_copy_path=if(
+        like(lower(TargetFilename), "%globalroot%") OR
+        like(lower(TargetFilename), "%harddiskvolumeshadowcopy%") OR
+        like(lower(TargetFilename), "%shadowcopy%"),
+        "YES", "NO"
+      )
+    ```Identify the output location type```
+    | eval output_location_type=case(
+        like(lower(TargetFilename), "%\\temp\\%"),         "temp_directory",
+        like(lower(TargetFilename), "%\\appdata\\%"),      "user_profile",
+        like(lower(TargetFilename), "%\\users\\%"),        "user_directory",
+        like(lower(TargetFilename), "\\\\%"),              "network_share — CRITICAL exfil risk",
+        like(lower(TargetFilename), "%\\windows\\temp\\%"),"windows_temp",
+        like(lower(TargetFilename), "%c:\\windows\\ntds\\"), "legitimate_ntds_dir",
+        1==1,                                              "other_location"
+      )
+    | eval actor_account=coalesce(User, SubjectUserName)
+    | eval creating_process=Image
+    | eval src_host=coalesce(Computer, ComputerName)
+    ```Correlate with SYSTEM hive copy in same session (complete extraction package)```
+    | join type=left src_host
+        [
+            search index=wineventlog
+                sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                EventCode=11
+                (TargetFilename="*SYSTEM.hiv*" OR TargetFilename="*SYSTEM.bak*"
+                 OR TargetFilename="*SAM.hiv*" OR TargetFilename="*SECURITY.hiv*")
+            | stats count as hive_copy_count, values(TargetFilename) as hive_files_copied
+              by Computer
+            | rename Computer as src_host
+        ]
+    | eval full_package=if(
+        isnotnull(hive_copy_count) AND hive_copy_count > 0,
+        "YES — ntds.dit + registry hive: offline cracking ready",
+        "ntds.dit only — SYSTEM hive may follow"
+      )
+    | eval mitre_technique="T1003.003"
+    | eval alert_name="NTDS.dit File Copy — Extraction Confirmed"
+    | table _time, src_host, actor_account, creating_process, TargetFilename,
+            output_location_type, is_shadow_copy_path,
+            hive_files_copied, full_package, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "NTDS.dit Copied — $src_host$ | $actor_account$ | $TargetFilename$"
+        rule_description: >
+          A copy of ntds.dit was created outside the NTDS directory on Domain
+          Controller $src_host$ by $actor_account$ via $creating_process$.
+          Output location: $TargetFilename$ ($output_location_type$).
+          Full extraction package ready: $full_package$.
+          This represents a complete Active Directory credential extraction event.
+          ALL domain account password hashes are likely compromised.
+        severity: critical
+    - risk:
+        risk_object: "actor_account"
+        risk_object_type: "user"
+        risk_score: 100
+    - risk:
+        risk_object: "src_host"
+        risk_object_type: "system"
+        risk_score: 100
+
+  known_false_positives:
+    - >
+      AD DS backup software that copies ntds.dit to a backup staging area
+      before sending to backup media — verify the output path matches your
+      backup software's staging directory and the creating_process is the
+      backup agent executable
+    - >
+      ntdsutil compact/offline defragmentation may create a temp copy of
+      ntds.dit in the output directory — distinguish by checking if the
+      creating_process is ntdsutil.exe and the cmd_line contains "compact to"
+  tuning_guidance: |
+    1. This rule has the highest confidence of all NTDS rules — treat every alert seriously
+    2. If backup software triggers this, add an exclusion for the specific staging path AND
+       creating_process combination — not just the path alone
+    3. If full_package=YES (ntds.dit + registry hive), initiate full incident response
+       immediately — the attacker has everything needed for offline hash cracking
+    4. Check for subsequent network connections from the same host for exfiltration activity
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: NTDS.dit Direct File Access Attempt (Event 4663)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Windows Security Event 4663 fires when a process opens the NTDS.dit file
+#  with read access, provided a SACL (System Access Control List) has been
+#  configured on the file. This catches any tool that attempts to read
+#  NTDS.dit directly — including esentutl without /vss, volume-level readers,
+#  and any novel tools not covered by process name rules.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Low if SACL properly scoped; SYSTEM and ntdsa.dll are excluded
+
+rule_7_ntds_direct_access_4663:
+  name: "NTDS.dit Extraction — Direct File Access Attempt on NTDS Database"
+  description: >
+    Detects any process accessing C:\Windows\NTDS\ntds.dit with read operations
+    via Windows Security Event 4663 (Object Access). This requires a SACL
+    (Audit ACE) configured on the file. The NTDS service (ntdsa.dll, lsass.exe
+    with SYSTEM account) legitimately accesses ntds.dit continuously — these
+    are excluded. Any OTHER process accessing ntds.dit directly is anomalous.
+    This is a technique-agnostic detection that complements process name rules —
+    it catches novel tools, renamed binaries, and any approach that reads the
+    file directly rather than through VSS.
+  mitre:
+    tactic: Credential Access
+    technique: T1003.003
+    technique_name: "OS Credential Dumping: NTDS"
+  severity: critical
+  confidence: 85
+  risk_score: 92
+  data_sources:
+    - "Windows Security Event Log (Event ID 4663) — Object Access"
+  prerequisites:
+    - "SACL configured on C:\\Windows\\NTDS\\ntds.dit (see prerequisites section)"
+    - "Audit File System — Success enabled in Advanced Audit Policy"
+    - "Security logs forwarded from all DCs to Splunk"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4663
+        ObjectType="File"
+        ObjectName="*ntds.dit*"
+    ```Exclude the legitimate NTDS service — lsass.exe running as SYSTEM```
+    | where NOT (
+        (SubjectUserName="SYSTEM" OR Security_ID="S-1-5-18")
+        AND (like(ProcessName, "%\\lsass.exe") OR like(ProcessName, "%\\svchost.exe"))
+      )
+    ```Exclude well-known NTDS maintenance processes by SYSTEM```
+    | where NOT (
+        SubjectUserName="SYSTEM"
+        AND ProcessName IN (
+            "C:\\Windows\\System32\\lsass.exe",
+            "C:\\Windows\\System32\\ntdsutil.exe"
+        )
+    )
+    ```Filter to read-related access masks```
+    | where AccessMask IN ("0x1", "0x80", "0x120089", "0x100001", "0x1b6",
+                           "0x1", "0x20000", "0x20089")
+        OR like(AccessMask, "%1%")
+    | stats
+        count as access_count,
+        dc(HandleId) as unique_handles,
+        values(AccessMask) as access_masks_used,
+        values(ProcessName) as accessing_processes,
+        min(_time) as first_access,
+        max(_time) as last_access
+        by SubjectUserName, SubjectDomainName, ObjectName, ComputerName
+    | eval actor_context=case(
+        SubjectUserName="SYSTEM" OR like(SubjectUserName, "%$"), "system_or_machine_account",
+        1==1, "user_account — INVESTIGATE IMMEDIATELY"
+      )
+    | eval mitre_technique="T1003.003"
+    | eval alert_name="NTDS.dit Direct Access — Object Access Event"
+    | table first_access, last_access, SubjectUserName, SubjectDomainName,
+            ComputerName, ObjectName, accessing_processes, access_masks_used,
+            access_count, unique_handles, actor_context, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "SubjectUserName"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "NTDS.dit Direct Access — $SubjectUserName$ on $ComputerName$"
+        severity: critical
+    - risk:
+        risk_object: "SubjectUserName"
+        risk_object_type: "user"
+        risk_score: 92
+
+  known_false_positives:
+    - "Improperly scoped SACL that includes SYSTEM access — ensure the SACL excludes SYSTEM"
+    - "AD backup agents that open ntds.dit via VSS (the VSS copy path differs from the original)"
+    - "AV/EDR products scanning ntds.dit as part of on-access file protection"
+  tuning_guidance: |
+    1. Configure the SACL to audit Everyone EXCEPT SYSTEM to minimize noise:
+       In icacls: icacls C:\Windows\NTDS\ntds.dit /audit:E:A(everyone:SACL:R)
+    2. After deploying, run a baseline query to see which processes legitimately access ntds.dit
+    3. AV/EDR exclusion: identify your AV process name and add to the NOT clause in ProcessName
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: NTDS Extraction — Complete Toolkit Correlation (Multi-Stage)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  This rule correlates multiple indicators from the same host within a 30-minute
+#  window to detect the full NTDS extraction kill chain. Individual indicators may
+#  be explainable in isolation; their combination within a short timeframe on a DC
+#  is definitive evidence of an extraction attempt. The rule scores each indicator
+#  and fires when the combined score exceeds the threshold.
+#
+#  Indicators scored:
+#  +3 — ntds.dit file creation outside NTDS dir (Sysmon 11)
+#  +3 — esentutl /vss execution (process creation)
+#  +3 — ntdsutil IFM execution (process creation)
+#  +2 — diskshadow /s execution (process creation)
+#  +2 — vssadmin create shadow on DC (process creation)
+#  +2 — PowerShell WMI Win32_ShadowCopy.Create (Event 4104)
+#  +1 — reg save HKLM\SYSTEM or HKLM\SECURITY (SYSTEM hive export)
+#  +1 — VSS service start on DC (Event 7036)
+#  Alert threshold: score >= 3 (catches even single high-confidence indicators)
+#
+#  Confidence  : VERY HIGH (multi-indicator)
+#  Severity    : CRITICAL
+#  FP Rate     : Very Low — multi-indicator correlation dramatically reduces FP
+
+rule_8_ntds_extraction_correlation:
+  name: "NTDS.dit Extraction — Multi-Stage Extraction Kill Chain Detected"
+  description: >
+    Correlates multiple NTDS extraction indicators across a 30-minute window
+    on the same Domain Controller. Individual events may be explainable;
+    their combination is definitive. The rule scores each event type by
+    confidence weight (1-3) and alerts when the cumulative score exceeds 3.
+    This catches the complete extraction kill chain: shadow copy creation,
+    NTDS tools execution, file copy, and SYSTEM hive export. It also catches
+    single high-confidence events (score 3) like ntds.dit file copy or
+    ntdsutil IFM, providing a unified correlated alert.
+  mitre:
+    tactic: Credential Access
+    technique: T1003.003
+    technique_name: "OS Credential Dumping: NTDS"
+  severity: critical
+  confidence: 95
+  risk_score: 98
+  data_sources:
+    - "Windows Security Event Log (Events 4688, 4663, 4104)"
+    - "Sysmon Events 1, 11"
+    - "Windows System Log (Event 7036)"
+  prerequisites:
+    - "All NTDS detection prerequisites from Rules 1-7 above"
+    - "A Splunk lookup or summary index to accumulate indicator scores (optional — can run inline)"
+
+  search: |
+    ```Collect all NTDS extraction indicators from the past 30 minutes```
+    (
+        ```Indicator A: ntds.dit file creation outside NTDS dir — score 3```
+        (
+            index=wineventlog
+                sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                EventCode=11
+                TargetFilename="*ntds.dit*"
+                NOT TargetFilename="C:\\Windows\\NTDS\\ntds.dit"
+            | eval indicator="ntds_file_copy"
+            | eval indicator_score=3
+            | eval indicator_detail="ntds.dit copied to: ".TargetFilename
+            | eval src_host=Computer
+            | eval actor_account=User
+        )
+        OR
+        ```Indicator B: ntdsutil IFM — score 3```
+        (
+            (
+                (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+                    NewProcessName="*\\ntdsutil.exe")
+                OR
+                (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                    EventCode=1 Image="*\\ntdsutil.exe")
+            )
+            | where like(lower(coalesce(CommandLine,"")), "%ifm%")
+                 OR like(lower(coalesce(CommandLine,"")), "%create full%")
+            | eval indicator="ntdsutil_ifm"
+            | eval indicator_score=3
+            | eval indicator_detail="ntdsutil IFM: ".coalesce(CommandLine, "cmd_not_available")
+            | eval src_host=coalesce(ComputerName, Computer)
+            | eval actor_account=coalesce(SubjectUserName, User)
+        )
+        OR
+        ```Indicator C: esentutl /vss — score 3```
+        (
+            (
+                (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+                    NewProcessName="*\\esentutl.exe")
+                OR
+                (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                    EventCode=1 Image="*\\esentutl.exe")
+            )
+            | where like(lower(coalesce(CommandLine,"")), "%/vss%")
+            | eval indicator="esentutl_vss"
+            | eval indicator_score=3
+            | eval indicator_detail="esentutl VSS: ".coalesce(CommandLine, "cmd_not_available")
+            | eval src_host=coalesce(ComputerName, Computer)
+            | eval actor_account=coalesce(SubjectUserName, User)
+        )
+        OR
+        ```Indicator D: diskshadow /s — score 2```
+        (
+            (
+                (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+                    NewProcessName="*\\diskshadow.exe")
+                OR
+                (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                    EventCode=1 Image="*\\diskshadow.exe")
+            )
+            | where like(lower(coalesce(CommandLine,"")), "%/s %")
+            | eval indicator="diskshadow_script"
+            | eval indicator_score=2
+            | eval indicator_detail="diskshadow /s: ".coalesce(CommandLine, "cmd_not_available")
+            | eval src_host=coalesce(ComputerName, Computer)
+            | eval actor_account=coalesce(SubjectUserName, User)
+        )
+        OR
+        ```Indicator E: vssadmin create shadow — score 2```
+        (
+            (
+                (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+                    NewProcessName="*\\vssadmin.exe")
+                OR
+                (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                    EventCode=1 Image="*\\vssadmin.exe")
+            )
+            | where like(lower(coalesce(CommandLine,"")), "%create shadow%")
+            | eval indicator="vssadmin_shadow"
+            | eval indicator_score=2
+            | eval indicator_detail="vssadmin: ".coalesce(CommandLine, "cmd_not_available")
+            | eval src_host=coalesce(ComputerName, Computer)
+            | eval actor_account=coalesce(SubjectUserName, User)
+        )
+        OR
+        ```Indicator F: reg save SYSTEM hive — score 1```
+        (
+            (
+                (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+                    NewProcessName="*\\reg.exe")
+                OR
+                (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                    EventCode=1 Image="*\\reg.exe")
+            )
+            | where like(lower(coalesce(CommandLine,"")), "%save%hklm\\system%")
+                 OR like(lower(coalesce(CommandLine,"")), "%save%hklm\\security%")
+            | eval indicator="reg_save_hive"
+            | eval indicator_score=1
+            | eval indicator_detail="reg save hive: ".coalesce(CommandLine, "cmd_not_available")
+            | eval src_host=coalesce(ComputerName, Computer)
+            | eval actor_account=coalesce(SubjectUserName, User)
+        )
+    )
+    ```Aggregate by host over the 30-minute correlation window```
+    | bin _time span=30m
+    | stats
+        sum(indicator_score) as total_score,
+        values(indicator) as indicators_fired,
+        values(indicator_detail) as indicator_details,
+        values(actor_account) as involved_accounts,
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as total_events
+        by src_host, _time
+    ```Only alert when total score exceeds threshold```
+    | where total_score >= 3
+    | eval threat_level=case(
+        total_score >= 8,  "CRITICAL — complete extraction kill chain confirmed",
+        total_score >= 5,  "CRITICAL — multiple extraction techniques observed",
+        total_score >= 3,  "HIGH — extraction technique detected"
+      )
+    | eval indicator_count=mvcount(indicators_fired)
+    | eval mitre_technique="T1003.003"
+    | eval alert_name="NTDS Extraction Kill Chain — Multi-Stage Detection"
+    | table first_seen, last_seen, src_host, involved_accounts,
+            indicators_fired, indicator_count, indicator_details,
+            total_score, threat_level, total_events, mitre_technique, alert_name
+    | sort - total_score
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-40m"
+    latest: "now"
+    window: "30m"
+  throttle:
+    field: "src_host"
+    period: "2h"
+  actions:
+    - notable_event:
+        rule_title: "NTDS Extraction Kill Chain — Score $total_score$ on $src_host$"
+        rule_description: >
+          NTDS.dit extraction kill chain detected on Domain Controller $src_host$.
+          Threat score: $total_score$. Indicators fired: $indicators_fired$.
+          Involved accounts: $involved_accounts$.
+          $threat_level$
+        severity: critical
+    - risk:
+        risk_object: "src_host"
+        risk_object_type: "system"
+        risk_score: 98
+
+  known_false_positives:
+    - "Combination of legitimate backup (vssadmin) + admin maintenance (reg save) on a DC"
+    - "Post-disaster recovery operations involving multiple NTDS tools"
+  tuning_guidance: |
+    1. Adjust the scoring weights per your environment's baseline
+    2. If vssadmin + reg save routinely occur together in your backup window, increase the threshold
+       or add a time-of-day exclusion for the backup window
+    3. The indicator_details field provides the exact commands — review them for context
+    4. This rule acts as a catch-all for the above individual rules — if running all rules,
+       consider whether to run this as an additional correlated alert or as the primary alert
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  INVESTIGATION QUERIES — Run manually during incident response
+# ██████████████████████████████████████████████████████████████████████████████
+
+investigation_queries:
+
+  # --- Query A: Full session timeline reconstruction on a DC ---
+  session_reconstruction_dc:
+    description: >
+      Given a session ID or host from an alert, reconstruct all activity
+      on the Domain Controller in a 2-hour window around the incident time.
+      Replace <DC_HOSTNAME> and <TIME_WINDOW> with actual values.
+    search: |
+      index=wineventlog (ComputerName="<DC_HOSTNAME>" OR Computer="<DC_HOSTNAME>")
+          (EventCode IN (4688, 4663, 4104, 4698, 4702, 7036)
+           OR (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+               AND EventCode IN (1, 11, 13, 7)))
+          earliest="<INCIDENT_TIME_MINUS_1h>"
+          latest="<INCIDENT_TIME_PLUS_1h>"
+      | sort _time
+      | eval event_type=case(
+          EventCode=4688 OR EventCode=1,  "Process Creation",
+          EventCode=4663,                 "File Access",
+          EventCode=11,                   "File Creation",
+          EventCode=4104,                 "PowerShell Script Block",
+          EventCode=7036,                 "Service State Change",
+          1==1,                           "Event ".EventCode
+        )
+      | table _time, event_type, EventCode, sourcetype,
+              coalesce(SubjectUserName, User) as actor,
+              coalesce(NewProcessName, Image, ObjectName, TargetFilename, ServiceName) as artifact,
+              coalesce(CommandLine, ScriptBlockText) as detail
+
+  # --- Query B: Find all ntds.dit file copies in the last 30 days ---
+  ntds_copy_historical:
+    description: >
+      Search for any historical ntds.dit file creation outside the NTDS
+      directory over the past 30 days. Useful for determining if extraction
+      occurred before detection was deployed.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=11
+          TargetFilename="*ntds.dit*"
+          NOT TargetFilename="C:\\Windows\\NTDS\\ntds.dit"
+          earliest=-30d
+      | table _time, Computer, User, Image, TargetFilename
+      | sort _time
+
+  # --- Query C: Enumerate all VSS shadow copies created on DCs ---
+  vss_shadow_history_on_dcs:
+    description: >
+      List all VSS shadow copy creation events on Domain Controllers over
+      the past 7 days. Establish a baseline of legitimate backup-driven
+      shadow copies vs. anomalous ones.
+    search: |
+      (
+          (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+              (NewProcessName="*\\vssadmin.exe" OR NewProcessName="*\\diskshadow.exe")
+          )
+          OR
+          (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+              EventCode=1
+              (Image="*\\vssadmin.exe" OR Image="*\\diskshadow.exe")
+          )
+      )
+      | where like(lower(coalesce(CommandLine,"")), "%create shadow%")
+           OR like(lower(coalesce(CommandLine,"")), "%/s %")
+      | eval src_host=coalesce(ComputerName, Computer)
+      | eval actor=coalesce(SubjectUserName, User)
+      | eval cmd=coalesce(CommandLine, "no_cmdline")
+      earliest=-7d
+      | stats
+          count as shadow_creates,
+          values(cmd) as commands,
+          min(_time) as first_seen,
+          max(_time) as last_seen
+          by src_host, actor
+      | sort - shadow_creates
+
+  # --- Query D: Check if SYSTEM hive was exported alongside ntds.dit ---
+  system_hive_export_check:
+    description: >
+      Checks for registry hive exports (SYSTEM, SECURITY, SAM) which are
+      required alongside ntds.dit for offline hash decryption. If found
+      near the same time as an NTDS extraction alert, the attacker has the
+      complete offline cracking toolkit.
+    search: |
+      (
+          (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4688
+              NewProcessName="*\\reg.exe")
+          OR
+          (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+              EventCode=1 Image="*\\reg.exe")
+      )
+      | where like(lower(coalesce(CommandLine,"")), "%save%")
+          AND (
+              like(lower(coalesce(CommandLine,"")), "%hklm\\system%")
+              OR like(lower(coalesce(CommandLine,"")), "%hklm\\security%")
+              OR like(lower(coalesce(CommandLine,"")), "%hklm\\sam%")
+          )
+      | eval src_host=coalesce(ComputerName, Computer)
+      | eval actor=coalesce(SubjectUserName, User)
+      | table _time, src_host, actor, coalesce(CommandLine, "no_cmdline") as command
+      | sort _time
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RESPONSE PLAYBOOK — Actions upon confirmed NTDS extraction detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+response_playbook:
+  name: "NTDS.dit Extraction — Incident Response Procedure"
+  description: >
+    Step-by-step response when an NTDS extraction rule fires and is confirmed
+    as a true positive. The scope of compromise is the entire Active Directory
+    domain — all password hashes are considered compromised.
+
+  immediate_actions:
+    - step: 1
+      action: "Isolate the Domain Controller"
+      detail: >
+        Network-isolate the DC where extraction was detected. Use firewall
+        rules or EDR network containment. Do NOT shut down — preserve memory
+        and VSS snapshot state. Remove from production network but maintain
+        management access for forensics.
+
+    - step: 2
+      action: "Disable the actor account"
+      detail: >
+        Disable the account identified in the alert (actor_account).
+        If SYSTEM is the actor, escalate immediately — attacker has SYSTEM-level
+        access on a DC, indicating full domain compromise.
+
+    - step: 3
+      action: "Preserve forensic artifacts"
+      detail: >
+        Before any remediation: capture live memory (Magnet RAM Capture or
+        WinPmem), take disk image or VSS snapshot for forensic analysis,
+        export relevant Security and Sysmon event logs.
+
+    - step: 4
+      action: "Determine scope — identify the extracted file location"
+      detail: >
+        From the alert, identify ifm_output_path or TargetFilename.
+        Determine if the file was subsequently exfiltrated:
+        - Check network logs for outbound transfers from the DC
+        - Check removable media connections (Event 6416, Sysmon)
+        - Check SMB connections to the extracted file path
+
+    - step: 5
+      action: "Reset the KRBTGT password twice"
+      detail: >
+        The KRBTGT hash is in ntds.dit. Reset the KRBTGT password twice
+        (12+ hours apart) to invalidate all Kerberos tickets.
+        Command: Reset-KrbtgtKeyInteractive.ps1 (Microsoft script)
+        Reference: https://aka.ms/krbtgt
+
+    - step: 6
+      action: "Reset ALL domain account passwords"
+      detail: >
+        Every account hash is in ntds.dit. Priority order:
+        1) krbtgt (already done)
+        2) Domain Admins, Enterprise Admins, Schema Admins
+        3) All service accounts and computer accounts
+        4) All user accounts
+        Note: This is a domain-wide password reset operation.
+
+    - step: 7
+      action: "Revoke all active Kerberos tickets"
+      detail: >
+        After KRBTGT reset, clear the Kerberos ticket cache on all domain
+        members (restart Kerberos Distribution Center service on DCs).
+        Monitor for Golden Ticket usage: Event 4769 with EncryptionType=0x17
+        (RC4) from accounts that have been reset to AES-only.
+
+    - step: 8
+      action: "Audit AD for persistence mechanisms"
+      detail: >
+        Check for: new admin accounts, new GPOs, new scheduled tasks on DCs,
+        new WMI subscriptions, modified startup scripts, changes to
+        AdminSDHolder object, new SID history entries.
+
+  forensic_actions:
+    - "Analyze ntdsutil IFM output directory if left on DC (contains datfiles/ntds.dit)"
+    - "Check VSS shadow copy list: vssadmin list shadows (any shadows not created by backup?)"
+    - "Analyze Memory for credential extraction tools (Mimikatz, SecretsDump artifacts)"
+    - "Check event logs for lateral movement FROM the DC after extraction"
+    - "Correlate with VPN/remote access logs — attacker may be remote"
+    - "Check for ntds.dit in network shares, cloud storage sync folders, email"
+    - "Search for hive files (SYSTEM.hiv, SECURITY.hiv) in the same directories as ntds.dit"

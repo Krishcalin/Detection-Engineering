@@ -1,0 +1,978 @@
+# ==============================================================================
+#  Pass-the-Hash Attack Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for Pass-the-Hash (PtH) lateral movement.
+#                Covers classic NTLM Type 3 null-subject logons, Mimikatz
+#                sekurlsa::pth (LogonType 9 / seclogo), Overpass-the-Hash
+#                (RC4 TGT via kerberos::ptk), Impacket psexec/smbexec/wmiexec
+#                tool signatures, and chained TTP correlation with LSASS dumps.
+#
+#                Pass-the-Hash exploits the NTLM authentication design: the NT hash
+#                IS the credential. Attackers extract an NT hash (via LSASS dump,
+#                SAM, or NTDS.dit) and replay it directly against SMB, WMI, WinRM,
+#                or RDP without ever cracking the password.
+#
+#  MITRE ATT&CK: T1550.002 - Use Alternate Authentication Material: Pass the Hash
+#                 T1021.002 - Remote Services: SMB/Windows Admin Shares
+#                 T1021.006 - Remote Services: Windows Remote Management
+#                 T1047    - Windows Management Instrumentation
+#  Kill Chain   : Lateral Movement -> Privilege Escalation -> Persistence
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-04
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Enable Advanced Audit Policy on ALL domain-joined hosts:
+#     Logon/Logoff > "Audit Logon" -> Success, Failure
+#     Logon/Logoff > "Audit Special Logon" -> Success
+#     Object Access > "Audit File Share" -> Success
+#     Account Logon > "Audit Credential Validation" -> Success, Failure
+#     Account Logon > "Audit Kerberos Authentication Service" -> Success, Failure
+#     (via GPO: auditpol /set /subcategory:"Logon" /success:enable /failure:enable)
+#
+#  2. Forward Security logs from ALL hosts to Splunk:
+#     sourcetype=XmlWinEventLog:Security
+#
+#  3. Deploy Sysmon for process-access telemetry (chained TTP rule):
+#     sourcetype=XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+#
+#  4. (Optional) Enable NTLM Operational logging on Domain Controllers:
+#     GPO: Network Security: Restrict NTLM: Audit NTLM authentication -> "Enable all"
+#     sourcetype=XmlWinEventLog:Microsoft-Windows-NTLM/Operational (Event 8004)
+#
+#  5. Lookup tables (recommended):
+#     dc_ip_list.csv        — Domain Controller IP addresses
+#     legacy_ntlm_hosts.csv — Hosts with legitimate legacy NTLM requirements
+#
+# ==============================================================================
+#
+#  Key Detection Fields (Event 4624):
+#
+#  Field                      | PtH Indicator         | Legitimate NTLM
+#  -------------------------- | --------------------- | ----------------------
+#  LogonType                  | 3 (Network)           | 3 (same)
+#  AuthenticationPackageName  | NTLM                  | NTLM
+#  LogonProcessName           | NtLmSsp               | NtLmSsp
+#  SubjectUserSid             | S-1-0-0 (null SID)    | S-1-5-18 (SYSTEM)
+#  KeyLength                  | 0                     | 128 (modern Windows)
+#  LogonGuid                  | All-zeros GUID        | All-zeros GUID (NTLM)
+#
+#  LogonType 9 (NewCredentials) + LogonProcessName=seclogo = Mimikatz sekurlsa::pth
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: Classic PtH — NTLM Type 3 Logon with Null Subject (Event 4624)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The most reliable PtH indicator on the TARGET machine. When PtH is used,
+#  the authentication occurs with NO active subject context on the target —
+#  SubjectUserSid = S-1-0-0 (Null SID) and KeyLength = 0 (no session key).
+#  In legitimate NTLM logons, KeyLength = 128 for NTLMv2 (modern default).
+#
+#  Detection logic:
+#    - Event 4624 LogonType=3, AuthPackage=NTLM, SubjectUserSid=S-1-0-0, KeyLength=0
+#    - Excludes machine accounts, ANONYMOUS LOGON, and localhost
+#    - Classifies single-target vs lateral movement spray pattern
+#
+#  Confidence  : MEDIUM-HIGH (78) — requires tuning for legacy environments
+#  Severity    : HIGH
+#  FP Rate     : Medium — legacy apps, print servers, some backup agents use NTLM Type 3
+
+rule_1_classic_pth_ntlm_type3:
+  name: "Pass-the-Hash — NTLM Type 3 Logon with Null Subject (KeyLength=0)"
+  description: >
+    Detects NTLM network logon (Event 4624, LogonType=3) where SubjectUserSid=S-1-0-0
+    (null SID) and KeyLength=0, which are the defining characteristics of Pass-the-Hash
+    authentication. In legitimate NTLM NTLMv2 logons, KeyLength is 128 and the
+    SubjectUserSid reflects the caller's security context. When KeyLength=0, the NTLM
+    session key was not established — characteristic of hash-relay authentication where
+    the attacker does not possess the full credential material to derive a session key.
+    Excludes machine accounts, ANONYMOUS LOGON, localhost loopback, and known legacy
+    NTLM hosts to reduce false positives.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: T1550.002
+    technique_name: "Use Alternate Authentication Material: Pass the Hash"
+    related_techniques:
+      - "T1021.002: Remote Services: SMB/Windows Admin Shares"
+      - "T1021.006: Remote Services: Windows Remote Management"
+      - "T1047: Windows Management Instrumentation"
+  severity: high
+  confidence: 78
+  risk_score: 80
+  kill_chain_phase: "Lateral Movement"
+  data_sources:
+    - "Windows Security Event Log — Event 4624 (Logon)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4624
+        LogonType="3"
+        AuthenticationPackageName="NTLM"
+        LogonProcessName="NtLmSsp"
+        SubjectUserSid="S-1-0-0"
+        KeyLength="0"
+    ``` Exclude machine accounts, anonymous, and system accounts ```
+    | where NOT match(TargetUserName, "\\$$")
+    | where TargetUserName NOT IN ("ANONYMOUS LOGON", "-", "SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE")
+    | where TargetDomainName!="-"
+    ``` Exclude localhost loopback ```
+    | where IpAddress NOT IN ("127.0.0.1", "::1", "-", "LOCAL")
+    ``` Optionally exclude known legacy NTLM hosts (build csv lookup) ```
+    | lookup legacy_ntlm_hosts.csv ip AS IpAddress OUTPUT is_legacy
+    | where isnull(is_legacy) OR is_legacy!="true"
+    ``` Normalize source IP (strip IPv4-mapped IPv6 prefix) ```
+    | eval src_ip=replace(IpAddress, "::ffff:", "")
+    ``` Classify attack scope ```
+    | eval target_host=Computer
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as auth_count,
+        dc(target_host) as unique_targets,
+        values(target_host) as target_hosts,
+        values(TargetUserName) as accounts_used,
+        values(LmPackageName) as ntlm_version,
+        values(ElevatedToken) as elevated_token,
+        values(TargetLogonId) as logon_ids
+        by src_ip, TargetDomainName
+    | eval lateral_movement_scope=case(
+        unique_targets >= 10, "CRITICAL — Mass lateral movement (10+ targets)",
+        unique_targets >= 5,  "HIGH — Broad lateral movement (5+ targets)",
+        unique_targets >= 2,  "HIGH — Multi-target lateral movement",
+        1==1,                 "MEDIUM — Single target (verify manually)"
+      )
+    | eval mitre_technique="T1550.002"
+    | eval mitre_tactic="Lateral Movement"
+    | eval alert_name="Pass-the-Hash — NTLM Null Subject"
+    | sort - unique_targets, auth_count
+    | table first_seen, last_seen, src_ip, TargetDomainName, accounts_used,
+            target_hosts, unique_targets, auth_count, ntlm_version,
+            elevated_token, lateral_movement_scope, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "src_ip"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Pass-the-Hash from $src_ip$ — $unique_targets$ target(s) — $lateral_movement_scope$"
+        rule_description: >
+          NTLM Pass-the-Hash detected from $src_ip$ targeting $unique_targets$ host(s)
+          ($target_hosts$) as $accounts_used$. SubjectUserSid=S-1-0-0 and KeyLength=0
+          confirm hash-based authentication (not password). $lateral_movement_scope$.
+          Correlate with recent LSASS dump (Sysmon Event 10) from $src_ip$ to confirm
+          hash extraction source. Check target hosts for post-exploitation indicators.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "src_ip"
+        risk_score: 80
+        risk_message: "PtH from $src_ip$ to $unique_targets$ host(s) — T1550.002"
+  false_positives:
+    - description: >
+        Legacy applications (file shares, print servers, old ERP systems) that do not
+        support Kerberos may generate NTLM Type 3 logons with KeyLength=0 legitimately.
+      tuning: "Build legacy_ntlm_hosts.csv with known legacy NTLM sources and add to lookup exclusion."
+    - description: >
+        Backup agents (Veeam, Commvault, Veritas) perform scheduled NTLM authentication
+        to remote hosts. These appear at consistent times and always use the same account.
+      tuning: "Allowlist backup agent IPs or add time-window exclusion for scheduled backup windows."
+    - description: >
+        Some vulnerability scanners (Nessus, Qualys, Rapid7) use NTLM for authenticated scans.
+      tuning: "Add scanner IP addresses to the exclusion list or allowlist."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Mimikatz sekurlsa::pth — LogonType 9 + seclogo Logon Process
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Mimikatz sekurlsa::pth spawns a new process with an injected token using
+#  LogonType 9 (NewCredentials) and the undocumented seclogo logon process.
+#  LogonType 9 means: the current user's local token is UNCHANGED, but all
+#  outbound network connections from that process use the injected hash credentials.
+#  In the event, TargetOutboundUserName and TargetOutboundDomainName contain
+#  the account whose hash was injected — confirming the impersonation target.
+#
+#  LogonType 9 + seclogo + Negotiate is essentially unique to Mimikatz PtH and
+#  the `runas /netonly` command (the latter is legitimate but rare outside IT).
+#
+#  Confidence  : HIGH (90) — near-zero FP rate outside IT helpdesk use
+#  Severity    : CRITICAL
+
+rule_2_mimikatz_pth_logontype9:
+  name: "Pass-the-Hash via Mimikatz sekurlsa::pth — LogonType 9 + seclogo Detected"
+  description: >
+    Detects Mimikatz sekurlsa::pth execution via the unique signature it leaves in
+    Event 4624: LogonType=9 (NewCredentials) combined with LogonProcessName=seclogo
+    and AuthenticationPackageName=Negotiate. The TargetOutboundUserName field reveals
+    the account whose hash was injected. This event fires on the SOURCE machine where
+    Mimikatz ran. Legitimate uses of LogonType 9 (runas /netonly, PowerShell -Credential
+    with -Authentication NtlmPasswordAuthentication) are excluded by the seclogo process
+    filter — runas uses the CREDMAN logon process, not seclogo.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: T1550.002
+    technique_name: "Use Alternate Authentication Material: Pass the Hash"
+    related_techniques:
+      - "T1003.001: OS Credential Dumping: LSASS Memory (prerequisite — hash source)"
+      - "T1134.002: Access Token Manipulation: Create Process with Token"
+  severity: critical
+  confidence: 90
+  risk_score: 95
+  kill_chain_phase: "Lateral Movement"
+  data_sources:
+    - "Windows Security Event Log — Event 4624 (Logon)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4624
+        LogonType="9"
+        LogonProcessName="seclogo"
+        AuthenticationPackageName="Negotiate"
+    ``` Exclude known legitimate uses — SYSTEM and machine accounts ```
+    | where SubjectUserName NOT IN ("SYSTEM", "-")
+    | where NOT match(SubjectUserName, "\\$$")
+    ``` Extract impersonated account info ```
+    | eval impersonated_account=TargetOutboundUserName + "@" + TargetOutboundDomainName
+    | eval actor=SubjectUserName + "@" + SubjectDomainName
+    | eval source_host=Computer
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as pth_count,
+        values(impersonated_account) as impersonated_accounts,
+        values(actor) as actors,
+        values(ProcessName) as spawning_processes,
+        values(SubjectLogonId) as logon_sessions
+        by source_host
+    | eval mitre_technique="T1550.002"
+    | eval mitre_tactic="Lateral Movement"
+    | eval alert_name="Mimikatz PtH — seclogo LogonType9"
+    | table first_seen, last_seen, source_host, actors, impersonated_accounts,
+            spawning_processes, pth_count, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "source_host"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Mimikatz PtH on $source_host$ — $actors$ impersonating $impersonated_accounts$"
+        rule_description: >
+          Mimikatz sekurlsa::pth was used on $source_host$ by $actors$ to inject the
+          hash of $impersonated_accounts$ (LogonType=9, seclogo). A new process was
+          spawned with the injected token for outbound network access. Isolate $source_host$,
+          identify what network connections the spawned process made, and rotate passwords
+          for all $impersonated_accounts$ accounts immediately.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "source_host"
+        risk_score: 95
+        risk_message: "Mimikatz PtH — impersonating $impersonated_accounts$ — T1550.002"
+  false_positives:
+    - description: >
+        `runas /netonly` uses LogonType 9 but its LogonProcessName is CREDMAN, not seclogo.
+        The seclogo process name is essentially unique to Mimikatz and is not generated
+        by any built-in Windows mechanism.
+      tuning: "No suppression recommended. Any seclogo + LogonType 9 event is suspicious."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Rapid NTLM Lateral Movement — Single Source, Multiple Targets
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  CrackMapExec and automated post-exploitation frameworks perform mass PtH
+#  against CIDR ranges in seconds. A single source IP authenticating to 5+ distinct
+#  target hosts via NTLM within 5 minutes is a strong lateral movement indicator.
+#
+#  This rule uses a 5-minute bucket to catch spray behavior while avoiding
+#  false positives from legitimate scheduled tasks that run hourly.
+#
+#  Confidence  : HIGH (82)
+#  Severity    : HIGH
+
+rule_3_rapid_ntlm_lateral_movement:
+  name: "Pass-the-Hash Spray — Rapid NTLM Authentication to Multiple Targets"
+  description: >
+    Detects a single source IP performing NTLM network authentication (Event 4624
+    LogonType=3) against 5 or more distinct target hosts within a 5-minute window.
+    This pattern is consistent with CrackMapExec, Metasploit smb_login, Impacket
+    tools running in scan mode, and Cobalt Strike lateral movement modules performing
+    network-wide hash validation or command execution. Legitimate services
+    (backup agents, monitoring) that access multiple hosts via NTLM are excluded by
+    time consistency — automated tools access all targets near-simultaneously while
+    legitimate services have temporally spaced access patterns.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: T1550.002
+    technique_name: "Use Alternate Authentication Material: Pass the Hash"
+    related_techniques:
+      - "T1021.002: Remote Services: SMB/Windows Admin Shares"
+      - "T1110.003: Password Spraying (similar spray pattern but different auth vector)"
+  severity: high
+  confidence: 82
+  risk_score: 85
+  kill_chain_phase: "Lateral Movement"
+  data_sources:
+    - "Windows Security Event Log — Event 4624 (Logon)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4624
+        LogonType="3"
+        AuthenticationPackageName="NTLM"
+    | where NOT match(TargetUserName, "\\$$")
+    | where TargetUserName NOT IN ("ANONYMOUS LOGON", "-", "SYSTEM")
+    | where IpAddress NOT IN ("127.0.0.1", "::1", "-")
+    | eval src_ip=replace(IpAddress, "::ffff:", "")
+    ``` Bin into 5-minute windows ```
+    | bin span=5m _time
+    | stats
+        dc(Computer) as unique_targets,
+        values(Computer) as target_hosts,
+        count as total_auths,
+        dc(TargetUserName) as unique_accounts,
+        values(TargetUserName) as accounts,
+        values(LogonType) as logon_types,
+        values(LmPackageName) as ntlm_versions,
+        min(_time) as first_auth,
+        max(_time) as last_auth
+        by _time, src_ip
+    ``` Threshold: 5+ unique targets in 5 minutes ```
+    | where unique_targets >= 5
+    | eval auth_rate=round(total_auths / 5, 1)
+    | eval severity_level=case(
+        unique_targets >= 20, "CRITICAL — Mass lateral movement",
+        unique_targets >= 10, "HIGH — Broad lateral movement",
+        unique_targets >= 5,  "HIGH — Multi-target lateral movement"
+      )
+    | eval mitre_technique="T1550.002"
+    | eval mitre_tactic="Lateral Movement"
+    | eval alert_name="PtH Spray — Rapid Multi-Target NTLM"
+    | sort - unique_targets
+    | table _time, src_ip, unique_targets, target_hosts, accounts,
+            total_auths, auth_rate, severity_level,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "src_ip"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "PtH Spray from $src_ip$ — $unique_targets$ targets in 5 min — $severity_level$"
+        rule_description: >
+          Source $src_ip$ performed NTLM authentication to $unique_targets$ distinct hosts
+          ($target_hosts$) within 5 minutes at a rate of $auth_rate$ auths/min.
+          This pattern is consistent with CrackMapExec, Metasploit, or Cobalt Strike
+          lateral movement using a stolen hash. Isolate $src_ip$ and investigate which
+          target hosts received successful authentication.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "src_ip"
+        risk_score: 85
+        risk_message: "Rapid NTLM PtH spray — $unique_targets$ targets — T1550.002"
+  false_positives:
+    - description: >
+        Enterprise backup agents (Veeam, Commvault) perform overnight backups accessing
+        dozens of servers simultaneously using NTLM. These run at scheduled times
+        (typically 01:00-05:00) from known backup server IPs.
+      tuning: "Add backup server IPs to allowlist; add time-window exclusion for scheduled backup hours."
+    - description: >
+        Vulnerability scanners (Nessus, Qualys, Rapid7) perform authenticated scans
+        across the network. These access many hosts simultaneously from a known scan IP.
+      tuning: "Add scanner IP addresses to an explicit exclusion lookup."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Impacket Tool Signatures — psexec / smbexec / wmiexec Detection
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Impacket tools leave hard-coded, tool-specific signatures in Windows event logs:
+#
+#  psexec.py:  Event 7045 — random 4-8 char uppercase service name; binary in ADMIN$
+#  smbexec.py: Event 7045 — ImagePath contains cmd.exe /Q /c echo ... > \\127.0.0.1\C$\__output
+#  wmiexec.py: Event 5140 — ADMIN$ share access with RelativeTargetName=__<unix_epoch>
+#
+#  These signatures are hardcoded in the Python source and not customizable by default.
+#  Detection is near-certain when these patterns appear.
+#
+#  Confidence  : VERY HIGH (95)
+#  Severity    : CRITICAL
+
+rule_4_impacket_tool_signatures:
+  name: "Impacket PtH Tool Detected — psexec/smbexec/wmiexec Signatures"
+  description: >
+    Detects Impacket lateral movement tools (psexec.py, smbexec.py, wmiexec.py) via
+    their hardcoded signatures in Windows event logs. Impacket psexec.py creates a
+    service with a random 4-8 character uppercase name and drops a binary to ADMIN$.
+    Impacket smbexec.py creates a service whose ImagePath contains 'cmd.exe /Q /c echo'
+    with output redirected to '\\127.0.0.1\C$\__output'. Impacket wmiexec.py creates
+    temporary output files in ADMIN$ with a double-underscore prefix followed by a
+    Unix epoch timestamp. All three tools use NTLM Pass-the-Hash for authentication.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: T1550.002
+    technique_name: "Use Alternate Authentication Material: Pass the Hash"
+    related_techniques:
+      - "T1543.003: Create or Modify System Process: Windows Service (psexec/smbexec)"
+      - "T1047: Windows Management Instrumentation (wmiexec)"
+      - "T1021.002: SMB/Windows Admin Shares (all three)"
+  severity: critical
+  confidence: 95
+  risk_score: 95
+  kill_chain_phase: "Lateral Movement"
+  data_sources:
+    - "Windows System Event Log — Event 7045 (Service Installed)"
+    - "Windows Security Event Log — Event 4697, 5140 (Service + Share Access)"
+
+  search: |
+    ``` Branch A: psexec.py / smbexec.py — service creation (System log Event 7045) ```
+    (index=wineventlog sourcetype="XmlWinEventLog:System" EventCode=7045)
+    OR (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4697)
+    | eval process_image=coalesce(ImagePath, ServiceFileName)
+    | eval service=coalesce(ServiceName, ServiceName)
+    ``` Impacket smbexec signature: ImagePath with cmd.exe redirect to __output ```
+    | eval is_smbexec=if(match(lower(process_image), "cmd\\.exe.*\\/q.*\\/c.*__output"), 1, 0)
+    ``` Impacket psexec signature: random 4-8 uppercase char service name, binary in ADMIN$ or TEMP ```
+    | eval is_psexec=if(
+        match(service, "^[A-Za-z]{4,8}$") AND
+        (match(lower(process_image), "admin\\$") OR match(lower(process_image), "\\\\temp\\\\")),
+        1, 0)
+    ``` Native PsExec: PSEXESVC service name ```
+    | eval is_sysinternals_psexec=if(upper(service)="PSEXESVC", 1, 0)
+    | where is_smbexec=1 OR is_psexec=1 OR is_sysinternals_psexec=1
+    | eval tool_signature=case(
+        is_smbexec=1,              "Impacket smbexec.py",
+        is_psexec=1,               "Impacket psexec.py (random service name)",
+        is_sysinternals_psexec=1,  "Sysinternals PsExec / Impacket psexec (PSEXESVC)",
+        1==1,                      "Unknown"
+      )
+    | eval branch="ServiceCreation"
+    ``` Branch B: wmiexec.py — output file in ADMIN$ with __ prefix + epoch timestamp ```
+    | append [
+        index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=5140
+        | where match(ShareName, "(?i)ADMIN\\$") OR match(ShareName, "(?i)C\\$")
+        | rex field=RelativeTargetName "^(?P<wmiexec_epoch>__\d{9,10})"
+        | where isnotnull(wmiexec_epoch)
+        | eval tool_signature="Impacket wmiexec.py (epoch output file)"
+        | eval branch="ShareAccess"
+        | eval service="-"
+        | eval process_image=RelativeTargetName
+    ]
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(tool_signature) as tools_detected,
+        values(service) as service_names,
+        values(process_image) as image_paths,
+        values(branch) as detection_branches,
+        values(AccountName) as accounts,
+        values(SubjectUserName) as subject_users
+        by Computer
+    | eval mitre_technique="T1550.002"
+    | eval mitre_tactic="Lateral Movement"
+    | eval alert_name="Impacket PtH Tool Detected"
+    | table first_seen, last_seen, Computer, tools_detected, service_names,
+            image_paths, accounts, subject_users, event_count,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "Computer"
+    period: "4h"
+  actions:
+    - notable_event:
+        rule_title: "Impacket PtH Tool on $Computer$ — $tools_detected$"
+        rule_description: >
+          Impacket lateral movement tool detected on $Computer$: $tools_detected$.
+          Service(s): $service_names$ | Image: $image_paths$ | Account: $accounts$.
+          Impacket tools use NTLM Pass-the-Hash for remote authentication. Isolate
+          $Computer$, identify the originating host (correlate Event 4624 LogonType=3
+          NTLM on $Computer$ around $first_seen$), and check for command execution
+          artifacts (process creation, scheduled tasks, new files).
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "Computer"
+        risk_score: 95
+        risk_message: "Impacket PtH tool detected — $tools_detected$ — T1550.002"
+  false_positives:
+    - description: >
+        Sysinternals PsExec (PSEXESVC) is used legitimately by IT administrators for
+        remote command execution. The service name PSEXESVC is shared between Sysinternals
+        and Impacket's default psexec mode. Verify if authorized by checking the source IP
+        and time of day against change management records.
+      tuning: "Review context: Impacket psexec in non-authorized-red-team contexts has no legitimate use."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Overpass-the-Hash — Kerberos TGT Requested with RC4 Encryption
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Mimikatz kerberos::ptk (Pass-the-Key / Overpass-the-Hash) converts an NT hash
+#  directly into a Kerberos TGT by using the hash as the RC4-HMAC encryption key.
+#  All modern Windows systems (Win7+/2008 R2+) default to AES-256 (0x12) or AES-128
+#  (0x11) for TGT requests. RC4 (0x17) from a modern Windows workstation indicates
+#  either legacy backward compatibility or a deliberate downgrade for hash-based TGT.
+#
+#  This rule overlaps with Kerberoasting RC4 detection — cross-reference both.
+#
+#  Confidence  : MEDIUM (72) — requires legacy system allowlist for low FP rate
+#  Severity    : HIGH
+
+rule_5_overpass_the_hash_rc4_tgt:
+  name: "Overpass-the-Hash (Pass-the-Key) — RC4 Kerberos TGT from Modern System (Event 4768)"
+  description: >
+    Detects Kerberos TGT requests (Event 4768) using RC4-HMAC encryption (0x17) from
+    modern Windows hosts. Mimikatz kerberos::ptk converts the NT NTLM hash into a
+    Kerberos TGT by using the hash as the RC4 session key, producing a TGT with
+    TicketEncryptionType=0x17. Modern Windows (7+/2008 R2+) negotiates AES-256 (0x12)
+    or AES-128 (0x11) when the KDC supports it. RC4 TGT requests from modern systems
+    indicate either legacy application constraints or a deliberate downgrade. Combined
+    with the subsequent Kerberos service ticket requests, this allows NTLM-hash-based
+    lateral movement via Kerberos without touching NTLM protocols directly.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: T1550.002
+    technique_name: "Use Alternate Authentication Material: Pass the Hash"
+    related_techniques:
+      - "T1550.003: Pass the Ticket (subsequent use of the TGT obtained)"
+      - "T1558.003: Kerberoasting (same RC4 indicator — different context)"
+  severity: high
+  confidence: 72
+  risk_score: 78
+  kill_chain_phase: "Lateral Movement"
+  data_sources:
+    - "Windows Security Event Log — Event 4768 (Kerberos TGT Request) on Domain Controllers"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4768
+        Status="0x0"
+    ``` RC4-HMAC (0x17) or RC4-HMAC-EXP (0x18) — both are hash-passable ```
+    | where TicketEncryptionType IN ("0x17", "0x18")
+    ``` Exclude machine accounts — their hash rotation makes cracking impractical ```
+    | where NOT match(TargetUserName, "\\$$")
+    | where TargetUserName NOT IN ("krbtgt", "-")
+    | eval src_ip=replace(IpAddress, "::ffff:", "")
+    | where src_ip NOT IN ("127.0.0.1", "::1", "-")
+    ``` Exclude known legacy NTLM hosts if lookup is available ```
+    | lookup legacy_ntlm_hosts.csv ip AS src_ip OUTPUT is_legacy
+    | where isnull(is_legacy) OR is_legacy!="true"
+    ``` Classify encryption type risk ```
+    | eval enc_risk=case(
+        TicketEncryptionType="0x18", "CRITICAL — RC4-EXP export cipher (never legitimate)",
+        TicketEncryptionType="0x17", "HIGH — RC4-HMAC (Overpass-the-Hash or legacy app)"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as tgt_requests,
+        dc(TargetUserName) as unique_accounts,
+        values(TargetUserName) as accounts,
+        values(src_ip) as source_ips,
+        values(enc_risk) as risk_classification,
+        values(TicketOptions) as ticket_options,
+        values(PreAuthType) as preauth_types
+        by Computer
+    | eval mitre_technique="T1550.002"
+    | eval mitre_tactic="Lateral Movement"
+    | eval alert_name="Overpass-the-Hash — RC4 TGT"
+    | table first_seen, last_seen, Computer, accounts, source_ips,
+            risk_classification, tgt_requests, ticket_options,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "source_ips"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Overpass-the-Hash — RC4 TGT for $accounts$ from $source_ips$ on $Computer$"
+        rule_description: >
+          RC4-HMAC Kerberos TGT requested from $source_ips$ for $accounts$ on DC $Computer$.
+          $risk_classification$. This may indicate Mimikatz kerberos::ptk (Overpass-the-Hash)
+          converting an NTLM hash to a Kerberos ticket. Correlate with Sysmon Event 10 (LSASS
+          dump) and Event 4624 LogonType 9 (Mimikatz PtH) on the source host. Baseline
+          legitimate RC4 consumers (legacy apps, cross-realm trusts) before tuning.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "source_ips"
+        risk_score: 78
+        risk_message: "Overpass-the-Hash — RC4 TGT — T1550.002"
+  false_positives:
+    - description: >
+        Legacy applications (some SAP systems, old custom apps, non-Windows Kerberos clients)
+        may request RC4 TGTs because they do not support AES encryption.
+      tuning: "Build legacy_ntlm_hosts.csv and populate with known RC4-requiring source IPs."
+    - description: >
+        Cross-domain Kerberos trusts that use RC4 for inter-realm encryption will generate
+        RC4 TGT requests. These have TargetDomainName different from the home domain.
+      tuning: "Exclude cross-realm trust accounts or specific cross-domain source IPs."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Chained TTP — LSASS Dump Followed by PtH Lateral Movement
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The complete attack chain: dump LSASS → extract hash → use hash for PtH.
+#  Correlates Sysmon Event 10 (LSASS memory access on host H) with Event 4624
+#  Type 3 NTLM (on any remote target where IpAddress = H's IP) within 30 minutes.
+#  This chain provides near-certain confirmation of Pass-the-Hash, eliminating
+#  ambiguity from either indicator alone.
+#
+#  Confidence  : VERY HIGH (92)
+#  Severity    : CRITICAL
+
+rule_6_chained_lsass_dump_to_pth:
+  name: "Chained TTP — LSASS Dump Followed by NTLM PtH Lateral Movement"
+  description: >
+    Correlates two events to detect the LSASS dump → Pass-the-Hash kill chain:
+    (1) Sysmon Event 10 (ProcessAccess to lsass.exe with memory-read GrantedAccess) on
+    source host H, followed within 30 minutes by (2) Event 4624 LogonType=3 NTLM on
+    any remote target where IpAddress matches H's IP address. This chain directly maps
+    to the attacker workflow: dump LSASS memory to extract NTLM hashes, then immediately
+    use those hashes for lateral movement. The chained detection eliminates false positives
+    from Rule 1 (NTLM Type 3 alone) while providing high-fidelity confirmation that a
+    specific LSASS dump event led to the subsequent authentication.
+  mitre:
+    tactic: "Credential Access / Lateral Movement"
+    technique: T1550.002
+    technique_name: "Use Alternate Authentication Material: Pass the Hash"
+    related_techniques:
+      - "T1003.001: OS Credential Dumping: LSASS Memory (step 1 of chain)"
+  severity: critical
+  confidence: 92
+  risk_score: 95
+  kill_chain_phase: "Credential Access -> Lateral Movement"
+  data_sources:
+    - "Sysmon Event 10 (ProcessAccess) — requires Sysmon deployment"
+    - "Windows Security Event Log — Event 4624 (Logon)"
+
+  search: |
+    ``` Step 1: Collect LSASS dump events from Sysmon ```
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        EventCode=10
+    | where lower(TargetImage) LIKE "%\\lsass.exe"
+    | eval granted_dec=tonumber(GrantedAccess, 16)
+    | where granted_dec>=16 AND NOT (granted_dec=4096)
+    | where NOT match(lower(SourceImage),
+        "(?i)(MsMpEng|csagent\\.exe|senseir|sensece|lsaiso\\.exe|wininit\\.exe|csrss\\.exe|sysmon)")
+    | eval dump_host=Computer
+    | eval dump_time=_time
+    | eval dump_tool=SourceImage
+    | table dump_time, dump_host, dump_tool, GrantedAccess
+    ``` Step 2: Join with subsequent NTLM PtH events on any target ```
+    | join type=inner dump_host [
+        search index=wineventlog sourcetype="XmlWinEventLog:Security"
+            EventCode=4624 LogonType="3" AuthenticationPackageName="NTLM"
+            SubjectUserSid="S-1-0-0" KeyLength="0"
+        | where NOT match(TargetUserName, "\\$$")
+        | where TargetUserName NOT IN ("ANONYMOUS LOGON", "-")
+        | where IpAddress NOT IN ("127.0.0.1", "::1", "-")
+        | eval src_ip=replace(IpAddress, "::ffff:", "")
+        | eval dump_host=src_ip
+        | eval pth_time=_time
+        | eval pth_target=Computer
+        | eval pth_account=TargetUserName
+        | table dump_host, pth_time, pth_target, pth_account, LmPackageName
+    ]
+    ``` Keep only PtH events that follow the LSASS dump within 30 minutes ```
+    | where pth_time > dump_time AND pth_time <= (dump_time + 1800)
+    | eval time_delta_minutes=round((pth_time - dump_time) / 60, 1)
+    | stats
+        min(dump_time) as dump_time,
+        min(pth_time) as first_pth_time,
+        values(dump_tool) as dump_tools,
+        values(GrantedAccess) as granted_access,
+        values(pth_target) as pth_targets,
+        dc(pth_target) as unique_pth_targets,
+        values(pth_account) as pth_accounts,
+        min(time_delta_minutes) as min_delta_min
+        by dump_host
+    | eval mitre_technique="T1003.001,T1550.002"
+    | eval mitre_tactic="Credential Access,Lateral Movement"
+    | eval alert_name="Chained TTP — LSASS Dump to PtH"
+    | table dump_time, first_pth_time, dump_host, dump_tools, granted_access,
+            pth_targets, unique_pth_targets, pth_accounts, min_delta_min,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-40m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "dump_host"
+    period: "4h"
+  actions:
+    - notable_event:
+        rule_title: "LSASS Dump → PtH Chain Confirmed on $dump_host$ — $unique_pth_targets$ target(s)"
+        rule_description: >
+          LSASS was dumped on $dump_host$ using $dump_tools$ (GrantedAccess: $granted_access$),
+          followed within $min_delta_min$ minutes by NTLM PtH to $unique_pth_targets$ host(s)
+          ($pth_targets$) using account(s) $pth_accounts$. This confirms the full credential
+          extraction and lateral movement chain. Isolate $dump_host$ and all $pth_targets$
+          immediately. Rotate passwords for all $pth_accounts$ accounts.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "dump_host"
+        risk_score: 95
+        risk_message: "LSASS dump → PtH chain confirmed — $unique_pth_targets$ targets — T1003.001+T1550.002"
+  false_positives:
+    - description: >
+        EDR agents that access LSASS for memory scanning (triggering Sysmon Event 10)
+        may be on the same host as a service that legitimately uses NTLM for file share
+        access. Ensure your EDR agent is excluded from the Sysmon Event 10 filter.
+      tuning: "Add EDR agent process names to the SourceImage exclusion regex in Step 1."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  INVESTIGATION QUERIES
+# ██████████████████████████████████████████████████████████████████████████████
+
+investigation_queries:
+
+  iq_1_pth_timeline:
+    name: "IQ-1: Full PtH Attack Timeline for Source Host"
+    description: >
+      Reconstruct the complete event timeline for a suspected PtH source host.
+      Replace $SOURCE_HOST_IP$ with the attacker's source IP address.
+    query: |
+      index=wineventlog earliest=-4h
+      (
+        (sourcetype="XmlWinEventLog:Security"
+            EventCode IN (4624, 4625, 4648, 4672, 5140, 4697)
+            (IpAddress="$SOURCE_HOST_IP$" OR WorkstationName="$SOURCE_HOST$"))
+        OR
+        (sourcetype="XmlWinEventLog:Security"
+            EventCode IN (4624, 4625, 4648)
+            Computer="$SOURCE_HOST$")
+        OR
+        (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+            EventCode IN (1, 3, 10, 11)
+            host="$SOURCE_HOST$")
+      )
+      | eval event_desc=case(
+          EventCode=4624 AND LogonType="3" AND AuthenticationPackageName="NTLM",
+              "OUTBOUND PtH: NTLM Type 3 to " + Computer,
+          EventCode=4624 AND LogonType="9" AND LogonProcessName="seclogo",
+              "Mimikatz PtH: LogonType9 seclogo — impersonating " + TargetOutboundUserName,
+          EventCode=4624, "Logon Type " + LogonType + " — " + TargetUserName,
+          EventCode=4648, "Explicit Creds: " + SubjectUserName + " -> " + TargetUserName + " @ " + TargetServerName,
+          EventCode=4672, "Special Privileges: " + PrivilegeList,
+          EventCode=5140, "Share Access: " + ShareName + " by " + SubjectUserName,
+          EventCode=4697, "Service Created: " + ServiceName + " — " + ServiceFileName,
+          EventCode=10, "Sysmon: LSASS Access by " + SourceImage + " GrantedAccess=" + GrantedAccess,
+          EventCode=11, "Sysmon: File Created — " + TargetFilename,
+          EventCode=1, "Sysmon: Process — " + Image + " " + CommandLine,
+          EventCode=3, "Sysmon: Network — " + DestinationIp + ":" + DestinationPort,
+          1==1, "EventCode=" + EventCode
+        )
+      | table _time, EventCode, event_desc, host
+      | sort _time
+
+  iq_2_ntlm_connections_from_host:
+    name: "IQ-2: All NTLM Connections Originating from Compromised Host"
+    description: >
+      Find all NTLM Type 3 logons on any target where the source is the compromised
+      host. Replace $COMPROMISED_HOST_IP$ with the source IP of the compromised host.
+    query: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4624
+          LogonType="3"
+          AuthenticationPackageName="NTLM"
+          earliest=-24h
+      | eval src_ip=replace(IpAddress, "::ffff:", "")
+      | where src_ip="$COMPROMISED_HOST_IP$"
+      | where NOT match(TargetUserName, "\\$$")
+      | stats
+          count as auth_count,
+          values(TargetUserName) as accounts,
+          values(ElevatedToken) as elevated,
+          min(_time) as first_seen,
+          max(_time) as last_seen
+          by Computer
+      | sort - auth_count
+      | table Computer, accounts, elevated, auth_count, first_seen, last_seen
+
+  iq_3_accounts_at_risk:
+    name: "IQ-3: All Accounts Logged On to Compromised Host — Credentials at Risk"
+    description: >
+      Identify all user accounts that had interactive sessions on the compromised host
+      — their NTLM hashes are in LSASS memory and are at risk. Replace $COMPROMISED_HOST$.
+    query: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode=4624
+          LogonType IN ("2", "10", "11")
+          Computer="$COMPROMISED_HOST$"
+          earliest=-24h
+      | where NOT match(TargetUserName, "\\$$")
+      | where TargetUserName NOT IN ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", "-")
+      | eval session_type=case(
+          LogonType="2",  "Interactive (keyboard)",
+          LogonType="10", "RemoteInteractive (RDP)",
+          LogonType="11", "CachedInteractive"
+        )
+      | stats
+          max(_time) as last_logon,
+          values(session_type) as session_types,
+          dc(TargetLogonId) as session_count
+          by TargetUserName, TargetDomainName
+      | eval credential_risk="NTLM hash in LSASS — rotate password immediately"
+      | sort - last_logon
+      | table TargetUserName, TargetDomainName, session_types, session_count,
+              last_logon, credential_risk
+
+  iq_4_post_pth_activity:
+    name: "IQ-4: Post-PtH Activity — Services Created, Scheduled Tasks, New Processes on Targets"
+    description: >
+      After PtH, attackers typically execute code on target hosts. This query finds
+      suspicious process creation and service installation on PtH target hosts around
+      the time of the authentication. Replace $TARGET_HOST$.
+    query: |
+      index=wineventlog
+          host="$TARGET_HOST$"
+          earliest=-2h
+      (
+        (sourcetype="XmlWinEventLog:Security"
+            EventCode IN (4624, 4672, 5140, 4697, 4698, 4688))
+        OR
+        (sourcetype="XmlWinEventLog:System"
+            EventCode=7045)
+        OR
+        (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+            EventCode IN (1, 3, 11))
+      )
+      | eval activity=case(
+          EventCode=4624, "Logon Type=" + LogonType + " by " + TargetUserName,
+          EventCode=4697 OR EventCode=7045, "Service: " + ServiceName + " = " + coalesce(ServiceFileName, ImagePath),
+          EventCode=4698, "Scheduled Task Created: " + TaskName,
+          EventCode=4688, "Process: " + NewProcessName + " " + CommandLine,
+          EventCode=5140, "Share: " + ShareName + " path=" + RelativeTargetName,
+          EventCode=1, "Process: " + Image + " " + CommandLine,
+          EventCode=3, "Network: " + DestinationIp + ":" + DestinationPort,
+          EventCode=11, "File: " + TargetFilename,
+          1==1, "EventCode=" + EventCode
+        )
+      | table _time, EventCode, activity
+      | sort _time
+
+  iq_5_admin_share_access_pth:
+    name: "IQ-5: Admin Share Access Correlated with PtH Logon (4624 + 5140)"
+    description: >
+      Correlate NTLM Type 3 logons with subsequent IPC$/ADMIN$/C$ share access using
+      the same TargetLogonId. This confirms the Impacket/psexec lateral movement pattern.
+    query: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode IN (4624, 5140)
+          earliest=-1h
+      | eval logon_id=coalesce(TargetLogonId, SubjectLogonId)
+      | eval is_ntlm_logon=if(EventCode=4624 AND LogonType="3" AND AuthenticationPackageName="NTLM", 1, 0)
+      | eval is_admin_share=if(EventCode=5140 AND
+          (match(ShareName, "(?i)(ADMIN\\$|C\\$|IPC\\$|SYSVOL|NETLOGON)$")), 1, 0)
+      | stats
+          sum(is_ntlm_logon) as ntlm_logons,
+          sum(is_admin_share) as admin_share_accesses,
+          values(ShareName) as shares_accessed,
+          values(IpAddress) as source_ips,
+          values(TargetUserName) as accounts
+          by Computer, logon_id
+      | where ntlm_logons > 0 AND admin_share_accesses > 0
+      | eval pth_with_admin_share="CONFIRMED — PtH logon correlated with admin share access"
+      | sort - admin_share_accesses
+      | table Computer, logon_id, source_ips, accounts, shares_accessed,
+              ntlm_logons, admin_share_accesses, pth_with_admin_share
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  INCIDENT RESPONSE PLAYBOOK
+# ██████████████████████████████████████████████████████████████████████████████
+
+incident_response_playbook:
+  name: "Pass-the-Hash — Incident Response Playbook"
+  version: "1.0.0"
+  last_updated: "2026-03-04"
+
+  phase_1_triage:
+    timeframe: "0–15 minutes"
+    steps:
+      - "Confirm rule is not FP — verify KeyLength=0 and SubjectUserSid=S-1-0-0 or seclogo"
+      - "Run IQ-3 to identify accounts whose hashes are in LSASS on the source host"
+      - "Run IQ-2 to map all NTLM connections from the source host in last 24h"
+      - "Determine initial access vector — check Event 4624 Type 2/10 history on source host"
+      - "Check if a C2 implant is running (unusual parent process for the PtH activity)"
+
+  phase_2_containment:
+    timeframe: "15–45 minutes"
+    steps:
+      - "Network-isolate the source host via EDR (do not reboot — preserve volatile evidence)"
+      - "Isolate any target hosts where privileged accounts (DA/EA) were used for PtH"
+      - "Disable AD accounts of compromised users (accounts identified in IQ-3)"
+      - "Revoke active Kerberos TGTs for compromised accounts (klist purge on all DCs)"
+      - "Block the source host IP at perimeter and internal firewall to stop C2 callbacks"
+
+  phase_3_investigation:
+    timeframe: "45 minutes – 4 hours"
+    steps:
+      - "Run IQ-1 (full timeline) to reconstruct the attack sequence"
+      - "Run IQ-4 on all PtH target hosts to find code execution artifacts"
+      - "Run IQ-5 to confirm admin share access correlated with PtH logons"
+      - "Check for Impacket service artifacts (Event 7045) on all target hosts"
+      - "Check for persistence: scheduled tasks (4698), new services (7045), registry run keys"
+      - "Review web proxy / EDR telemetry for C2 beacon patterns from source host"
+      - "Determine if Domain Admin or other Tier-0 accounts were compromised"
+
+  phase_4_remediation:
+    timeframe: "4–24 hours"
+    steps:
+      - "Reset passwords for ALL accounts identified in IQ-3 (priority: DA/EA first)"
+      - "If any DC was a PtH target and DA was used: reset KRBTGT password twice (10h gap)"
+      - "Enable Credential Guard (VBS) on endpoints to prevent future LSASS extraction:"
+      - "  GPO: Computer Config > Admin Templates > System > Device Guard > Credential Guard -> Enabled"
+      - "Enable LSASS PPL (Protected Process Light) on all endpoints:"
+      - "  reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa /v RunAsPPL /t REG_DWORD /d 1"
+      - "Enable ASR rule to block LSASS credential stealing:"
+      - "  Rule ID: 9e6c4e1f-7d60-472f-ba1a-a39ef669e4b0"
+      - "Consider enforcing Kerberos-only authentication (disable NTLM fallback):"
+      - "  GPO: Network Security > Restrict NTLM: NTLM authentication in this domain -> Deny All"
+      - "  (WARNING: Test thoroughly — some applications require NTLM)"
+      - "Rebuild the source host if C2 implant with kernel driver is suspected"
+
+  phase_5_post_incident:
+    timeframe: "Ongoing"
+    steps:
+      - "Implement tiered administration model to limit Tier-0 (DA) accounts on Tier-1/2 hosts"
+      - "Enforce Privileged Access Workstations (PAWs) for all Domain Admin operations"
+      - "Enable gMSA for all service accounts to prevent hash extraction"
+      - "Review and tune NTLM allowlists — only legacy-verified hosts should use NTLM"
+      - "Enable Microsoft Defender for Identity for built-in PtH detection cross-validation"
