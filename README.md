@@ -8,20 +8,29 @@ Security Operation Center (SOC) attack detection and response rules for Splunk S
 Detection-Engineering/
 ├── README.md
 └── splunk_rules/
-    └── credential_access/
-        ├── adcs_attack_detection.yml
-        ├── dcsync_attack_detection.yml
-        ├── golden_ticket_attack_detection.yml
-        ├── gpo_modification_detection.yml
-        ├── kerberoasting_attack_detection.yml
-        ├── lsass_credential_dumping_detection.yml
-        ├── ntds_dit_extraction_detection.yml
-        ├── pass_the_hash_detection.yml
-        ├── password_spraying_detection.yml
-        └── privileged_group_membership_modification_detection.yml
+    ├── credential_access/
+    │   ├── adcs_attack_detection.yml
+    │   ├── dcsync_attack_detection.yml
+    │   ├── golden_ticket_attack_detection.yml
+    │   ├── gpo_modification_detection.yml
+    │   ├── kerberoasting_attack_detection.yml
+    │   ├── lsass_credential_dumping_detection.yml
+    │   ├── ntds_dit_extraction_detection.yml
+    │   ├── pass_the_hash_detection.yml
+    │   ├── password_spraying_detection.yml
+    │   └── privileged_group_membership_modification_detection.yml
+    └── rhel_linux/
+        ├── rhel_privilege_escalation_detection.yml
+        ├── rhel_persistence_detection.yml
+        ├── rhel_credential_access_detection.yml
+        ├── rhel_defense_evasion_detection.yml
+        ├── rhel_execution_detection.yml
+        ├── rhel_lateral_movement_detection.yml
+        ├── rhel_discovery_enumeration_detection.yml
+        └── rhel_exfiltration_detection.yml
 ```
 
-## Detection Rules
+## Detection Rules — Windows Active Directory
 
 | Rule File | Attack Technique | MITRE ID | Severity | Detection Vectors |
 |-----------|-----------------|----------|----------|-------------------|
@@ -398,11 +407,223 @@ Detects malicious Group Policy Object modification (MITRE T1484.001) through 7 c
 
 ---
 
+## RHEL Linux Detection Rules
+
+Detection rules for Red Hat Enterprise Linux attack techniques across 8 MITRE ATT&CK tactics. Covers the full attack lifecycle from initial discovery through privilege escalation, persistence, credential access, defense evasion, execution, lateral movement, and exfiltration. **63 detection rules + 40 investigation queries + 8 incident response playbooks.**
+
+### Rule Summary
+
+| Rule File | Attack Technique | MITRE ID | Severity | Detection Vectors |
+|-----------|-----------------|----------|----------|-------------------|
+| `rhel_privilege_escalation_detection.yml` | Sudo Abuse, SUID/SGID, Kernel Exploits, Container Escape | T1548.003, T1548.001, T1068, T1611 | HIGH–CRITICAL | 8 rules + 5 investigation queries |
+| `rhel_persistence_detection.yml` | Cron, Systemd, SSH Keys, PAM, LD_PRELOAD, Shell Profiles | T1053.003, T1543.002, T1098.004, T1556.003, T1574.006, T1546.004 | HIGH–CRITICAL | 9 rules + 5 investigation queries |
+| `rhel_credential_access_detection.yml` | Shadow File, SSH Key Theft, Brute Force, Ptrace, Keylogger | T1003.008, T1552.004, T1110.001, T1003, T1056.001 | HIGH–CRITICAL | 8 rules + 5 investigation queries |
+| `rhel_defense_evasion_detection.yml` | Auditd Tampering, Log Deletion, SELinux, Rootkits, Timestomping | T1562.001, T1070.002, T1070.006, T1014, T1036.004 | HIGH–CRITICAL | 9 rules + 5 investigation queries |
+| `rhel_execution_detection.yml` | Reverse Shells, Webshells, Fileless, Log4Shell, Ptrace Injection | T1059.004, T1059.006, T1620, T1505.003, T1055.008, T1203 | HIGH–CRITICAL | 8 rules + 5 investigation queries |
+| `rhel_lateral_movement_detection.yml` | SSH Tunneling, Agent Forwarding, SCP/Rsync, Network Scanning | T1021.004, T1572, T1563.001, T1072, T1046, T1210 | MEDIUM–CRITICAL | 7 rules + 5 investigation queries |
+| `rhel_discovery_enumeration_detection.yml` | LinPEAS/LinEnum, System Recon, User Enum, Container Discovery | T1059.004, T1082, T1087.001, T1016, T1518.001, T1613 | MEDIUM–HIGH | 7 rules + 5 investigation queries |
+| `rhel_exfiltration_detection.yml` | DNS Tunneling, HTTP Upload, Archive Staging, Encoded Data | T1560.001, T1048.003, T1048.002, T1132.001, T1119 | HIGH–CRITICAL | 7 rules + 5 investigation queries |
+
+---
+
+### RHEL Privilege Escalation Detection
+
+**File**: `splunk_rules/rhel_linux/rhel_privilege_escalation_detection.yml`
+
+Detects Linux privilege escalation techniques (MITRE T1548, T1068, T1611) through 8 complementary detection rules:
+
+| Rule | Detection Method | Data Source | Technique | Confidence |
+|------|-----------------|-------------|-----------|------------|
+| Rule 1 | Sudo abuse — unauthorized sudo, sudo to root shell | auditd EXECVE | T1548.003 | HIGH |
+| Rule 2 | Sudoers file modification — visudo bypass, echo injection | auditd SYSCALL/PATH | T1548.003 | HIGH |
+| Rule 3 | SUID/SGID binary exploitation — find/vim/nmap/python | auditd EXECVE | T1548.001 | HIGH |
+| Rule 4 | Kernel exploit indicators — dirty pipe/cow, exploit compilation | auditd EXECVE, syslog | T1068 | CRITICAL |
+| Rule 5 | Linux capabilities abuse — cap_setuid, cap_dac_override | auditd EXECVE | T1548 | HIGH |
+| Rule 6 | PwnKit / Polkit exploitation (CVE-2021-4034) | auditd EXECVE, syslog | T1068 | CRITICAL |
+| Rule 7 | Container escape to host — nsenter, mount /proc, chroot | auditd EXECVE | T1611 | CRITICAL |
+| Rule 8 | Cgroup escape — notify_on_release abuse | auditd EXECVE/SYSCALL | T1611 | CRITICAL |
+
+---
+
+### RHEL Persistence Detection
+
+**File**: `splunk_rules/rhel_linux/rhel_persistence_detection.yml`
+
+Detects Linux persistence mechanisms (MITRE T1053, T1543, T1098, T1556, T1574, T1546, T1037, T1547) through 9 complementary detection rules:
+
+| Rule | Detection Method | Data Source | Technique | Confidence |
+|------|-----------------|-------------|-----------|------------|
+| Rule 1 | Malicious cron job — reverse shells, download-and-execute | auditd SYSCALL/PATH | T1053.003 | HIGH |
+| Rule 2 | Rogue systemd service — ExecStart pointing to /tmp, /dev/shm | auditd SYSCALL, syslog | T1543.002 | HIGH |
+| Rule 3 | SSH authorized_keys injection — unauthorized key addition | auditd SYSCALL/PATH | T1098.004 | HIGH |
+| Rule 4 | PAM backdoor module — pam_exec, custom .so in /lib/security | auditd SYSCALL | T1556.003 | CRITICAL |
+| Rule 5 | LD_PRELOAD hijacking — /etc/ld.so.preload, LD_PRELOAD env | auditd EXECVE, SYSCALL | T1574.006 | CRITICAL |
+| Rule 6 | Shell profile backdoor — .bashrc, .bash_profile, /etc/profile.d | auditd SYSCALL/PATH | T1546.004 | HIGH |
+| Rule 7 | Malicious at job scheduling | auditd EXECVE | T1053.002 | HIGH |
+| Rule 8 | Init script / rc.local persistence | auditd SYSCALL | T1037.004 | HIGH |
+| Rule 9 | Kernel module persistence — insmod, modprobe from non-standard path | auditd SYSCALL | T1547.006 | CRITICAL |
+
+---
+
+### RHEL Credential Access Detection
+
+**File**: `splunk_rules/rhel_linux/rhel_credential_access_detection.yml`
+
+Detects Linux credential theft techniques (MITRE T1003, T1552, T1110, T1056, T1558) through 8 complementary detection rules:
+
+| Rule | Detection Method | Data Source | Technique | Confidence |
+|------|-----------------|-------------|-----------|------------|
+| Rule 1 | /etc/shadow access — unshadow, cat/cp shadow, john/hashcat | auditd SYSCALL/EXECVE | T1003.008 | CRITICAL |
+| Rule 2 | SSH private key theft — copying id_rsa, .pem from .ssh dirs | auditd SYSCALL/EXECVE | T1552.004 | HIGH |
+| Rule 3 | SSH brute force — ≥10 failed auth in 5 min from single source | linux_secure | T1110.001 | HIGH |
+| Rule 4 | Ptrace-based credential dumping — gdb attach, strace on sshd | auditd SYSCALL | T1003 | HIGH |
+| Rule 5 | Keylogger installation — xinput, logkeys, pam_tty_audit | auditd EXECVE | T1056.001 | HIGH |
+| Rule 6 | Credential files in non-standard locations — .netrc, .pgpass, .my.cnf | auditd EXECVE | T1552.001 | MEDIUM-HIGH |
+| Rule 7 | Kerberos keytab theft — ktutil, klist, keytab file copy | auditd EXECVE/SYSCALL | T1558.004 | HIGH |
+| Rule 8 | LDAP credential harvesting — ldapsearch with password attributes | auditd EXECVE | T1003 | HIGH |
+
+---
+
+### RHEL Defense Evasion Detection
+
+**File**: `splunk_rules/rhel_linux/rhel_defense_evasion_detection.yml`
+
+Detects Linux defense evasion techniques (MITRE T1562, T1070, T1014, T1036) through 9 complementary detection rules:
+
+| Rule | Detection Method | Data Source | Technique | Confidence |
+|------|-----------------|-------------|-----------|------------|
+| Rule 1 | Auditd tampering — service stop, auditctl -e 0, config modification | auditd SYSCALL/EXECVE | T1562.001 | CRITICAL |
+| Rule 2 | Log deletion — rm/shred/truncate on /var/log files | auditd EXECVE | T1070.002 | CRITICAL |
+| Rule 3 | Timestomping — touch -t, touch -r to alter file timestamps | auditd EXECVE | T1070.006 | HIGH |
+| Rule 4 | SELinux disabling — setenforce 0, SELINUX=disabled | auditd EXECVE, syslog | T1562.001 | CRITICAL |
+| Rule 5 | Firewall tampering — iptables -F, firewalld stop, ufw disable | auditd EXECVE | T1562.004 | HIGH |
+| Rule 6 | Rootkit indicators — hidden kernel modules, /dev/shm binaries, LD_PRELOAD | auditd EXECVE, syslog | T1014 | CRITICAL |
+| Rule 7 | Process masquerading — renamed binaries mimicking system processes | sysmon_linux Event 1 | T1036.004 | HIGH |
+| Rule 8 | History tampering — HISTFILE=/dev/null, unset HISTFILE, history -c | auditd EXECVE | T1070.003 | HIGH |
+| Rule 9 | Binary replacement — overwriting system binaries (ps, ls, netstat) | auditd SYSCALL/PATH | T1036.005 | CRITICAL |
+
+---
+
+### RHEL Execution Detection
+
+**File**: `splunk_rules/rhel_linux/rhel_execution_detection.yml`
+
+Detects Linux malicious execution techniques (MITRE T1059, T1620, T1505, T1105, T1055, T1203) through 8 complementary detection rules:
+
+| Rule | Detection Method | Data Source | Technique | Confidence |
+|------|-----------------|-------------|-----------|------------|
+| Rule 1 | Reverse shell execution — bash -i, nc -e, python pty.spawn | auditd EXECVE | T1059.004 | CRITICAL |
+| Rule 2 | Suspicious script interpreters — python/perl/ruby one-liners from /tmp | auditd EXECVE | T1059.006 | HIGH |
+| Rule 3 | Fileless execution — memfd_create, /proc/self/fd, shm_open | auditd SYSCALL/EXECVE | T1620 | CRITICAL |
+| Rule 4 | Webshell execution — www-data/apache spawning shell commands | auditd EXECVE | T1505.003 | CRITICAL |
+| Rule 5 | Download-and-execute — curl/wget piped to bash/sh | auditd EXECVE | T1105 | HIGH |
+| Rule 6 | Cron-based suspicious execution — cron spawning network tools | auditd EXECVE, syslog | T1053.003 | HIGH |
+| Rule 7 | Ptrace code injection — PTRACE_POKETEXT into running processes | auditd SYSCALL | T1055.008 | CRITICAL |
+| Rule 8 | Application exploitation — Log4Shell, Struts, Spring indicators | syslog, auditd | T1203 | CRITICAL |
+
+---
+
+### RHEL Lateral Movement Detection
+
+**File**: `splunk_rules/rhel_linux/rhel_lateral_movement_detection.yml`
+
+Detects Linux lateral movement techniques (MITRE T1021, T1572, T1563, T1072, T1105, T1046, T1210) through 7 complementary detection rules:
+
+| Rule | Detection Method | Data Source | Technique | Confidence |
+|------|-----------------|-------------|-----------|------------|
+| Rule 1 | Unusual outbound SSH — connections to non-standard ports or IPs | auditd EXECVE, sysmon_linux Event 3 | T1021.004 | MEDIUM-HIGH |
+| Rule 2 | SSH tunneling — dynamic (-D) and local (-L) port forwarding | auditd EXECVE | T1572 | HIGH |
+| Rule 3 | SSH agent forwarding abuse — ForwardAgent, SSH_AUTH_SOCK hijack | auditd EXECVE | T1563.001 | HIGH |
+| Rule 4 | Config management abuse — Ansible/Puppet/Salt ad-hoc commands | auditd EXECVE | T1072 | MEDIUM-HIGH |
+| Rule 5 | Suspicious SCP/rsync — bulk file transfer to external hosts | auditd EXECVE, sysmon_linux | T1105 | HIGH |
+| Rule 6 | Internal network scanning — nmap, masscan, zmap from non-scanner hosts | auditd EXECVE | T1046 | HIGH |
+| Rule 7 | Internal service exploitation — exploit frameworks targeting internal IPs | auditd EXECVE, sysmon_linux | T1210 | CRITICAL |
+
+---
+
+### RHEL Discovery & Enumeration Detection
+
+**File**: `splunk_rules/rhel_linux/rhel_discovery_enumeration_detection.yml`
+
+Detects Linux reconnaissance and discovery techniques (MITRE T1059, T1082, T1087, T1016, T1518, T1083, T1613) through 7 complementary detection rules:
+
+| Rule | Detection Method | Data Source | Technique | Confidence |
+|------|-----------------|-------------|-----------|------------|
+| Rule 1 | LinPEAS / LinEnum execution — known enumeration script names and hashes | auditd EXECVE | T1059.004 | HIGH |
+| Rule 2 | System information discovery burst — ≥5 recon commands in 2 min | auditd EXECVE | T1082 | HIGH |
+| Rule 3 | User and group enumeration — /etc/passwd read, getent, id commands | auditd EXECVE | T1087.001 | MEDIUM |
+| Rule 4 | Network configuration discovery — ip route, ss, netstat, arp -a | auditd EXECVE | T1016 | MEDIUM |
+| Rule 5 | Security software discovery — querying AV, EDR, audit daemon status | auditd EXECVE | T1518.001 | HIGH |
+| Rule 6 | Sensitive file discovery — find / -name *.pem, locate shadow | auditd EXECVE | T1083 | HIGH |
+| Rule 7 | Container and cloud metadata discovery — docker inspect, curl 169.254 | auditd EXECVE | T1613 | HIGH |
+
+---
+
+### RHEL Exfiltration Detection
+
+**File**: `splunk_rules/rhel_linux/rhel_exfiltration_detection.yml`
+
+Detects Linux data exfiltration techniques (MITRE T1560, T1048, T1132, T1119) through 7 complementary detection rules:
+
+| Rule | Detection Method | Data Source | Technique | Confidence |
+|------|-----------------|-------------|-----------|------------|
+| Rule 1 | Archive staging — tar/zip of sensitive directories (/etc, /home, DB dumps) | auditd EXECVE | T1560.001 | HIGH |
+| Rule 2 | DNS tunneling exfiltration — iodine, dnscat2, dns2tcp, high TXT query volume | auditd EXECVE, sysmon_linux | T1048.003 | CRITICAL |
+| Rule 3 | HTTP exfiltration — curl/wget POST with file upload to external hosts | auditd EXECVE | T1048.002 | HIGH |
+| Rule 4 | SSH/SCP exfiltration — bulk SCP/sftp to external IPs | auditd EXECVE | T1048 | HIGH |
+| Rule 5 | Encoded data staging — base64/xxd/openssl encoding of sensitive files | auditd EXECVE | T1132.001 | HIGH |
+| Rule 6 | Automated collection — scripted find/grep harvesting credentials and configs | auditd EXECVE | T1119 | HIGH |
+| Rule 7 | Alternative protocol exfiltration — netcat, socat, /dev/tcp to external IPs | auditd EXECVE | T1048 | CRITICAL |
+
+---
+
+### RHEL Data Sources
+
+All RHEL rules rely on the following Splunk data sources:
+
+| Sourcetype | Description | Index |
+|------------|-------------|-------|
+| `linux:audit` | auditd EXECVE, SYSCALL, PATH events (primary source) | `linux` |
+| `syslog` | /var/log/messages, syslog daemon output | `linux` |
+| `linux_secure` | /var/log/secure — SSH auth, sudo, PAM events | `linux` |
+| `sysmon_linux` | Sysmon for Linux — Events 1 (ProcessCreate), 3 (NetworkConnect), 11 (FileCreate) | `linux` |
+
+### RHEL Prerequisites
+
+1. **auditd Configuration** — Deploy comprehensive audit rules covering EXECVE, SYSCALL, PATH, and key file watches (`-w /etc/shadow -p rwa`, `-w /etc/sudoers -p wa`, etc.)
+2. **Sysmon for Linux** — Deploy Sysmon for Linux on all RHEL hosts for process, network, and file creation telemetry
+3. **Log Forwarding** — Splunk Universal Forwarder on all RHEL hosts forwarding `/var/log/audit/audit.log`, `/var/log/secure`, `/var/log/messages`
+4. **Lookup Tables**:
+   - `linux_bastion_hosts.csv` — bastion/jump hosts and configuration management servers
+   - `linux_admin_accounts.csv` — authorized admin and sudo accounts
+   - `linux_server_inventory.csv` — host roles, environments, and expected services
+
+### RHEL Quick Deploy
+
+1. Deploy **Defense Evasion** rules first — if an attacker disables auditd or deletes logs, all other detections fail
+2. Deploy **Privilege Escalation** rules next — sudo abuse and kernel exploits are the most common RHEL attack patterns
+3. Deploy **Execution** rules (reverse shells, webshells) for immediate high-fidelity alerting
+4. Deploy **Persistence** rules to catch implant installation (cron, systemd, SSH keys)
+5. Deploy **Credential Access** rules — shadow file access and SSH key theft are critical indicators
+6. Deploy **Lateral Movement** and **Exfiltration** rules last — these benefit from the bastion host lookup table being fully populated
+7. Run **Discovery/Enumeration** rules in report mode for 14 days before alerting to establish a baseline of normal admin activity
+
+---
+
 ## Requirements
 
 - Splunk Enterprise 8.x+ or Splunk Cloud
 - Splunk Enterprise Security (ES) recommended for notable events and risk framework
+
+### Windows AD Detection Rules
 - Windows Security Event Logs from all endpoints (sourcetype: `XmlWinEventLog:Security`)
 - Sysmon deployed on all endpoints (sourcetype: `XmlWinEventLog:Microsoft-Windows-Sysmon/Operational`)
 - PowerShell logs from all endpoints (sourcetype: `XmlWinEventLog:Microsoft-Windows-PowerShell/Operational`)
 - PowerShell 5.1+ on endpoints for audit policy configuration
+
+### RHEL Linux Detection Rules
+- auditd deployed and configured on all RHEL hosts (sourcetype: `linux:audit`)
+- Sysmon for Linux deployed on all RHEL hosts (sourcetype: `sysmon_linux`)
+- SSH/PAM logs forwarded from all RHEL hosts (sourcetype: `linux_secure`)
+- Syslog forwarded from all RHEL hosts (sourcetype: `syslog`)
+- Splunk Universal Forwarder on all RHEL hosts

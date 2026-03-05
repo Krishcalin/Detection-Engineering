@@ -1,0 +1,984 @@
+# ==============================================================================
+#  RHEL Defense Evasion Attack Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for defense evasion techniques on Red
+#                Hat Enterprise Linux (RHEL) systems. Covers auditd tampering,
+#                log file deletion, timestomping, SELinux disabling, firewall
+#                rule manipulation, rootkit indicators, process masquerading,
+#                history file tampering, and binary replacement/trojanization.
+#                These techniques allow attackers to hide their presence and
+#                avoid detection by security tools.
+#
+#  MITRE ATT&CK: T1562.001 - Impair Defenses: Disable or Modify Tools
+#                 T1070.002 - Indicator Removal: Clear Linux or Mac System Logs
+#                 T1070.006 - Indicator Removal: Timestomp
+#                 T1562.004 - Impair Defenses: Disable or Modify System Firewall
+#                 T1014     - Rootkit
+#                 T1036.004 - Masquerading: Masquerade Task or Service
+#                 T1070.003 - Indicator Removal: Clear Command History
+#                 T1036.005 - Masquerading: Match Legitimate Name or Location
+#  Kill Chain   : Defense Evasion
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-05
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Deploy auditd with the following rules on ALL RHEL hosts:
+#     -w /var/log/ -p wa -k log_tamper
+#     -w /etc/selinux/ -p wa -k selinux_mod
+#     -a always,exit -F arch=b64 -S execve -k exec_log
+#     -a always,exit -F arch=b64 -S utimensat,futimesat -k timestomp
+#     -a always,exit -F arch=b64 -S init_module,finit_module -k mod_load
+#     -w /usr/bin/ -p wa -k binary_mod
+#     -w /usr/sbin/ -p wa -k binary_mod
+#
+#  2. Configure Sysmon for Linux with Process Creation (Event 1),
+#     File Creation/Delete (Event 11/23), and Module Load events.
+#
+#  3. Forward all logs to Splunk:
+#     index=linux sourcetype=linux:audit
+#     index=linux sourcetype=syslog
+#     index=linux sourcetype=sysmon_linux
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: Auditd Service Tampering (T1562.001)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Auditd is the primary security logging service on RHEL. Disabling it is
+#  the first action a sophisticated attacker takes after gaining access.
+#  Detection of auditd tampering is the highest-priority defense evasion rule.
+#
+#  Confidence  : VERY HIGH (95)
+#  Severity    : CRITICAL
+
+rule_1_auditd_tampering:
+  name: "Defense Evasion — Auditd Service Tampering Detected (T1562.001)"
+  description: >
+    Detects attempts to disable, stop, or tamper with the Linux audit daemon
+    (auditd). Covers: systemctl stop/disable auditd, service auditd stop,
+    auditctl -e 0 (disable auditing), auditctl -D (delete all rules), killing
+    the auditd process (kill -9), and modification of audit.rules or auditd.conf.
+    Auditd is RHEL's primary security monitoring service — disabling it is the
+    highest-priority indicator of an attacker attempting to operate undetected.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: T1562.001
+    technique_name: "Impair Defenses: Disable or Modify Tools"
+    related_techniques:
+      - "T1070: Indicator Removal (post-tampering log cleanup)"
+  severity: critical
+  confidence: 95
+  risk_score: 98
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Linux Audit Log — EXECVE for systemctl/service/auditctl/kill"
+    - "Sysmon for Linux — Event 1 (Process Creation)"
+    - "Linux syslog — audit daemon status messages"
+
+  search: |
+    index=linux (sourcetype=linux:audit OR sourcetype=sysmon_linux OR sourcetype=syslog)
+    | eval cmdline=coalesce(CommandLine, comm." ".coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect auditd stop/disable ```
+    | where match(cmdline_lower, "(systemctl|service).*(stop|disable).*auditd")
+    ``` Detect auditctl disable/delete rules ```
+        OR match(cmdline_lower, "auditctl\s+(-e\s*0|-D)")
+    ``` Detect killing auditd process ```
+        OR match(cmdline_lower, "kill.*auditd")
+        OR match(cmdline_lower, "pkill.*auditd")
+    ``` Detect audit config modification ```
+        OR match(cmdline_lower, "(vi|vim|nano|sed|echo|tee).*(audit\.rules|auditd\.conf|audit\.conf)")
+    | eval tamper_type=case(
+        match(cmdline_lower, "stop.*auditd"),     "AUDITD_STOPPED",
+        match(cmdline_lower, "disable.*auditd"),  "AUDITD_DISABLED",
+        match(cmdline_lower, "auditctl.*-e.*0"),  "AUDITING_DISABLED (auditctl -e 0)",
+        match(cmdline_lower, "auditctl.*-D"),     "AUDIT_RULES_DELETED (auditctl -D)",
+        match(cmdline_lower, "kill.*auditd"),     "AUDITD_PROCESS_KILLED",
+        match(cmdline_lower, "audit\.rules|auditd\.conf"), "AUDIT_CONFIG_MODIFIED",
+        1==1,                                     "AUDITD_TAMPERING"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1562.001"
+    | eval mitre_tactic="Defense Evasion"
+    | eval alert_name="Auditd Tampering"
+    | table _time, host, user, tamper_type, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/2 * * * *"
+    earliest: "-5m"
+    latest: "now"
+    window: "2m"
+  throttle:
+    field: "host"
+    period: "10m"
+  actions:
+    - notable_event:
+        rule_title: "AUDITD TAMPERED — $tamper_type$ on $host$ by $user$"
+        rule_description: >
+          Audit daemon tampering detected on $host$ by $user$. Type: $tamper_type$.
+          Command: $cmdline$. Auditd is the primary security logging service — its
+          disabling indicates an attacker operating under cover. IMMEDIATE ACTION:
+          Re-enable auditd, investigate the user session, and assume the host is
+          compromised.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 98
+        risk_message: "AUDITD TAMPERED — $tamper_type$ — T1562.001"
+  false_positives:
+    - description: >
+        Auditd may be restarted during audit rule updates or configuration changes
+        by authorized administrators. These should be rare and planned.
+      tuning: "Correlate with change management tickets. Temporarily suppress during scheduled maintenance."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Log File Deletion and Tampering (T1070.002)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Attackers delete or truncate log files to remove evidence of their
+#  activities. Key targets: /var/log/secure (auth), /var/log/messages (syslog),
+#  /var/log/audit/audit.log, /var/log/wtmp (logins), /var/log/btmp (bad logins).
+#
+#  Confidence  : VERY HIGH (92)
+#  Severity    : HIGH
+
+rule_2_log_deletion_tampering:
+  name: "Defense Evasion — System Log Deletion or Truncation (T1070.002)"
+  description: >
+    Detects deletion, truncation, or shredding of critical system log files:
+    /var/log/secure, /var/log/messages, /var/log/audit/audit.log, /var/log/wtmp,
+    /var/log/btmp, /var/log/lastlog, /var/log/cron. Also detects journalctl
+    vacuum operations (--vacuum-time, --vacuum-size) and redirection to truncate
+    (> /var/log/secure). Log deletion is a key defense evasion technique to
+    remove evidence of compromise.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: T1070.002
+    technique_name: "Indicator Removal: Clear Linux or Mac System Logs"
+    related_techniques:
+      - "T1562.001: Impair Defenses: Disable or Modify Tools"
+      - "T1070.001: Indicator Removal: Clear Windows Event Logs"
+  severity: high
+  confidence: 92
+  risk_score: 88
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Linux Audit Log — watch on /var/log/ (key=log_tamper)"
+    - "Linux Audit Log — EXECVE for rm, shred, truncate, journalctl"
+
+  search: |
+    index=linux (sourcetype=linux:audit OR sourcetype=sysmon_linux)
+    | eval cmdline=coalesce(CommandLine, comm." ".coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect log file deletion ```
+    | where match(cmdline_lower, "(rm|unlink)\s.*/var/log/(secure|messages|audit|wtmp|btmp|lastlog|cron|syslog)")
+    ``` Detect log truncation ```
+        OR match(cmdline_lower, "(truncate|shred|wipe)\s.*/var/log/")
+    ``` Detect journalctl vacuum ```
+        OR match(cmdline_lower, "journalctl.*(--vacuum-time|--vacuum-size|--rotate)")
+    ``` Detect redirection-based truncation ```
+        OR match(cmdline_lower, ">\s*/var/log/(secure|messages|audit|syslog)")
+    ``` Detect utmpdump/wtmp manipulation ```
+        OR match(cmdline_lower, "(utmpdump|wtmpclean).*(/var/log/wtmp|/var/log/btmp)")
+    | eval deletion_type=case(
+        match(cmdline_lower, "(rm|unlink)"),                  "LOG_FILE_DELETED",
+        match(cmdline_lower, "shred"),                        "LOG_FILE_SHREDDED (unrecoverable)",
+        match(cmdline_lower, "truncate"),                     "LOG_FILE_TRUNCATED",
+        match(cmdline_lower, "journalctl.*vacuum"),           "JOURNAL_VACUUMED",
+        match(cmdline_lower, ">\s*/var/log/"),                "LOG_TRUNCATED_VIA_REDIRECT",
+        match(cmdline_lower, "utmpdump|wtmpclean"),           "LOGIN_RECORD_TAMPERED",
+        1==1,                                                 "LOG_TAMPERING"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1070.002"
+    | eval mitre_tactic="Defense Evasion"
+    | eval alert_name="Log Deletion"
+    | table _time, host, user, deletion_type, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "LOG TAMPERING — $deletion_type$ on $host$ by $user$"
+        rule_description: >
+          System log tampering detected on $host$ by $user$. Type: $deletion_type$.
+          Command: $cmdline$. Log deletion removes evidence of the attacker's
+          activities. Investigate what the attacker was trying to hide — check for
+          concurrent privilege escalation, lateral movement, or data exfiltration.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 88
+        risk_message: "Log tampering — $deletion_type$ — T1070.002"
+  false_positives:
+    - description: >
+        Log rotation (logrotate) removes old log files on schedule. logrotate runs
+        via cron and is expected behavior.
+      tuning: "Exclude events where the parent process is logrotate or crond running logrotate."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Timestomping — File Timestamp Manipulation (T1070.006)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Timestomping modifies file creation/modification times to blend malicious
+#  files with legitimate ones, defeating timeline-based forensics.
+#
+#  Confidence  : MEDIUM (78)
+#  Severity    : MEDIUM
+
+rule_3_timestomping:
+  name: "Defense Evasion — File Timestomping Detected (T1070.006)"
+  description: >
+    Detects timestamp manipulation commands: touch -t (set specific timestamp),
+    touch -r (copy timestamp from reference file), and debugfs timestamp
+    manipulation. Also monitors utimensat/futimesat syscalls on sensitive
+    paths (/usr/bin, /usr/sbin, /etc). Timestomping allows attackers to make
+    malicious files appear to have been created at a different time, defeating
+    timeline analysis during forensic investigation.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: T1070.006
+    technique_name: "Indicator Removal: Timestomp"
+    related_techniques:
+      - "T1036: Masquerading (blending with legitimate files)"
+  severity: medium
+  confidence: 78
+  risk_score: 65
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Linux Audit Log — EXECVE for touch with -t/-r flags"
+    - "Linux Audit Log — utimensat/futimesat syscalls (key=timestomp)"
+
+  search: |
+    index=linux sourcetype=linux:audit
+        ((type=EXECVE comm="touch") OR (type=SYSCALL key=timestomp))
+    | eval cmdline=coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+    ``` Detect touch with timestamp manipulation flags ```
+    | where match(cmdline, "touch.*(-t\s|--date=|-r\s|--reference=)")
+    ``` Also detect debugfs timestamp manipulation ```
+        OR match(cmdline, "debugfs.*set_inode_field")
+    | eval stomp_type=case(
+        match(cmdline, "-t\s|--date="),       "SET_SPECIFIC_TIMESTAMP",
+        match(cmdline, "-r\s|--reference="),  "COPY_REFERENCE_TIMESTAMP",
+        match(cmdline, "debugfs"),            "DEBUGFS_TIMESTAMP_MANIPULATION",
+        1==1,                                 "TIMESTAMP_MODIFICATION"
+      )
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    ``` Escalate if targeting sensitive directories ```
+    | eval severity=if(match(cmdline, "(/usr/bin|/usr/sbin|/etc/|/var/log)"), "HIGH", "MEDIUM")
+    | eval mitre_technique="T1070.006"
+    | eval mitre_tactic="Defense Evasion"
+    | eval alert_name="Timestomping"
+    | table _time, host, user, stomp_type, cmdline, severity,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Timestomping — $stomp_type$ on $host$ by $user$"
+        rule_description: >
+          File timestamp manipulation detected on $host$ by $user$. Type: $stomp_type$.
+          Command: $cmdline$. Timestomping defeats timeline-based forensics. Check
+          which files were modified and compare against RPM package verification.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 65
+        risk_message: "Timestomping — $stomp_type$ — T1070.006"
+  false_positives:
+    - description: >
+        Build systems and deployment scripts may use touch -t to set consistent
+        file timestamps. These are typically part of CI/CD pipelines.
+      tuning: "Exclude known build/deployment service accounts."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: SELinux Disable or Bypass (T1562.001)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  SELinux is RHEL's mandatory access control (MAC) system. It provides
+#  significant protection against privilege escalation and lateral movement.
+#  Disabling it is a priority for attackers operating on RHEL systems.
+#
+#  Confidence  : VERY HIGH (93)
+#  Severity    : HIGH
+
+rule_4_selinux_disable:
+  name: "Defense Evasion — SELinux Disabled or Set to Permissive (T1562.001)"
+  description: >
+    Detects attempts to disable or weaken SELinux on RHEL: setenforce 0
+    (immediate permissive mode), modification of /etc/selinux/config to set
+    SELINUX=disabled or permissive (survives reboot), security context
+    manipulation via chcon (relabeling malicious files), and SELinux boolean
+    changes via setsebool. SELinux is a critical defense layer on RHEL —
+    disabling it removes mandatory access controls that prevent many
+    exploitation techniques from succeeding.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: T1562.001
+    technique_name: "Impair Defenses: Disable or Modify Tools"
+    related_techniques:
+      - "T1068: Exploitation for Privilege Escalation (SELinux prevents many exploits)"
+  severity: high
+  confidence: 93
+  risk_score: 88
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Linux Audit Log — EXECVE for setenforce, chcon, setsebool"
+    - "Linux Audit Log — watch on /etc/selinux/ (key=selinux_mod)"
+
+  search: |
+    index=linux (sourcetype=linux:audit OR sourcetype=sysmon_linux)
+    | eval cmdline=coalesce(CommandLine, comm." ".coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect setenforce 0 (permissive) ```
+    | where match(cmdline_lower, "setenforce\s+0")
+    ``` Detect SELinux config modification ```
+        OR match(cmdline_lower, "(vi|vim|nano|sed|echo|tee).*/etc/selinux/config")
+    ``` Detect chcon for context manipulation ```
+        OR match(cmdline_lower, "chcon.*(-t\s|--type=)")
+    ``` Detect setsebool changes ```
+        OR match(cmdline_lower, "setsebool")
+    | eval selinux_action=case(
+        match(cmdline_lower, "setenforce.*0"),              "SELINUX_PERMISSIVE (immediate)",
+        match(cmdline_lower, "/etc/selinux/config"),        "SELINUX_CONFIG_MODIFIED (persistent)",
+        match(cmdline_lower, "chcon"),                      "SECURITY_CONTEXT_CHANGED (chcon)",
+        match(cmdline_lower, "setsebool"),                  "SELINUX_BOOLEAN_CHANGED",
+        1==1,                                               "SELINUX_MODIFICATION"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval severity=if(match(selinux_action, "PERMISSIVE|CONFIG_MODIFIED"), "CRITICAL", "HIGH")
+    | eval mitre_technique="T1562.001"
+    | eval mitre_tactic="Defense Evasion"
+    | eval alert_name="SELinux Tampering"
+    | table _time, host, user, selinux_action, cmdline, severity,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "SELINUX TAMPERED — $selinux_action$ on $host$ by $user$"
+        rule_description: >
+          SELinux modification detected on $host$ by $user$. Action: $selinux_action$.
+          Command: $cmdline$. SELinux enforcing mode is a critical RHEL defense —
+          disabling it removes mandatory access controls. Verify getenforce status,
+          investigate the user session, and re-enable enforcing mode immediately.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 88
+        risk_message: "SELinux tampering — $selinux_action$ — T1562.001"
+  false_positives:
+    - description: >
+        Application installations may require temporary SELinux boolean changes
+        (e.g., httpd_can_network_connect). These should be documented.
+      tuning: "Allow specific setsebool changes for known applications via allowlist."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Firewall Rule Tampering (T1562.004)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Attackers disable or modify firewall rules to allow C2 traffic, reverse
+#  shells, or lateral movement. Key targets: iptables flush, firewalld disable,
+#  opening high-risk ports.
+#
+#  Confidence  : HIGH (87)
+#  Severity    : HIGH
+
+rule_5_firewall_tampering:
+  name: "Defense Evasion — Firewall Rules Disabled or Modified (T1562.004)"
+  description: >
+    Detects firewall rule manipulation on RHEL: iptables flush (-F), chain
+    deletion (-X), default ACCEPT policy (-P INPUT ACCEPT), firewalld
+    stop/disable, firewall-cmd adding high-risk ports (4444, 5555, 8080, 9090,
+    etc.), and nftables flush ruleset. Firewall tampering enables C2 traffic,
+    reverse shells, and lateral movement that would otherwise be blocked.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: T1562.004
+    technique_name: "Impair Defenses: Disable or Modify System Firewall"
+    related_techniques:
+      - "T1562.001: Impair Defenses: Disable or Modify Tools"
+  severity: high
+  confidence: 87
+  risk_score: 82
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Linux Audit Log — EXECVE for iptables, firewall-cmd, nft, systemctl"
+
+  search: |
+    index=linux (sourcetype=linux:audit OR sourcetype=sysmon_linux)
+    | eval cmdline=coalesce(CommandLine, comm." ".coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect iptables flush/delete/accept-all ```
+    | where match(cmdline_lower, "iptables\s+(-F|--flush|-X|--delete-chain)")
+        OR match(cmdline_lower, "iptables.*-P\s+(INPUT|FORWARD|OUTPUT)\s+ACCEPT")
+    ``` Detect firewalld stop/disable ```
+        OR match(cmdline_lower, "(systemctl|service).*(stop|disable).*firewalld")
+    ``` Detect firewall-cmd opening suspicious ports ```
+        OR match(cmdline_lower, "firewall-cmd.*--add-port=(4444|5555|8080|9090|1337|31337|6666|6667)")
+    ``` Detect nftables flush ```
+        OR match(cmdline_lower, "nft\s+flush\s+ruleset")
+    ``` Detect ufw disable ```
+        OR match(cmdline_lower, "ufw\s+disable")
+    | eval fw_action=case(
+        match(cmdline_lower, "iptables.*(-F|--flush)"),    "IPTABLES_FLUSHED",
+        match(cmdline_lower, "iptables.*ACCEPT"),          "IPTABLES_DEFAULT_ACCEPT",
+        match(cmdline_lower, "stop.*firewalld"),           "FIREWALLD_STOPPED",
+        match(cmdline_lower, "disable.*firewalld"),        "FIREWALLD_DISABLED",
+        match(cmdline_lower, "firewall-cmd.*--add-port"),  "SUSPICIOUS_PORT_OPENED",
+        match(cmdline_lower, "nft.*flush"),                "NFTABLES_FLUSHED",
+        1==1,                                              "FIREWALL_MODIFICATION"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1562.004"
+    | eval mitre_tactic="Defense Evasion"
+    | eval alert_name="Firewall Tampering"
+    | table _time, host, user, fw_action, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "FIREWALL TAMPERED — $fw_action$ on $host$ by $user$"
+        rule_description: >
+          Firewall rule modification detected on $host$ by $user$. Action: $fw_action$.
+          Command: $cmdline$. Firewall tampering enables C2 communications and lateral
+          movement. Verify current firewall rules and re-apply security policies.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 82
+        risk_message: "Firewall tampering — $fw_action$ — T1562.004"
+  false_positives:
+    - description: >
+        Network administrators may modify firewall rules during deployment or
+        troubleshooting. These should correlate with change tickets.
+      tuning: "Exclude authorized network admin accounts during maintenance windows."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Rootkit Indicators (T1014)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Linux rootkits operate at the kernel level (diamorphine, reptile, suterusu)
+#  or userland level (LD_PRELOAD-based: jynx, azazel). This rule detects
+#  loading of known rootkit modules, hidden files in staging directories,
+#  and LD_PRELOAD-based rootkit artifacts.
+#
+#  Confidence  : VERY HIGH (92)
+#  Severity    : CRITICAL
+
+rule_6_rootkit_indicators:
+  name: "Defense Evasion — Linux Rootkit Indicators Detected (T1014)"
+  description: >
+    Detects indicators of Linux rootkit presence: loading of known rootkit kernel
+    modules (diamorphine, reptile, suterusu, adore-ng, azazel, jynx, khook,
+    kovid), hidden executable files in staging directories (/dev/shm, /tmp with
+    dot-prefix), and LD_PRELOAD-based userland rootkit artifacts. Rootkits hide
+    processes, files, network connections, and other attack indicators from system
+    tools and security monitoring.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: T1014
+    technique_name: "Rootkit"
+    related_techniques:
+      - "T1547.006: Kernel Modules and Extensions"
+      - "T1574.006: Dynamic Linker Hijacking (LD_PRELOAD rootkits)"
+  severity: critical
+  confidence: 92
+  risk_score: 95
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Linux Audit Log — init_module syscall (key=mod_load)"
+    - "Linux Audit Log — EXECVE for insmod/modprobe"
+    - "Sysmon for Linux — Event 1 and Event 11"
+
+  search: |
+    index=linux (sourcetype=linux:audit OR sourcetype=sysmon_linux)
+    | eval cmdline=coalesce(CommandLine, comm." ".coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,""))
+    | eval filepath=coalesce(TargetFilename, name, "")
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect known rootkit kernel module names ```
+    | where match(cmdline_lower, "(diamorphine|reptile|suterusu|adore-ng|adore_ng|azazel|jynx|jynx2|khook|kovid|bdvl|enyelkm|nurupo|rkmod)")
+    ``` Detect hidden executables in staging directories ```
+        OR match(filepath, "/(dev/shm|tmp)/\.[^/]+$")
+    ``` Detect libprocesshider and similar LD_PRELOAD rootkits ```
+        OR match(cmdline_lower, "(libprocesshider|processhider|libhide)")
+    ``` Detect rootkit checking tools being used by attacker ```
+        OR match(cmdline_lower, "(unhide|rkhunter|chkrootkit)")
+    | eval rootkit_indicator=case(
+        match(cmdline_lower, "diamorphine"),    "DIAMORPHINE kernel rootkit",
+        match(cmdline_lower, "reptile"),        "REPTILE kernel rootkit",
+        match(cmdline_lower, "suterusu"),       "SUTERUSU kernel rootkit",
+        match(cmdline_lower, "adore"),          "ADORE-NG kernel rootkit",
+        match(cmdline_lower, "azazel|jynx"),    "USERLAND rootkit (LD_PRELOAD)",
+        match(cmdline_lower, "kovid|khook"),    "MODERN kernel rootkit",
+        match(filepath, "/\\.[^/]+$"),          "HIDDEN_EXECUTABLE in staging dir",
+        match(cmdline_lower, "libprocesshider"),"PROCESS_HIDER library",
+        match(cmdline_lower, "unhide|rkhunter"),"ROOTKIT_DETECTION_TOOL (may be attacker checking)",
+        1==1,                                   "ROOTKIT_INDICATOR"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1014"
+    | eval mitre_tactic="Defense Evasion"
+    | eval alert_name="Rootkit Indicator"
+    | table _time, host, user, rootkit_indicator, cmdline, filepath,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "ROOTKIT DETECTED — $rootkit_indicator$ on $host$"
+        rule_description: >
+          Linux rootkit indicator detected on $host$ by $user$. Indicator:
+          $rootkit_indicator$. Command: $cmdline$. File: $filepath$. Rootkits
+          hide attacker activity at the kernel or userland level. IMMEDIATE:
+          Isolate host, boot from trusted media for forensic analysis, and
+          rebuild from known-good image.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 95
+        risk_message: "Rootkit indicator — $rootkit_indicator$ — T1014"
+  false_positives:
+    - description: >
+        Security teams running rkhunter or chkrootkit for proactive scanning.
+        These are legitimate security tools but may also be run by attackers
+        to check if their rootkit was detected.
+      tuning: "Exclude scheduled rkhunter/chkrootkit scans run by authorized security accounts."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: Process Masquerading (T1036.004)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Attackers rename malicious processes to match legitimate system services
+#  (sshd, systemd, crond) but run them from non-standard paths. Also includes
+#  deleted binary execution and fileless execution via memfd_create.
+#
+#  Confidence  : HIGH (85)
+#  Severity    : HIGH
+
+rule_7_process_masquerading:
+  name: "Defense Evasion — Process Masquerading or Fileless Execution (T1036.004)"
+  description: >
+    Detects processes with names mimicking system services but running from
+    non-standard paths (e.g., sshd from /tmp, systemd from /dev/shm). Also
+    detects deleted binary execution (process exe path shows "(deleted)")
+    indicating the binary was removed after launch, and fileless execution
+    via memfd_create (/proc/self/fd or /memfd: in exe path).
+  mitre:
+    tactic: "Defense Evasion"
+    technique: T1036.004
+    technique_name: "Masquerading: Masquerade Task or Service"
+    related_techniques:
+      - "T1620: Reflective Code Loading (memfd_create)"
+      - "T1036.005: Masquerading: Match Legitimate Name or Location"
+  severity: high
+  confidence: 85
+  risk_score: 82
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Sysmon for Linux — Event 1 (Process Creation)"
+    - "Linux Audit Log — EXECVE with exe path analysis"
+
+  search: |
+    index=linux (sourcetype=sysmon_linux EventCode=1) OR
+        (sourcetype=linux:audit type=SYSCALL syscall=execve)
+    | eval process_name=coalesce(comm, Image, "unknown")
+    | eval exe_path=coalesce(Image, exe, "unknown")
+    | eval process_lower=lower(process_name)
+    | eval exe_lower=lower(exe_path)
+    ``` Detect system process names from non-standard paths ```
+    | where (match(process_lower, "^(sshd|systemd|crond|auditd|rsyslogd|httpd|nginx|syslogd|dbus|polkitd)$")
+             AND match(exe_lower, "(/tmp/|/dev/shm/|/var/tmp/|/home/|/root/)"))
+    ``` Detect deleted binary execution ```
+        OR match(exe_lower, "\(deleted\)")
+    ``` Detect memfd_create fileless execution ```
+        OR match(exe_lower, "(memfd:|/proc/self/fd/|/proc/[0-9]+/fd/)")
+    | eval masquerade_type=case(
+        match(exe_lower, "\(deleted\)"),     "DELETED_BINARY — binary removed after exec",
+        match(exe_lower, "memfd:"),          "MEMFD_FILELESS — in-memory execution",
+        match(exe_lower, "/proc/.*/fd/"),    "PROC_FD_FILELESS — fd-based execution",
+        1==1,                                "PATH_MASQUERADE — system name, wrong path"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1036.004"
+    | eval mitre_tactic="Defense Evasion"
+    | eval alert_name="Process Masquerading"
+    | table _time, host, user, process_name, exe_path, masquerade_type,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "MASQUERADE — $masquerade_type$: $process_name$ from $exe_path$ on $host$"
+        rule_description: >
+          Process masquerading detected on $host$ by $user$. Process: $process_name$.
+          Path: $exe_path$. Type: $masquerade_type$. Investigate the process tree,
+          check network connections from this process, and examine the binary.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 82
+        risk_message: "Process masquerading — $masquerade_type$ — T1036.004"
+  false_positives:
+    - description: >
+        Containerized processes may appear to run from unexpected paths due to
+        mount namespace differences visible from the host.
+      tuning: "Correlate with container runtime events to exclude containerized processes."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: Command History Tampering (T1070.003)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Attackers disable or clear command history to remove evidence of their
+#  typed commands. Common techniques: HISTFILE=/dev/null, HISTSIZE=0,
+#  unset HISTFILE, deleting .bash_history, symlinking to /dev/null.
+#
+#  Confidence  : HIGH (85)
+#  Severity    : MEDIUM
+
+rule_8_history_tampering:
+  name: "Defense Evasion — Command History Tampered (T1070.003)"
+  description: >
+    Detects attempts to disable or clear shell command history: setting
+    HISTFILE=/dev/null, HISTSIZE=0, HISTFILESIZE=0, unsetting HISTFILE,
+    deleting .bash_history/.zsh_history files, truncating history files,
+    and symlinking history to /dev/null. History tampering removes evidence
+    of typed commands from the compromised session.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: T1070.003
+    technique_name: "Indicator Removal: Clear Command History"
+    related_techniques:
+      - "T1070.002: Clear Linux System Logs"
+  severity: medium
+  confidence: 85
+  risk_score: 68
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Linux Audit Log — EXECVE for history manipulation commands"
+
+  search: |
+    index=linux (sourcetype=linux:audit OR sourcetype=sysmon_linux)
+    | eval cmdline=coalesce(CommandLine, comm." ".coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect history environment variable manipulation ```
+    | where match(cmdline_lower, "(export\s+)?histfile\s*=\s*/dev/null")
+        OR match(cmdline_lower, "(export\s+)?histsize\s*=\s*0")
+        OR match(cmdline_lower, "(export\s+)?histfilesize\s*=\s*0")
+        OR match(cmdline_lower, "unset\s+histfile")
+    ``` Detect history file deletion/truncation ```
+        OR match(cmdline_lower, "(rm|shred|truncate)\s.*\.(bash_history|zsh_history|history)")
+    ``` Detect symlink to /dev/null ```
+        OR match(cmdline_lower, "ln\s+-sf?\s+/dev/null.*history")
+    ``` Detect history -c (clear) ```
+        OR match(cmdline_lower, "history\s+-c")
+    | eval tamper_method=case(
+        match(cmdline_lower, "histfile.*/dev/null"),  "HISTFILE_TO_DEVNULL",
+        match(cmdline_lower, "histsize.*0"),           "HISTSIZE_ZERO",
+        match(cmdline_lower, "unset.*histfile"),       "HISTFILE_UNSET",
+        match(cmdline_lower, "(rm|shred).*history"),   "HISTORY_FILE_DELETED",
+        match(cmdline_lower, "ln.*null.*history"),     "HISTORY_SYMLINK_DEVNULL",
+        match(cmdline_lower, "history.*-c"),           "HISTORY_CLEARED",
+        1==1,                                         "HISTORY_TAMPERING"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1070.003"
+    | eval mitre_tactic="Defense Evasion"
+    | eval alert_name="History Tampering"
+    | table _time, host, user, tamper_method, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "user"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "History Tampered — $tamper_method$ by $user$ on $host$"
+        rule_description: >
+          Command history tampering detected on $host$ by $user$. Method:
+          $tamper_method$. Command: $cmdline$. History tampering is a strong
+          indicator of an attacker trying to hide their activity. Investigate
+          the user's full session via auditd EXECVE logs (which are unaffected
+          by history manipulation).
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "user"
+        risk_score: 68
+        risk_message: "History tampering — $tamper_method$ — T1070.003"
+  false_positives:
+    - description: >
+        Some hardened shell profiles set HISTSIZE=0 by policy for sensitive
+        systems (e.g., PCI DSS compliance).
+      tuning: "Exclude hosts with documented history-disable policies."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 9: System Binary Replacement — Trojanized Tools (T1036.005)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Attackers replace critical system binaries (ls, ps, netstat, ss, lsof)
+#  with trojanized versions that hide their activity. Any write to /usr/bin
+#  or /usr/sbin outside of package management is extremely suspicious.
+#
+#  Confidence  : VERY HIGH (92)
+#  Severity    : CRITICAL
+
+rule_9_binary_replacement:
+  name: "Defense Evasion — System Binary Modified Outside Package Management (T1036.005)"
+  description: >
+    Detects writes to critical system binary directories (/usr/bin/, /usr/sbin/,
+    /usr/local/bin/) by processes other than package managers (rpm, dnf, yum, pip,
+    gem). Trojanized system tools (ls, ps, netstat, ss, lsof, top, find, bash)
+    hide attacker processes, files, and network connections. Also detects rpm -V
+    verification failures that indicate tampered packages.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: T1036.005
+    technique_name: "Masquerading: Match Legitimate Name or Location"
+    related_techniques:
+      - "T1014: Rootkit (trojanized tools serve same purpose)"
+      - "T1554: Compromise Client Software Binary"
+  severity: critical
+  confidence: 92
+  risk_score: 92
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Linux Audit Log — watch on /usr/bin/ and /usr/sbin/ (key=binary_mod)"
+
+  search: |
+    index=linux sourcetype=linux:audit key=binary_mod
+    | eval binary_path=coalesce(name, "unknown")
+    | eval writer=coalesce(exe, "unknown")
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    ``` Filter out package manager operations ```
+    | where NOT match(writer, "(rpm|dnf|yum|pip|pip3|gem|npm|cargo|go|rustup|install)")
+    ``` Flag modification of critical system tools ```
+    | eval is_critical=if(match(binary_path, "/(ls|ps|netstat|ss|lsof|top|find|bash|sh|sudo|su|login|sshd|grep|awk|sed|cat|mount|df|id|who|w|last)$"), "YES — critical system tool", "NO")
+    | eval severity=if(is_critical=="YES — critical system tool", "CRITICAL", "HIGH")
+    | eval mitre_technique="T1036.005"
+    | eval mitre_tactic="Defense Evasion"
+    | eval alert_name="Binary Replacement"
+    | table _time, host, user, binary_path, writer, is_critical, severity,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "BINARY REPLACED — $binary_path$ on $host$ by $writer$ (critical=$is_critical$)"
+        rule_description: >
+          System binary $binary_path$ was modified on $host$ by $writer$ (user: $user$).
+          Critical tool: $is_critical$. Any modification of system binaries outside
+          of package management is extremely suspicious. Run: rpm -Vf $binary_path$ to
+          verify integrity. Consider the host fully compromised if a critical tool
+          was replaced.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 92
+        risk_message: "Binary replacement — $binary_path$ — T1036.005"
+  false_positives:
+    - description: >
+        Manual software installations (make install, custom builds) may write to
+        /usr/local/bin/. These should be documented and use /usr/local/ prefix.
+      tuning: "Consider lower severity for /usr/local/bin/ modifications vs /usr/bin/ or /usr/sbin/."
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  inv_1_auditd_status_history:
+    name: "Auditd Service Status and Events on Host"
+    description: >
+      Shows auditd service events, restarts, and configuration changes.
+    search: |
+      index=linux (sourcetype=linux:audit OR sourcetype=syslog) hostname="$target_host$"
+          ("auditd" OR "audit" OR "auditctl") earliest=-24h
+      | where match(_raw, "(start|stop|enable|disable|reload|config|rule)")
+      | sort _time
+      | table _time, _raw
+
+  inv_2_selinux_status:
+    name: "SELinux Status Changes on Host"
+    description: >
+      Shows SELinux enforcement changes and boolean modifications.
+    search: |
+      index=linux (sourcetype=linux:audit OR sourcetype=syslog) hostname="$target_host$"
+          ("setenforce" OR "selinux" OR "setsebool" OR "chcon" OR "restorecon")
+          earliest=-7d
+      | sort _time
+      | table _time, _raw
+
+  inv_3_binary_integrity:
+    name: "System Binary Modifications on Host"
+    description: >
+      Lists all writes to system binary directories in the last 7 days.
+    search: |
+      index=linux sourcetype=linux:audit key=binary_mod hostname="$target_host$"
+          earliest=-7d
+      | stats count, values(exe) as writer, values(auid) as user,
+              min(_time) as first, max(_time) as last by name
+      | sort - last
+      | table name, writer, user, count, first, last
+
+  inv_4_deleted_binaries:
+    name: "Processes Running from Deleted Binaries"
+    description: >
+      Finds processes with (deleted) in their exe path on the host.
+    search: |
+      index=linux sourcetype=linux:audit type=SYSCALL syscall=execve
+          hostname="$target_host$" exe="*(deleted)*"
+          earliest=-24h
+      | stats count, values(comm) as process, values(auid) as user by exe
+      | table exe, process, user, count
+
+  inv_5_firewall_changes:
+    name: "Firewall Rule Changes on Host"
+    description: >
+      Shows all firewall-related command executions on the host.
+    search: |
+      index=linux sourcetype=linux:audit type=EXECVE hostname="$target_host$"
+          (comm="iptables" OR comm="ip6tables" OR comm="firewall-cmd"
+           OR comm="nft" OR comm="ufw")
+          earliest=-7d
+      | eval cmdline=coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+      | sort _time
+      | table _time, comm, cmdline, auid
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+incident_response_playbook:
+  name: "RHEL Defense Evasion — Incident Response Playbook"
+  description: >
+    Step-by-step response procedure when defense evasion is detected on
+    a RHEL system.
+
+  phase_1_detection_and_triage:
+    - step: "Identify the evasion technique: auditd tampering, log deletion, SELinux bypass, rootkit, masquerading"
+    - step: "PRIORITY: Auditd tampering and rootkits are CRITICAL — respond within 15 minutes"
+    - step: "Verify auditd is still running: systemctl status auditd"
+    - step: "Verify SELinux is enforcing: getenforce"
+    - step: "Check if attacker has already escalated privileges"
+
+  phase_2_containment:
+    - step: "Re-enable auditd immediately if stopped: systemctl start auditd"
+    - step: "Re-enable SELinux if set to permissive: setenforce 1"
+    - step: "Restore firewall rules from known-good configuration"
+    - step: "If rootkit detected: network-isolate the host immediately"
+    - step: "Preserve evidence before remediation: snapshot filesystem, dump running processes"
+
+  phase_3_evidence_collection:
+    - step: "Collect remaining audit logs: ausearch --start <time> -k exec_log"
+    - step: "Check RPM package integrity: rpm -Va | grep '^S' (files with size changes)"
+    - step: "List all kernel modules: lsmod, and check for unknown modules"
+    - step: "Check /etc/ld.so.preload content"
+    - step: "Verify system binary hashes against known-good values"
+
+  phase_4_eradication:
+    - step: "For rootkit: boot from trusted rescue media, mount filesystem read-only for analysis"
+    - step: "Reinstall tampered packages: yum reinstall <package>"
+    - step: "Remove unauthorized kernel modules: rmmod <module>"
+    - step: "Clear /etc/ld.so.preload if tampered"
+    - step: "Restore auditd rules from known-good configuration"
+    - step: "For severe compromise (rootkit, binary replacement): rebuild from golden image"
+
+  phase_5_hardening:
+    - step: "Deploy immutable auditd rules: auditctl -e 2 (locks audit configuration)"
+    - step: "Enable SELinux enforcing mode and set in /etc/selinux/config"
+    - step: "Deploy AIDE or OSSEC for file integrity monitoring"
+    - step: "Implement centralized log forwarding so logs survive local tampering"
+    - step: "Enable kernel module signing enforcement to prevent unsigned rootkit modules"

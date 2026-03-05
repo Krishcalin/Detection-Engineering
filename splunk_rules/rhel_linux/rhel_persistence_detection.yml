@@ -1,0 +1,1030 @@
+# ==============================================================================
+#  RHEL Persistence Attack Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for persistence mechanisms on Red Hat
+#                Enterprise Linux (RHEL) systems. Covers malicious cron jobs,
+#                systemd service creation, SSH authorized_keys modification,
+#                PAM backdoor installation, LD_PRELOAD hijacking, shell profile
+#                backdoors, at job abuse, init script modification, and kernel
+#                module persistence. These techniques allow attackers to maintain
+#                access across reboots and user sessions.
+#
+#  MITRE ATT&CK: T1053.003 - Scheduled Task/Job: Cron
+#                 T1543.002 - Create or Modify System Process: Systemd Service
+#                 T1098.004 - Account Manipulation: SSH Authorized Keys
+#                 T1556.003 - Modify Authentication Process: Pluggable Auth Modules
+#                 T1574.006 - Hijack Execution Flow: Dynamic Linker Hijacking
+#                 T1546.004 - Event Triggered Execution: Unix Shell Config Modification
+#                 T1053.002 - Scheduled Task/Job: At
+#                 T1037.004 - Boot or Logon Initialization: RC Scripts
+#                 T1547.006 - Boot or Logon Autostart: Kernel Modules and Extensions
+#  Kill Chain   : Persistence -> Privilege Escalation
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : auditd, Sysmon for Linux, syslog, linux_secure
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-05
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Deploy auditd with the following watch rules on ALL RHEL hosts:
+#     -w /var/spool/cron/ -p wa -k cron_mod
+#     -w /etc/cron.d/ -p wa -k cron_mod
+#     -w /etc/crontab -p wa -k cron_mod
+#     -w /etc/systemd/system/ -p wa -k systemd_mod
+#     -w /usr/lib/systemd/system/ -p wa -k systemd_mod
+#     -w /etc/pam.d/ -p wa -k pam_mod
+#     -w /etc/security/ -p wa -k pam_mod
+#     -w /etc/ld.so.preload -p wa -k preload_mod
+#     -w /etc/ld.so.conf.d/ -p wa -k preload_mod
+#     -w /etc/profile -p wa -k shell_profile
+#     -w /etc/profile.d/ -p wa -k shell_profile
+#     -w /etc/bashrc -p wa -k shell_profile
+#     -w /etc/rc.local -p wa -k rc_mod
+#     -w /etc/init.d/ -p wa -k init_mod
+#     -w /etc/modules-load.d/ -p wa -k module_mod
+#
+#  2. Configure Sysmon for Linux with FileCreate (Event 11) and Process
+#     Creation (Event 1) rules.
+#
+#  3. Forward all logs to Splunk:
+#     index=linux sourcetype=linux:audit
+#     index=linux sourcetype=syslog
+#     index=linux sourcetype=linux_secure
+#     index=linux sourcetype=sysmon_linux
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: Malicious Cron Job Creation (T1053.003)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Cron is the most common Linux persistence mechanism. Attackers add entries
+#  to user crontabs (/var/spool/cron/), system cron (/etc/cron.d/), or modify
+#  /etc/crontab. Malicious entries typically contain download-and-execute
+#  patterns: curl/wget piped to bash, reverse shells, or base64 payloads.
+#
+#  Confidence  : HIGH (88)
+#  Severity    : HIGH
+
+rule_1_malicious_cron_creation:
+  name: "Persistence — Malicious Cron Job Creation or Modification (T1053.003)"
+  description: >
+    Detects creation or modification of cron job files in /var/spool/cron/,
+    /etc/cron.d/, and /etc/crontab via auditd watch events. Cron entries are
+    further analyzed for malicious patterns: download-and-execute (curl|wget
+    piped to bash/sh), reverse shell constructs (/dev/tcp, nc -e, ncat),
+    encoded payloads (base64 -d), script interpreter inline execution
+    (python -c, perl -e), and connections to /dev/tcp. Any cron modification
+    outside of scheduled maintenance is suspicious on production RHEL systems.
+  mitre:
+    tactic: "Persistence"
+    technique: T1053.003
+    technique_name: "Scheduled Task/Job: Cron"
+    related_techniques:
+      - "T1059.004: Unix Shell (cron executes shell commands)"
+      - "T1105: Ingress Tool Transfer (download payloads via cron)"
+  severity: high
+  confidence: 88
+  risk_score: 82
+  kill_chain_phase: "Persistence"
+  data_sources:
+    - "Linux Audit Log — watch on cron directories (key=cron_mod)"
+    - "Sysmon for Linux — Event 11 (FileCreate) in cron paths"
+
+  search: |
+    index=linux (sourcetype=linux:audit key=cron_mod) OR
+        (sourcetype=sysmon_linux EventCode=11
+         TargetFilename="/var/spool/cron/*" OR TargetFilename="/etc/cron.d/*"
+         OR TargetFilename="/etc/crontab")
+    ``` Aggregate cron modification events ```
+    | eval file_path=coalesce(TargetFilename, name, "unknown")
+    | eval modifier_process=coalesce(Image, exe, "unknown")
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    ``` Flag suspicious cron content patterns (if available in log context) ```
+    | eval suspicious_content=case(
+        match(file_path, "/var/spool/cron/root"), "ROOT_CRONTAB_MODIFIED",
+        match(modifier_process, "(vi|vim|nano|sed|echo|tee|cp|cat|bash)"), "DIRECT_EDIT",
+        match(modifier_process, "crontab"), "CRONTAB_CMD",
+        1==1, "FILE_WRITE"
+      )
+    ``` Escalate root crontab modifications ```
+    | eval severity=if(match(file_path, "/var/spool/cron/root") OR match(file_path, "/etc/crontab"), "CRITICAL", "HIGH")
+    | eval mitre_technique="T1053.003"
+    | eval mitre_tactic="Persistence"
+    | eval alert_name="Cron Job Persistence"
+    | table _time, host, user, file_path, modifier_process, suspicious_content,
+            severity, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Cron Persistence — $file_path$ modified on $host$ by $user$"
+        rule_description: >
+          Cron file $file_path$ was modified on $host$ by user $user$ using
+          $modifier_process$. Pattern: $suspicious_content$. Review the cron entry
+          content for download-and-execute, reverse shell, or encoded command
+          patterns. Compare against change management records.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 82
+        risk_message: "Cron modification — $file_path$ — T1053.003"
+  false_positives:
+    - description: >
+        Configuration management tools (Ansible, Puppet) may deploy cron jobs as
+        part of normal operations. These run under known service accounts and deploy
+        to expected cron paths.
+      tuning: "Exclude known automation service accounts and expected cron file names."
+    - description: >
+        System package updates (rpm/dnf) may install or update cron entries for
+        system services (logrotate, man-db, etc.).
+      tuning: "Exclude events where modifier_process is rpm, dnf, or yum."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Systemd Service Persistence (T1543.002)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Attackers create malicious .service files in systemd directories to ensure
+#  their payload survives reboot. Key indicators: services with ExecStart
+#  pointing to /tmp, /dev/shm, or shell interpreters; daemon-reload followed
+#  by enable of a new service; services created outside package management.
+#
+#  Confidence  : HIGH (90)
+#  Severity    : HIGH
+
+rule_2_systemd_service_persistence:
+  name: "Persistence — Suspicious Systemd Service Created (T1543.002)"
+  description: >
+    Detects creation of new .service unit files in systemd directories
+    (/etc/systemd/system/, /usr/lib/systemd/system/, ~/.config/systemd/user/).
+    New services are flagged when created outside of package management (rpm,
+    dnf, yum) or configuration management (ansible, puppet). The rule also
+    detects systemctl daemon-reload followed by systemctl enable of a new
+    service within a 5-minute window, which is the standard attacker workflow
+    for activating persistence. Services pointing to /tmp, /dev/shm, or
+    /var/tmp in ExecStart are elevated to CRITICAL.
+  mitre:
+    tactic: "Persistence"
+    technique: T1543.002
+    technique_name: "Create or Modify System Process: Systemd Service"
+    related_techniques:
+      - "T1059.004: Unix Shell (service executes shell)"
+      - "T1547.001: Boot or Logon Autostart Execution"
+  severity: high
+  confidence: 90
+  risk_score: 85
+  kill_chain_phase: "Persistence"
+  data_sources:
+    - "Linux Audit Log — watch on systemd directories (key=systemd_mod)"
+    - "Sysmon for Linux — Event 11 (FileCreate) for .service files"
+
+  search: |
+    index=linux (sourcetype=linux:audit key=systemd_mod) OR
+        (sourcetype=sysmon_linux EventCode=11
+         (TargetFilename="*/systemd/system/*.service"
+          OR TargetFilename="*/systemd/user/*.service"))
+    ``` Extract service file details ```
+    | eval service_file=coalesce(TargetFilename, name, "unknown")
+    | eval creator=coalesce(Image, exe, "unknown")
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    ``` Filter out package manager operations ```
+    | where NOT match(creator, "(rpm|dnf|yum|pip|ansible|puppet|chef)")
+    ``` Flag suspicious service characteristics ```
+    | eval risk_indicator=case(
+        match(service_file, "(/tmp/|/dev/shm/|/var/tmp/)"), "EXEC_FROM_TEMP_DIR",
+        match(creator, "(bash|sh|python|curl|wget)"),       "CREATED_BY_SCRIPT",
+        match(service_file, "\.config/systemd/user"),       "USER_LEVEL_SERVICE",
+        1==1,                                               "NEW_SYSTEM_SERVICE"
+      )
+    | eval severity=if(risk_indicator="EXEC_FROM_TEMP_DIR", "CRITICAL", "HIGH")
+    | eval mitre_technique="T1543.002"
+    | eval mitre_tactic="Persistence"
+    | eval alert_name="Systemd Service Persistence"
+    | table _time, host, user, service_file, creator, risk_indicator,
+            severity, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Systemd Persistence — $service_file$ created on $host$ by $user$"
+        rule_description: >
+          A new systemd service file ($service_file$) was created on $host$ by $user$
+          using $creator$. Risk: $risk_indicator$. Review the service file content,
+          particularly ExecStart, and verify against change management. Services
+          executing from /tmp or /dev/shm are almost certainly malicious.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 85
+        risk_message: "Systemd service persistence — $risk_indicator$ — T1543.002"
+  false_positives:
+    - description: >
+        System administrators may create custom systemd services for application
+        deployments. These should be tracked via change management.
+      tuning: "Maintain a list of expected service names and exclude known deployments."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: SSH Authorized Keys Modification (T1098.004)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Adding an SSH public key to authorized_keys grants persistent passwordless
+#  access. Root's authorized_keys is CRITICAL — it gives unrestricted root
+#  SSH access. Attackers commonly append keys after initial compromise.
+#
+#  Confidence  : HIGH (90)
+#  Severity    : HIGH → CRITICAL (root)
+
+rule_3_ssh_authorized_keys_modification:
+  name: "Persistence — SSH Authorized Keys Modified (T1098.004)"
+  description: >
+    Detects writes to SSH authorized_keys and authorized_keys2 files across
+    all user home directories. Any addition of an SSH public key provides
+    persistent, passwordless access to the target account. Modifications to
+    /root/.ssh/authorized_keys are elevated to CRITICAL severity as they
+    grant direct root SSH access. The rule correlates auditd file write events
+    and Sysmon FileCreate events on authorized_keys paths.
+  mitre:
+    tactic: "Persistence"
+    technique: T1098.004
+    technique_name: "Account Manipulation: SSH Authorized Keys"
+    related_techniques:
+      - "T1021.004: Remote Services: SSH (access method)"
+      - "T1078.003: Valid Accounts: Local Accounts"
+  severity: high
+  confidence: 90
+  risk_score: 88
+  kill_chain_phase: "Persistence"
+  data_sources:
+    - "Linux Audit Log — openat/write syscall on authorized_keys files"
+    - "Sysmon for Linux — Event 11 (FileCreate/FileWrite) on .ssh/authorized_keys"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=PATH name="*authorized_keys*") OR
+        (sourcetype=sysmon_linux EventCode=11 TargetFilename="*authorized_keys*")
+    ``` Extract file details ```
+    | eval key_file=coalesce(TargetFilename, name, "unknown")
+    | eval writer=coalesce(Image, exe, "unknown")
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    ``` Determine target account from path ```
+    | eval target_account=case(
+        match(key_file, "/root/"),     "root",
+        match(key_file, "/home/"),     replace(key_file, "^/home/([^/]+)/.*", "\1"),
+        1==1,                          "unknown"
+      )
+    ``` Escalate for root account ```
+    | eval severity=if(target_account=="root", "CRITICAL", "HIGH")
+    ``` Flag non-SSH key management processes ```
+    | eval method=case(
+        match(writer, "ssh-copy-id"),   "ssh-copy-id (expected)",
+        match(writer, "(echo|tee|cp|cat|sed|bash|sh|python|curl|wget)"), "SUSPICIOUS WRITE METHOD",
+        match(writer, "(ansible|puppet|chef|salt)"), "CONFIG MANAGEMENT",
+        1==1,                           "OTHER"
+      )
+    | eval mitre_technique="T1098.004"
+    | eval mitre_tactic="Persistence"
+    | eval alert_name="SSH Authorized Keys Modification"
+    | table _time, host, user, target_account, key_file, writer, method,
+            severity, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "SSH Key Added — $target_account$@$host$ modified by $user$ ($method$)"
+        rule_description: >
+          SSH authorized_keys for $target_account$ was modified on $host$ by $user$.
+          File: $key_file$. Writer: $writer$. Method: $method$. Verify the added key
+          fingerprint against authorized key inventory. Root authorized_keys modification
+          is CRITICAL — attacker gains persistent root SSH access.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 88
+        risk_message: "SSH key modification for $target_account$ — T1098.004"
+  false_positives:
+    - description: >
+        SSH key deployment via configuration management (Ansible, Puppet) is expected.
+        These use known service accounts and follow predictable patterns.
+      tuning: "Exclude events where writer matches authorized config management tools."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: PAM Backdoor Installation (T1556.003)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  PAM (Pluggable Authentication Modules) controls all authentication on Linux.
+#  A backdoored PAM module can capture every password entered on the system
+#  or allow bypass authentication with a master password. This is one of the
+#  most dangerous persistence mechanisms on Linux.
+#
+#  Confidence  : VERY HIGH (93)
+#  Severity    : CRITICAL
+
+rule_4_pam_backdoor_installation:
+  name: "Persistence — PAM Configuration or Module Modification (T1556.003)"
+  description: >
+    Detects modification of PAM configuration files (/etc/pam.d/*) and PAM
+    security configuration (/etc/security/*). Also detects compilation of
+    custom PAM modules (gcc/make with pam_ in arguments) and replacement of
+    existing PAM shared objects. PAM backdoors are one of the most dangerous
+    persistence mechanisms — they can capture ALL passwords on the system or
+    allow authentication bypass. Any PAM modification outside of package
+    updates warrants immediate investigation.
+  mitre:
+    tactic: "Persistence"
+    technique: T1556.003
+    technique_name: "Modify Authentication Process: Pluggable Authentication Modules"
+    related_techniques:
+      - "T1556: Modify Authentication Process"
+      - "T1003: OS Credential Dumping (password capture via PAM)"
+  severity: critical
+  confidence: 93
+  risk_score: 95
+  kill_chain_phase: "Persistence"
+  data_sources:
+    - "Linux Audit Log — watch on /etc/pam.d/ and /etc/security/ (key=pam_mod)"
+    - "Linux Audit Log — EXECVE for gcc/make with pam_ patterns"
+
+  search: |
+    ``` Detect PAM config file modifications ```
+    index=linux sourcetype=linux:audit key=pam_mod
+    | eval pam_file=coalesce(name, "unknown")
+    | eval modifier=coalesce(exe, "unknown")
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    | eval detection_type="PAM_CONFIG_MODIFICATION"
+    | append
+        [``` Detect PAM module compilation ```
+         search index=linux sourcetype=linux:audit type=EXECVE
+         | eval cmdline=coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+         | where match(cmdline, "(gcc|make|cc).*pam_")
+         | eval pam_file=cmdline
+         | eval modifier=exe
+         | eval user=coalesce(auid, "unknown")
+         | eval host=coalesce(hostname, "unknown")
+         | eval detection_type="PAM_MODULE_COMPILATION"]
+    ``` Filter out package manager operations ```
+    | where NOT match(modifier, "(rpm|dnf|yum|authconfig|authselect)")
+    ``` Flag high-risk PAM files ```
+    | eval risk_level=case(
+        match(pam_file, "pam.d/(sshd|login|su|sudo|system-auth|password-auth)"), "CRITICAL — auth-critical PAM file",
+        match(pam_file, "pam_exec"),                                              "CRITICAL — pam_exec (arbitrary cmd exec)",
+        detection_type=="PAM_MODULE_COMPILATION",                                 "CRITICAL — custom PAM module compiled",
+        1==1,                                                                     "HIGH — PAM configuration change"
+      )
+    | eval mitre_technique="T1556.003"
+    | eval mitre_tactic="Persistence"
+    | eval alert_name="PAM Backdoor"
+    | table _time, host, user, pam_file, modifier, detection_type, risk_level,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "PAM BACKDOOR — $pam_file$ modified on $host$ by $user$ ($risk_level$)"
+        rule_description: >
+          PAM configuration or module was modified on $host$ by $user$. File: $pam_file$.
+          Detection: $detection_type$. Risk: $risk_level$. PAM backdoors can capture ALL
+          passwords or allow bypass authentication. Verify the change against package
+          management (rpm -V pam) and check for pam_exec.so or custom .so modules.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 95
+        risk_message: "PAM modification — $risk_level$ — T1556.003"
+  false_positives:
+    - description: >
+        authselect or authconfig may modify PAM files during authentication
+        configuration changes. These are expected on new deployments.
+      tuning: "Exclude events where modifier is authselect or authconfig."
+    - description: >
+        PAM package updates via dnf/yum modify PAM shared objects legitimately.
+      tuning: "Exclude events where modifier is rpm, dnf, or yum."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: LD_PRELOAD / Dynamic Linker Hijacking (T1574.006)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  /etc/ld.so.preload forces every dynamically linked executable to load a
+#  specified shared library BEFORE any other. This is used for userland
+#  rootkits (Jynx, Azazel) that intercept libc functions to hide processes,
+#  files, and network connections. Any modification to ld.so.preload on a
+#  production system is near-certain evidence of compromise.
+#
+#  Confidence  : VERY HIGH (95)
+#  Severity    : CRITICAL
+
+rule_5_ld_preload_hijacking:
+  name: "Persistence — LD_PRELOAD or Dynamic Linker Hijacking (T1574.006)"
+  description: >
+    Detects modification of /etc/ld.so.preload (global library preloading),
+    processes launched with LD_PRELOAD environment variable pointing to
+    suspicious paths (/tmp, /dev/shm, /var/tmp, non-standard directories),
+    and modifications to /etc/ld.so.conf.d/ (ldconfig cache poisoning).
+    ld.so.preload modification is the primary mechanism for userland rootkits
+    (Jynx, Azazel, libprocesshider) that intercept libc calls to hide
+    malicious activity. This is CRITICAL — it indicates rootkit-level compromise.
+  mitre:
+    tactic: "Persistence"
+    technique: T1574.006
+    technique_name: "Hijack Execution Flow: Dynamic Linker Hijacking"
+    related_techniques:
+      - "T1014: Rootkit (LD_PRELOAD rootkits)"
+      - "T1574.001: Hijack Execution Flow: DLL Search Order Hijacking (Linux equivalent)"
+  severity: critical
+  confidence: 95
+  risk_score: 95
+  kill_chain_phase: "Persistence"
+  data_sources:
+    - "Linux Audit Log — watch on /etc/ld.so.preload (key=preload_mod)"
+    - "Linux Audit Log — EXECVE with LD_PRELOAD in environment"
+
+  search: |
+    ``` Detect writes to /etc/ld.so.preload ```
+    index=linux sourcetype=linux:audit key=preload_mod
+    | eval file_path=coalesce(name, "unknown")
+    | eval writer=coalesce(exe, "unknown")
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    | eval detection_type="LD_PRELOAD_FILE_MODIFIED"
+    | append
+        [``` Detect LD_PRELOAD in process environment ```
+         search index=linux sourcetype=linux:audit type=EXECVE
+         | eval cmdline=coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+         | where match(cmdline, "LD_PRELOAD=")
+         ``` Flag suspicious preload paths ```
+         | where match(cmdline, "LD_PRELOAD=(/tmp/|/dev/shm/|/var/tmp/|/home/)")
+         | eval file_path=cmdline
+         | eval writer=exe
+         | eval user=coalesce(auid, "unknown")
+         | eval host=coalesce(hostname, "unknown")
+         | eval detection_type="LD_PRELOAD_ENV_INJECTION"]
+    | append
+        [``` Detect ldconfig cache poisoning ```
+         search index=linux sourcetype=linux:audit key=preload_mod
+             name="/etc/ld.so.conf.d/*"
+         | where NOT match(exe, "(rpm|dnf|yum|ldconfig)")
+         | eval file_path=coalesce(name, "unknown")
+         | eval writer=coalesce(exe, "unknown")
+         | eval user=coalesce(auid, "unknown")
+         | eval host=coalesce(hostname, "unknown")
+         | eval detection_type="LDCONFIG_CACHE_POISONING"]
+    | eval mitre_technique="T1574.006"
+    | eval mitre_tactic="Persistence"
+    | eval alert_name="LD_PRELOAD Hijacking"
+    | table _time, host, user, detection_type, file_path, writer,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "LD_PRELOAD HIJACK — $detection_type$ on $host$ by $user$"
+        rule_description: >
+          Dynamic linker hijacking detected on $host$ by $user$. Type: $detection_type$.
+          Path: $file_path$. Writer: $writer$. ld.so.preload modification is the primary
+          mechanism for userland rootkits. Isolate host, check /etc/ld.so.preload content,
+          verify all shared libraries with rpm -Va, and scan for rootkit indicators.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 95
+        risk_message: "LD_PRELOAD hijacking — $detection_type$ — T1574.006"
+  false_positives:
+    - description: >
+        Some performance profiling tools (LD_PRELOAD with jemalloc, tcmalloc) may
+        legitimately use LD_PRELOAD. These use known library paths.
+      tuning: "Exclude known performance libraries in standard paths (/usr/lib64/)."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Shell Profile and RC File Backdoors (T1546.004)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Modifications to shell profile files (.bashrc, .bash_profile, /etc/profile,
+#  /etc/profile.d/) allow attackers to execute commands every time a user
+#  opens a shell or logs in. Common payloads: reverse shells, download-and-
+#  execute, environment variable manipulation for credential capture.
+#
+#  Confidence  : MEDIUM (75)
+#  Severity    : MEDIUM → HIGH
+
+rule_6_shell_profile_backdoors:
+  name: "Persistence — Shell Profile or RC File Modified (T1546.004)"
+  description: >
+    Detects modifications to shell initialization files that execute on every
+    user login or shell session: /etc/profile, /etc/profile.d/*, /etc/bashrc,
+    ~/.bashrc, ~/.bash_profile, ~/.profile, and /etc/environment. Attackers
+    add malicious commands to these files to maintain persistence — commands
+    execute transparently every time the user opens a shell. The rule flags
+    modifications by non-package-manager processes and escalates severity
+    when the modifying process suggests script-based injection.
+  mitre:
+    tactic: "Persistence"
+    technique: T1546.004
+    technique_name: "Event Triggered Execution: Unix Shell Configuration Modification"
+    related_techniques:
+      - "T1059.004: Unix Shell"
+      - "T1547.001: Boot or Logon Autostart Execution"
+  severity: medium
+  confidence: 75
+  risk_score: 65
+  kill_chain_phase: "Persistence"
+  data_sources:
+    - "Linux Audit Log — watch on shell profile files (key=shell_profile)"
+
+  search: |
+    index=linux sourcetype=linux:audit key=shell_profile
+    | eval profile_file=coalesce(name, "unknown")
+    | eval modifier=coalesce(exe, "unknown")
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    ``` Filter out package manager and config management ```
+    | where NOT match(modifier, "(rpm|dnf|yum|ansible|puppet|chef|salt)")
+    ``` Determine risk based on file and modifier ```
+    | eval risk_indicator=case(
+        match(profile_file, "/etc/profile$"),           "SYSTEM_PROFILE (all users affected)",
+        match(profile_file, "/etc/profile.d/"),          "PROFILE_DROP_IN (all users affected)",
+        match(profile_file, "/etc/bashrc"),              "SYSTEM_BASHRC (all users affected)",
+        match(profile_file, "/etc/environment"),         "ENVIRONMENT_FILE (all users affected)",
+        match(profile_file, "/root/"),                   "ROOT_PROFILE (root shell backdoor)",
+        1==1,                                            "USER_PROFILE (single user)"
+      )
+    | eval severity=case(
+        match(risk_indicator, "SYSTEM_|ENVIRONMENT_"), "HIGH",
+        match(risk_indicator, "ROOT_"),                "HIGH",
+        1==1,                                          "MEDIUM"
+      )
+    | eval mitre_technique="T1546.004"
+    | eval mitre_tactic="Persistence"
+    | eval alert_name="Shell Profile Backdoor"
+    | table _time, host, user, profile_file, modifier, risk_indicator,
+            severity, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Shell Profile Modified — $profile_file$ on $host$ by $user$"
+        rule_description: >
+          Shell profile $profile_file$ was modified on $host$ by $user$ using
+          $modifier$. Scope: $risk_indicator$. Review the file content for reverse
+          shells, download commands, or environment variable manipulation. System-wide
+          profiles affect ALL users on the system.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 65
+        risk_message: "Shell profile modification — $risk_indicator$ — T1546.004"
+  false_positives:
+    - description: >
+        Administrators customizing shell prompts, aliases, or environment variables
+        may modify these files legitimately.
+      tuning: "Correlate with SSH session and maintenance window data to reduce noise."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: At Job Persistence (T1053.002)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The at command schedules one-time tasks. While less common than cron,
+#  attackers use at for timed persistence — scheduling a reverse shell or
+#  callback at a future time. At jobs are stored in /var/spool/at/.
+#
+#  Confidence  : HIGH (85)
+#  Severity    : MEDIUM
+
+rule_7_at_job_persistence:
+  name: "Persistence — At Job Created (T1053.002)"
+  description: >
+    Detects creation of at/batch jobs via the at command or direct writes to
+    /var/spool/at/. At jobs schedule one-time command execution at a specified
+    future time. Attackers use this for delayed persistence — scheduling reverse
+    shells, beacon callbacks, or payload downloads at specific times to evade
+    real-time monitoring. At is less monitored than cron, making it an attractive
+    option for sophisticated attackers.
+  mitre:
+    tactic: "Persistence"
+    technique: T1053.002
+    technique_name: "Scheduled Task/Job: At"
+    related_techniques:
+      - "T1053.003: Cron (related scheduling mechanism)"
+  severity: medium
+  confidence: 85
+  risk_score: 60
+  kill_chain_phase: "Persistence"
+  data_sources:
+    - "Linux Audit Log — EXECVE for at/batch commands"
+    - "Linux Audit Log — watch on /var/spool/at/"
+
+  search: |
+    index=linux sourcetype=linux:audit
+        (type=EXECVE (comm="at" OR comm="batch" OR comm="atq" OR comm="atrm"))
+        OR (type=PATH name="/var/spool/at/*")
+    | eval cmdline=coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    ``` Distinguish at creation from management ```
+    | eval action=case(
+        match(cmdline, "^at\s"),    "AT_JOB_CREATED",
+        match(cmdline, "batch"),     "BATCH_JOB_CREATED",
+        match(cmdline, "atq"),       "AT_QUEUE_LISTED",
+        match(cmdline, "atrm"),      "AT_JOB_REMOVED",
+        1==1,                        "AT_SPOOL_WRITE"
+      )
+    | where action IN ("AT_JOB_CREATED", "BATCH_JOB_CREATED", "AT_SPOOL_WRITE")
+    | eval mitre_technique="T1053.002"
+    | eval mitre_tactic="Persistence"
+    | eval alert_name="At Job Persistence"
+    | table _time, host, user, action, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "At Job Created — $action$ on $host$ by $user$"
+        rule_description: >
+          An at/batch job was created on $host$ by $user$. Action: $action$. Command:
+          $cmdline$. Review the at queue (atq) and job content to check for reverse
+          shells, download patterns, or beacon callbacks.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 60
+        risk_message: "At job persistence — $action$ — T1053.002"
+  false_positives:
+    - description: >
+        Some backup and maintenance scripts use at for one-time scheduling.
+        These are typically run by known service accounts.
+      tuning: "Exclude known backup service accounts."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: Init Script and rc.local Modification (T1037.004)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  /etc/rc.local and /etc/init.d/ scripts execute at boot. While systemd has
+#  largely replaced SysVinit, rc.local is still supported on RHEL for backward
+#  compatibility and attackers target it specifically because it's less
+#  monitored than systemd.
+#
+#  Confidence  : HIGH (85)
+#  Severity    : HIGH
+
+rule_8_init_script_modification:
+  name: "Persistence — Init Script or rc.local Modified (T1037.004)"
+  description: >
+    Detects writes to /etc/rc.local, /etc/rc.d/rc.local, and /etc/init.d/*
+    init scripts. While systemd is the standard init system on RHEL 7+,
+    rc.local and SysVinit scripts are still supported and execute at boot.
+    Attackers target these because they persist across reboots and are often
+    overlooked during incident response. Also detects chmod +x applied to
+    rc.local (enabling it, as it must be executable to run at boot).
+  mitre:
+    tactic: "Persistence"
+    technique: T1037.004
+    technique_name: "Boot or Logon Initialization Scripts: RC Scripts"
+    related_techniques:
+      - "T1543.002: Systemd Service (modern equivalent)"
+  severity: high
+  confidence: 85
+  risk_score: 78
+  kill_chain_phase: "Persistence"
+  data_sources:
+    - "Linux Audit Log — watch on /etc/rc.local and /etc/init.d/ (key=rc_mod, init_mod)"
+
+  search: |
+    index=linux sourcetype=linux:audit (key=rc_mod OR key=init_mod)
+    | eval init_file=coalesce(name, "unknown")
+    | eval modifier=coalesce(exe, "unknown")
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    ``` Filter out package manager operations ```
+    | where NOT match(modifier, "(rpm|dnf|yum|chkconfig|systemctl)")
+    | eval risk_level=case(
+        match(init_file, "rc.local"),       "RC_LOCAL (boot persistence)",
+        match(init_file, "/etc/init.d/"),   "INIT_SCRIPT (SysV service)",
+        1==1,                               "OTHER_INIT"
+      )
+    | eval mitre_technique="T1037.004"
+    | eval mitre_tactic="Persistence"
+    | eval alert_name="Init Script Persistence"
+    | table _time, host, user, init_file, modifier, risk_level,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Init Script Modified — $init_file$ on $host$ by $user$"
+        rule_description: >
+          Init script $init_file$ was modified on $host$ by $user$ using $modifier$.
+          Risk: $risk_level$. Review the script content for reverse shells, download
+          commands, or persistence payloads. rc.local executes at every boot as root.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 78
+        risk_message: "Init script modification — $risk_level$ — T1037.004"
+  false_positives:
+    - description: >
+        Some legacy applications may still use SysVinit scripts on RHEL systems
+        that were upgraded from RHEL 6. These should have change records.
+      tuning: "Maintain a list of expected init scripts and exclude known applications."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 9: Kernel Module Persistence — Rootkit Loading (T1547.006)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Kernel module loading is the mechanism for Linux kernel rootkits. Attackers
+#  load custom .ko files via insmod/modprobe to hide processes, files, and
+#  network connections at the kernel level. Modules from /tmp, /dev/shm, or
+#  /home are almost certainly malicious. Modules loaded outside of package
+#  management warrant immediate investigation.
+#
+#  Confidence  : VERY HIGH (93)
+#  Severity    : CRITICAL
+
+rule_9_kernel_module_persistence:
+  name: "Persistence — Suspicious Kernel Module Loaded (T1547.006)"
+  description: >
+    Detects kernel module loading via insmod/modprobe and writes to module
+    auto-load configuration (/etc/modules-load.d/, /etc/modprobe.d/). Kernel
+    modules execute in ring 0 with full system access — malicious modules are
+    effectively rootkits. The rule flags modules loaded from non-standard paths
+    (/tmp, /dev/shm, /home, /var/tmp), unsigned modules, and modules loaded
+    by non-root/non-package-manager processes. Also detects configuration of
+    modules for auto-load at boot.
+  mitre:
+    tactic: "Persistence"
+    technique: T1547.006
+    technique_name: "Boot or Logon Autostart Execution: Kernel Modules and Extensions"
+    related_techniques:
+      - "T1014: Rootkit (kernel module rootkits)"
+      - "T1068: Exploitation for Privilege Escalation"
+  severity: critical
+  confidence: 93
+  risk_score: 95
+  kill_chain_phase: "Persistence"
+  data_sources:
+    - "Linux Audit Log — init_module/finit_module syscall (key=mod_load)"
+    - "Linux Audit Log — EXECVE for insmod/modprobe"
+    - "Linux Audit Log — watch on /etc/modules-load.d/ (key=module_mod)"
+
+  search: |
+    ``` Detect kernel module loading ```
+    index=linux sourcetype=linux:audit
+        ((type=SYSCALL (syscall=init_module OR syscall=finit_module))
+         OR (type=EXECVE (comm="insmod" OR comm="modprobe")))
+    | eval cmdline=coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    | eval loader=coalesce(exe, comm, "unknown")
+    ``` Flag modules from suspicious paths ```
+    | eval suspicious_path=if(match(cmdline, "(/tmp/|/dev/shm/|/var/tmp/|/home/|/root/)"), "YES", "NO")
+    ``` Flag non-package-manager module loads ```
+    | eval non_pkg_mgr=if(NOT match(loader, "(rpm|dnf|yum|dracut|depmod|systemd)"), "YES", "NO")
+    | where suspicious_path="YES" OR non_pkg_mgr="YES"
+    | append
+        [``` Detect module auto-load configuration ```
+         search index=linux sourcetype=linux:audit key=module_mod
+         | where NOT match(exe, "(rpm|dnf|yum)")
+         | eval cmdline="AUTO_LOAD_CONFIG: ".coalesce(name, "unknown")
+         | eval user=coalesce(auid, "unknown")
+         | eval host=coalesce(hostname, "unknown")
+         | eval loader=coalesce(exe, "unknown")
+         | eval suspicious_path="N/A"
+         | eval non_pkg_mgr="YES"]
+    | eval risk_level=case(
+        suspicious_path="YES",               "CRITICAL — module from temp directory",
+        match(cmdline, "AUTO_LOAD_CONFIG"),   "HIGH — auto-load configuration modified",
+        1==1,                                "HIGH — non-standard module load"
+      )
+    | eval mitre_technique="T1547.006"
+    | eval mitre_tactic="Persistence"
+    | eval alert_name="Kernel Module Persistence"
+    | table _time, host, user, loader, cmdline, suspicious_path,
+            risk_level, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "KERNEL MODULE — $risk_level$ on $host$ by $user$"
+        rule_description: >
+          A kernel module was loaded on $host$ by $user$. Loader: $loader$. Command:
+          $cmdline$. From temp path: $suspicious_path$. Risk: $risk_level$. Kernel
+          modules have unrestricted system access. Verify the module against rpm -V,
+          check for known rootkit signatures (diamorphine, reptile, suterusu), and
+          examine lsmod output for hidden modules.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 95
+        risk_message: "Kernel module load — $risk_level$ — T1547.006"
+  false_positives:
+    - description: >
+        Package installations and kernel updates load modules via modprobe as part
+        of normal operations. These are run by rpm/dnf/dracut.
+      tuning: "Excluded by the package manager filter in the query."
+    - description: >
+        Hardware driver loading at boot (via dracut initramfs) generates module load
+        events. These load from /lib/modules/ via systemd-modules-load.
+      tuning: "Excluded by the systemd/dracut exclusion in the loader filter."
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  inv_1_cron_job_contents:
+    name: "List All Cron Jobs on Suspected Host"
+    description: >
+      Retrieves all cron-related audit events on the target host in the last
+      24 hours to show the full timeline of cron modifications.
+    search: |
+      index=linux sourcetype=linux:audit key=cron_mod hostname="$target_host$"
+          earliest=-24h
+      | stats values(name) as files, values(exe) as modifiers, values(auid) as users,
+              count by type
+      | table type, files, modifiers, users, count
+
+  inv_2_new_systemd_services:
+    name: "List New Systemd Services Created in Last 7 Days"
+    description: >
+      Shows all .service files created or modified on the target host in the
+      last 7 days for baseline comparison.
+    search: |
+      index=linux sourcetype=linux:audit key=systemd_mod hostname="$target_host$"
+          earliest=-7d
+      | eval service_file=name
+      | stats earliest(_time) as first_seen, latest(_time) as last_modified,
+              values(exe) as creator, values(auid) as user by service_file
+      | sort - first_seen
+      | table first_seen, service_file, creator, user, last_modified
+
+  inv_3_ssh_key_inventory:
+    name: "SSH Authorized Keys Modification History"
+    description: >
+      Shows all authorized_keys modifications on the host in the last 30 days.
+    search: |
+      index=linux (sourcetype=linux:audit type=PATH name="*authorized_keys*")
+          hostname="$target_host$" earliest=-30d
+      | eval key_file=name
+      | stats count, values(exe) as writer, values(auid) as user,
+              min(_time) as first, max(_time) as last by key_file
+      | table key_file, writer, user, count, first, last
+
+  inv_4_pam_file_integrity:
+    name: "PAM Configuration File Changes on Host"
+    description: >
+      Lists all PAM-related file modifications in the last 7 days.
+    search: |
+      index=linux sourcetype=linux:audit key=pam_mod hostname="$target_host$"
+          earliest=-7d
+      | stats count, values(exe) as modifier, values(auid) as user,
+              min(_time) as first, max(_time) as last by name
+      | sort - last
+      | table name, modifier, user, count, first, last
+
+  inv_5_loaded_kernel_modules:
+    name: "Kernel Modules Loaded on Host in Last 24 Hours"
+    description: >
+      Lists all kernel module load events on the target host.
+    search: |
+      index=linux sourcetype=linux:audit type=SYSCALL
+          (syscall=init_module OR syscall=finit_module)
+          hostname="$target_host$" earliest=-24h
+      | eval cmdline=comm." ".coalesce(a0,"")." ".coalesce(a1,"")
+      | stats count, values(auid) as user, min(_time) as first by cmdline, exe
+      | sort - first
+      | table first, cmdline, exe, user, count
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+incident_response_playbook:
+  name: "RHEL Persistence — Incident Response Playbook"
+  description: >
+    Step-by-step response procedure when persistence mechanisms are detected
+    on a RHEL system.
+
+  phase_1_detection_and_triage:
+    - step: "Identify the persistence mechanism: cron, systemd, SSH key, PAM, LD_PRELOAD, kernel module"
+    - step: "Determine severity: CRITICAL (PAM, LD_PRELOAD, kernel module), HIGH (cron, systemd, SSH key, rc.local)"
+    - step: "Verify the alert against change management records — was this an authorized change?"
+    - step: "Identify the user who made the change and their session history"
+    - step: "Check if the persistence mechanism is already active (cron running, service enabled, key in use)"
+
+  phase_2_containment:
+    - step: "DO NOT immediately remove persistence — the attacker may have backup mechanisms"
+    - step: "Capture the full content of the persistence artifact before removal"
+    - step: "Lock the compromised user account: passwd -l <username>"
+    - step: "If kernel module: DO NOT reboot — the module may be harder to analyze after reload"
+    - step: "Network-isolate the host if PAM or LD_PRELOAD compromise is confirmed"
+
+  phase_3_evidence_collection:
+    - step: "Collect the persistence artifact: crontab -l -u <user>, systemctl cat <service>, cat authorized_keys"
+    - step: "Collect auditd logs: ausearch -k cron_mod/systemd_mod/pam_mod/preload_mod --start <time>"
+    - step: "For PAM: copy the modified PAM file and compare against rpm -V pam output"
+    - step: "For LD_PRELOAD: capture /etc/ld.so.preload content and the preloaded .so file"
+    - step: "For kernel modules: lsmod, modinfo on suspicious modules, copy .ko file for analysis"
+
+  phase_4_eradication:
+    - step: "Remove malicious cron entries: crontab -r -u <user> or delete from /etc/cron.d/"
+    - step: "Remove malicious systemd services: systemctl disable <service> && rm <service_file> && systemctl daemon-reload"
+    - step: "Remove unauthorized SSH keys from authorized_keys files"
+    - step: "Restore PAM files from known-good backup or reinstall: yum reinstall pam"
+    - step: "Clear /etc/ld.so.preload and remove malicious .so files"
+    - step: "Unload malicious kernel modules: rmmod <module> and remove from /etc/modules-load.d/"
+    - step: "Verify package integrity across the system: rpm -Va"
+
+  phase_5_recovery:
+    - step: "Rotate all credentials on the affected host"
+    - step: "Rotate SSH keys — regenerate keypairs for all accounts"
+    - step: "Deploy enhanced auditd rules for ongoing monitoring"
+    - step: "Verify no additional persistence mechanisms exist: check all 9 vectors covered by these rules"
+    - step: "Monitor the host for 48-72 hours post-remediation for re-compromise indicators"

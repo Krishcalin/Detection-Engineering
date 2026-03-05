@@ -1,0 +1,683 @@
+# ==============================================================================
+#  RHEL Data Exfiltration Attack Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detection rules for data staging and exfiltration on RHEL
+#                Linux. Covers archive creation for staging, DNS tunneling,
+#                HTTP/HTTPS exfiltration, SSH/SCP exfiltration, encrypted
+#                data staging, automated collection, and alternative protocol
+#                exfiltration (netcat, ICMP, FTP, /dev/tcp).
+#
+#  MITRE ATT&CK: T1560.001 - Archive Collected Data: Archive via Utility
+#                 T1048.003 - Exfiltration Over Alternative Protocol: DNS
+#                 T1048.002 - Exfiltration Over Alternative Protocol: HTTP
+#                 T1048     - Exfiltration Over Alternative Protocol
+#                 T1132.001 - Data Encoding: Standard Encoding
+#                 T1119     - Automated Collection
+#  Kill Chain   : Collection -> Exfiltration
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-05
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Deploy auditd EXECVE logging on ALL RHEL hosts.
+#  2. Deploy Sysmon for Linux with Process Creation (Event 1) and
+#     Network Connection (Event 3) events.
+#  3. Forward DNS query logs for DNS exfil detection.
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: Data Staging via Archive Creation (T1560.001)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_archive_staging:
+  name: "Exfiltration — Data Staging via Archive Creation in Temp Directory (T1560.001)"
+  description: >
+    Detects tar/zip/gzip/bzip2/xz creating archives in staging directories
+    (/tmp, /dev/shm, /var/tmp). Flags archiving of sensitive directories
+    (/etc/, /home/, /root/, /var/lib/, /var/log/) and root filesystem archiving
+    (tar -C /). Archive creation in temp directories is a common pre-exfiltration
+    staging technique.
+  mitre:
+    tactic: "Exfiltration"
+    technique: T1560.001
+    technique_name: "Archive Collected Data: Archive via Utility"
+    related_techniques:
+      - "T1074.001: Data Staged: Local Data Staging"
+      - "T1048: Exfiltration Over Alternative Protocol"
+  severity: high
+  confidence: 82
+  risk_score: 78
+  kill_chain_phase: "Exfiltration"
+  data_sources:
+    - "Linux Audit Log — EXECVE for tar, zip, gzip, bzip2, xz"
+
+  search: |
+    index=linux sourcetype=linux:audit type=EXECVE
+        (comm="tar" OR comm="zip" OR comm="gzip" OR comm="bzip2" OR comm="xz" OR comm="7z")
+    | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,"")." ".coalesce(a5,"")
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect archives created in staging directories ```
+    | where match(cmdline_lower, "(/tmp/|/dev/shm/|/var/tmp/)")
+    ``` Detect archiving sensitive directories ```
+        OR match(cmdline_lower, "(tar|zip).*(c|--create).*/etc/|/home/|/root/|/var/lib/|/var/log/")
+    ``` Detect root filesystem archiving ```
+        OR match(cmdline_lower, "tar.*-C\s+/\s")
+    | eval staging_risk=case(
+        match(cmdline_lower, "/etc/shadow|/etc/passwd"),    "CREDENTIAL_ARCHIVE — critical",
+        match(cmdline_lower, "/root/|/home/"),              "USER_DATA_ARCHIVE — high",
+        match(cmdline_lower, "/var/log/"),                  "LOG_ARCHIVE — evidence collection",
+        match(cmdline_lower, "/etc/"),                      "CONFIG_ARCHIVE — system configs",
+        match(cmdline_lower, "-C\\s+/"),                    "ROOT_FS_ARCHIVE — bulk collection",
+        match(cmdline_lower, "/dev/shm/"),                  "MEMORY_STAGING — volatile storage",
+        1==1,                                               "TEMP_DIR_ARCHIVE"
+      )
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    | eval mitre_technique="T1560.001"
+    | eval mitre_tactic="Exfiltration"
+    | eval alert_name="Data Staging Archive"
+    | table _time, host, user, staging_risk, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Data Staging — $staging_risk$ on $host$ by $user$"
+        rule_description: >
+          Archive creation for data staging on $host$ by $user$. Risk: $staging_risk$.
+          Command: $cmdline$. Check for subsequent exfiltration: SCP, curl upload,
+          DNS tunneling, or netcat transfers from this host.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 78
+        risk_message: "Data staging — $staging_risk$ — T1560.001"
+  false_positives:
+    - description: "Backup scripts create archives routinely."
+      tuning: "Exclude known backup service accounts and scheduled backup times."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: DNS Tunneling / Exfiltration (T1048.003)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_dns_exfiltration:
+  name: "Exfiltration — DNS Tunneling or Data Exfiltration Detected (T1048.003)"
+  description: >
+    Detects DNS-based data exfiltration: known DNS tunnel tools (dnscat2,
+    iodine, dns2tcp, dnstt), high-volume TXT record queries from a single
+    host, and nslookup/dig with base64-encoded or unusually long subdomain
+    queries (>50 characters indicating data encoding in DNS queries).
+  mitre:
+    tactic: "Exfiltration"
+    technique: T1048.003
+    technique_name: "Exfiltration Over Alternative Protocol: Exfiltration Over Unencrypted Non-C2 Protocol"
+    related_techniques:
+      - "T1071.004: Application Layer Protocol: DNS"
+      - "T1572: Protocol Tunneling"
+  severity: high
+  confidence: 85
+  risk_score: 82
+  kill_chain_phase: "Exfiltration"
+  data_sources:
+    - "Linux Audit Log — EXECVE for DNS tools"
+    - "DNS query logs — high-volume or long queries"
+
+  search: |
+    ``` Detect known DNS tunnel tools ```
+    index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,""))
+    | eval cmdline_lower=lower(cmdline)
+    | where match(cmdline_lower, "(dnscat|iodine|dns2tcp|dnstt|dnschef|dnsteal)")
+    ``` Detect base64-encoded DNS queries ```
+        OR match(cmdline_lower, "(nslookup|dig|host)\s+[A-Za-z0-9+/=]{50,}")
+    ``` Detect TXT record queries (data exfil channel) ```
+        OR match(cmdline_lower, "dig.*TXT")
+    | eval dns_exfil_type=case(
+        match(cmdline_lower, "dnscat"),     "DNSCAT2 — DNS C2 tunnel",
+        match(cmdline_lower, "iodine"),     "IODINE — DNS VPN tunnel",
+        match(cmdline_lower, "dns2tcp"),    "DNS2TCP — DNS TCP tunnel",
+        match(cmdline_lower, "[A-Za-z0-9+/=]{50,}"), "LONG_QUERY — encoded data in DNS",
+        match(cmdline_lower, "TXT"),        "TXT_QUERY — data exfil channel",
+        1==1,                               "DNS_TUNNEL_TOOL"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1048.003"
+    | eval mitre_tactic="Exfiltration"
+    | eval alert_name="DNS Exfiltration"
+    | table _time, host, user, dns_exfil_type, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "DNS EXFIL — $dns_exfil_type$ on $host$ by $user$"
+        rule_description: >
+          DNS tunneling/exfiltration detected on $host$ by $user$. Type:
+          $dns_exfil_type$. Command: $cmdline$. DNS exfiltration bypasses most
+          firewalls. Capture DNS query logs and block the tunnel domain.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 82
+        risk_message: "DNS exfiltration — $dns_exfil_type$ — T1048.003"
+  false_positives:
+    - description: "DNS TXT queries are used for SPF/DKIM verification."
+      tuning: "Exclude known DNS administration and mail server accounts."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: HTTP/HTTPS Data Exfiltration (T1048.002)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_http_exfiltration:
+  name: "Exfiltration — HTTP/HTTPS Data Upload Detected (T1048.002)"
+  description: >
+    Detects curl/wget POST requests for file uploads: curl -F file=@, curl
+    --upload-file, curl -T, and connections to known paste sites (pastebin,
+    paste.ee, hastebin, transfer.sh, file.io). Also detects python/perl
+    HTTP upload scripts.
+  mitre:
+    tactic: "Exfiltration"
+    technique: T1048.002
+    technique_name: "Exfiltration Over Alternative Protocol: Exfiltration Over Asymmetric Encrypted Non-C2 Protocol"
+    related_techniques:
+      - "T1567: Exfiltration Over Web Service"
+  severity: high
+  confidence: 85
+  risk_score: 80
+  kill_chain_phase: "Exfiltration"
+  data_sources:
+    - "Linux Audit Log — EXECVE for curl, wget with upload patterns"
+
+  search: |
+    index=linux sourcetype=linux:audit type=EXECVE (comm="curl" OR comm="wget")
+    | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,"")
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect file upload patterns ```
+    | where match(cmdline_lower, "curl\s+.*(-F\s+file=@|--upload-file|-T\s)")
+        OR match(cmdline_lower, "curl\s+.*-X\s+POST\s+.*-d\s+@")
+        OR match(cmdline_lower, "curl\s+.*--data-binary\s+@")
+    ``` Detect paste/file sharing sites ```
+        OR match(cmdline_lower, "(pastebin|paste\.ee|hastebin|transfer\.sh|file\.io|0x0\.st|tmpfiles|catbox)")
+    ``` Detect wget POST uploads ```
+        OR match(cmdline_lower, "wget\s+.*--post-file")
+    | eval exfil_type=case(
+        match(cmdline_lower, "(-F.*file=@|--upload-file|-T\\s)"), "FILE_UPLOAD",
+        match(cmdline_lower, "(pastebin|paste\\.ee|hastebin)"),    "PASTE_SITE_UPLOAD",
+        match(cmdline_lower, "(transfer\\.sh|file\\.io|0x0)"),    "FILE_SHARING_SERVICE",
+        match(cmdline_lower, "post-file"),                         "WGET_POST_UPLOAD",
+        match(cmdline_lower, "data-binary"),                       "BINARY_DATA_POST",
+        1==1,                                                      "HTTP_UPLOAD"
+      )
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    | eval mitre_technique="T1048.002"
+    | eval mitre_tactic="Exfiltration"
+    | eval alert_name="HTTP Exfiltration"
+    | table _time, host, user, exfil_type, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "HTTP EXFIL — $exfil_type$ from $host$ by $user$"
+        rule_description: >
+          HTTP-based data exfiltration on $host$ by $user$. Type: $exfil_type$.
+          Command: $cmdline$. Identify what data was uploaded and block the
+          destination. Check for staged archives that may have been uploaded.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 80
+        risk_message: "HTTP exfiltration — $exfil_type$ — T1048.002"
+  false_positives:
+    - description: "CI/CD pipelines may upload artifacts via curl."
+      tuning: "Exclude known CI/CD service accounts and authorized upload endpoints."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: SSH/SCP Exfiltration to External Hosts (T1048)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_ssh_exfiltration:
+  name: "Exfiltration — SCP/Rsync to External IP Address (T1048)"
+  description: >
+    Detects SCP/rsync transfers to non-RFC1918 (external) IP addresses,
+    indicating data exfiltration via SSH. Also detects large-volume transfers
+    and transfers occurring outside business hours.
+  mitre:
+    tactic: "Exfiltration"
+    technique: T1048
+    technique_name: "Exfiltration Over Alternative Protocol"
+    related_techniques:
+      - "T1021.004: Remote Services: SSH"
+  severity: high
+  confidence: 82
+  risk_score: 78
+  kill_chain_phase: "Exfiltration"
+  data_sources:
+    - "Linux Audit Log — EXECVE for scp, rsync"
+    - "Sysmon for Linux — Event 3 (Network Connection)"
+
+  search: |
+    index=linux sourcetype=linux:audit type=EXECVE (comm="scp" OR comm="rsync" OR comm="sftp")
+    | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,"")
+    ``` Extract destination from command ```
+    | rex field=cmdline "(?<dst_target>\S+@\S+:\S*)"
+    | rex field=dst_target "@(?<dst_host>[^:]+)"
+    ``` Filter for external (non-RFC1918) destinations ```
+    | where isnotnull(dst_host)
+    | where NOT match(dst_host, "^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|localhost)")
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    ``` Check for sensitive file transfers ```
+    | eval data_type=case(
+        match(cmdline, "(/etc/shadow|/etc/passwd|\.ssh/)"),  "CREDENTIAL_EXFIL",
+        match(cmdline, "\.(tar|zip|gz|bz2|xz|7z)"),         "ARCHIVE_EXFIL",
+        match(cmdline, "(/var/lib/|/var/log/|/home/)"),      "BULK_DATA_EXFIL",
+        1==1,                                                "FILE_EXFIL"
+      )
+    | eval mitre_technique="T1048"
+    | eval mitre_tactic="Exfiltration"
+    | eval alert_name="SSH Exfiltration"
+    | table _time, host, user, dst_host, data_type, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "SSH EXFIL — $data_type$ from $host$ to $dst_host$ by $user$"
+        rule_description: >
+          Data exfiltration via SCP/rsync from $host$ to external host $dst_host$
+          by $user$. Data type: $data_type$. Command: $cmdline$. Block the
+          destination and investigate what data was transferred.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 78
+        risk_message: "SSH exfiltration to $dst_host$ — $data_type$ — T1048"
+  false_positives:
+    - description: "Offsite backups via rsync to external backup servers."
+      tuning: "Exclude known backup destinations from the external IP filter."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Encrypted/Encoded Data Staging (T1132.001)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_encoded_staging:
+  name: "Exfiltration — Data Encoding or Encryption for Staging (T1132.001)"
+  description: >
+    Detects base64 encoding, hex encoding, and encryption of data files as
+    pre-exfiltration preparation: base64/openssl enc on files, xxd/od on
+    sensitive files, GPG encryption of data, and split command for chunked
+    exfiltration preparation.
+  mitre:
+    tactic: "Exfiltration"
+    technique: T1132.001
+    technique_name: "Data Encoding: Standard Encoding"
+    related_techniques:
+      - "T1560: Archive Collected Data"
+      - "T1027: Obfuscated Files or Information"
+  severity: medium
+  confidence: 75
+  risk_score: 62
+  kill_chain_phase: "Exfiltration"
+  data_sources:
+    - "Linux Audit Log — EXECVE for base64, openssl, xxd, gpg, split"
+
+  search: |
+    index=linux sourcetype=linux:audit type=EXECVE
+    | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect base64 encoding of files ```
+    | where match(cmdline_lower, "base64\s+(/etc/|/home/|/root/|/var/|/tmp/)")
+    ``` Detect openssl encryption ```
+        OR match(cmdline_lower, "openssl\s+enc\s+.*-in\s")
+    ``` Detect hex encoding ```
+        OR match(cmdline_lower, "(xxd|od)\s+.*(shadow|passwd|\.ssh|\.key|\.pem)")
+    ``` Detect GPG encryption ```
+        OR match(cmdline_lower, "gpg\s+(-c|--symmetric|--encrypt)\s+")
+    ``` Detect file splitting for chunked exfil ```
+        OR match(cmdline_lower, "split\s+.*(-b|--bytes)")
+    | eval encoding_type=case(
+        match(cmdline_lower, "base64"),   "BASE64_ENCODING",
+        match(cmdline_lower, "openssl"),  "OPENSSL_ENCRYPTION",
+        match(cmdline_lower, "xxd|od"),   "HEX_ENCODING",
+        match(cmdline_lower, "gpg"),      "GPG_ENCRYPTION",
+        match(cmdline_lower, "split"),    "FILE_SPLITTING (chunked exfil prep)",
+        1==1,                             "DATA_ENCODING"
+      )
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    | eval mitre_technique="T1132.001"
+    | eval mitre_tactic="Exfiltration"
+    | eval alert_name="Encoded Data Staging"
+    | table _time, host, user, encoding_type, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Data Encoding — $encoding_type$ on $host$ by $user$"
+        rule_description: >
+          Data encoding/encryption for staging on $host$ by $user$. Type:
+          $encoding_type$. Command: $cmdline$. This is likely pre-exfiltration
+          preparation. Watch for subsequent data transfer activity.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 62
+        risk_message: "Data encoding — $encoding_type$ — T1132.001"
+  false_positives:
+    - description: "GPG encryption is used for legitimate secure file transfer."
+      tuning: "Exclude known users who routinely encrypt files for authorized purposes."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Automated Data Collection (T1119)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_automated_collection:
+  name: "Exfiltration — Automated Bulk Data Collection (T1119)"
+  description: >
+    Detects automated data collection: find/locate piped to tar/cp for bulk
+    collection, scripted iteration over /home/* or /etc/*, database dumps
+    (mysqldump, pg_dump, mongodump) by non-DBA users, and log collection
+    (archiving /var/log/).
+  mitre:
+    tactic: "Collection"
+    technique: T1119
+    technique_name: "Automated Collection"
+    related_techniques:
+      - "T1005: Data from Local System"
+      - "T1560: Archive Collected Data"
+  severity: medium
+  confidence: 78
+  risk_score: 68
+  kill_chain_phase: "Collection"
+  data_sources:
+    - "Linux Audit Log — EXECVE for collection commands"
+
+  search: |
+    index=linux sourcetype=linux:audit type=EXECVE
+    | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,"")
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect database dumps ```
+    | where match(cmdline_lower, "(mysqldump|pg_dump|mongodump|redis-cli.*save|sqlite3.*\\.dump)")
+    ``` Detect bulk file collection ```
+        OR match(cmdline_lower, "find\s+.*\\|\s*(tar|cp|xargs)")
+        OR match(cmdline_lower, "for\s+.*in\s+/home/.*do")
+    ``` Detect log archiving ```
+        OR match(cmdline_lower, "(tar|zip).*(/var/log|/var/lib)")
+    ``` Detect credential database collection ```
+        OR match(cmdline_lower, "(cp|cat|tar).*/var/lib/sss/|/var/lib/mysql/|/var/lib/pgsql/")
+    | eval collection_type=case(
+        match(cmdline_lower, "mysqldump"),     "MYSQL_DUMP",
+        match(cmdline_lower, "pg_dump"),       "POSTGRES_DUMP",
+        match(cmdline_lower, "mongodump"),     "MONGODB_DUMP",
+        match(cmdline_lower, "find.*\\|.*tar"),"BULK_FILE_COLLECTION",
+        match(cmdline_lower, "/var/log"),       "LOG_COLLECTION",
+        match(cmdline_lower, "/var/lib/"),      "DATABASE_FILE_COLLECTION",
+        1==1,                                  "AUTOMATED_COLLECTION"
+      )
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    | eval severity=if(match(collection_type, "DUMP|DATABASE"), "HIGH", "MEDIUM")
+    | eval mitre_technique="T1119"
+    | eval mitre_tactic="Collection"
+    | eval alert_name="Automated Collection"
+    | table _time, host, user, collection_type, cmdline, severity,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Data Collection — $collection_type$ on $host$ by $user$"
+        rule_description: >
+          Automated data collection on $host$ by $user$. Type: $collection_type$.
+          Command: $cmdline$. Database dumps and bulk file collection indicate
+          data theft preparation. Check for subsequent exfiltration.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 68
+        risk_message: "Automated collection — $collection_type$ — T1119"
+  false_positives:
+    - description: "Scheduled database backups use mysqldump/pg_dump routinely."
+      tuning: "Exclude known DBA and backup service accounts."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: Exfiltration via Alternative Protocols (T1048)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_alternative_protocol_exfil:
+  name: "Exfiltration — Data Transfer via Netcat, ICMP, FTP, or /dev/tcp (T1048)"
+  description: >
+    Detects data exfiltration via non-standard protocols: netcat/ncat sending
+    data to external hosts, ICMP exfiltration (ping with large payloads or
+    patterns), FTP transfers to external hosts, and raw /dev/tcp or /dev/udp
+    socket exfiltration. Also detects known exfil tools: chisel, ligolo-ng,
+    and dnscat2.
+  mitre:
+    tactic: "Exfiltration"
+    technique: T1048
+    technique_name: "Exfiltration Over Alternative Protocol"
+    related_techniques:
+      - "T1572: Protocol Tunneling"
+      - "T1071.001: Application Layer Protocol: Web Protocols"
+  severity: high
+  confidence: 85
+  risk_score: 82
+  kill_chain_phase: "Exfiltration"
+  data_sources:
+    - "Linux Audit Log — EXECVE for nc, ping, ftp, /dev/tcp"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect netcat data transfer to external host ```
+    | where match(cmdline_lower, "(nc|ncat|netcat)\s+.*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+")
+    ``` Detect /dev/tcp raw socket exfil ```
+        OR match(cmdline_lower, "/dev/(tcp|udp)/[0-9]")
+    ``` Detect ICMP exfil (large ping) ```
+        OR match(cmdline_lower, "ping\s+.*(-s\s+[0-9]{4,}|-p\s)")
+    ``` Detect FTP to external host ```
+        OR match(cmdline_lower, "ftp\s+[0-9]+\\.[0-9]+")
+    ``` Detect exfiltration tools ```
+        OR match(cmdline_lower, "(chisel|ligolo|dnscat|ptunnel|icmpsh|hans)")
+    ``` Detect socat data transfer ```
+        OR match(cmdline_lower, "socat\s+.*tcp.*file:")
+    | eval exfil_protocol=case(
+        match(cmdline_lower, "(nc|ncat|netcat)"),   "NETCAT_TRANSFER",
+        match(cmdline_lower, "/dev/(tcp|udp)"),     "RAW_SOCKET_DEVTCP",
+        match(cmdline_lower, "ping.*(-s|-p)"),      "ICMP_EXFILTRATION",
+        match(cmdline_lower, "ftp"),                "FTP_TRANSFER",
+        match(cmdline_lower, "chisel"),             "CHISEL_TUNNEL",
+        match(cmdline_lower, "ligolo"),             "LIGOLO_TUNNEL",
+        match(cmdline_lower, "socat.*file"),        "SOCAT_FILE_TRANSFER",
+        match(cmdline_lower, "ptunnel|icmpsh|hans"),"ICMP_TUNNEL_TOOL",
+        1==1,                                       "ALTERNATIVE_PROTOCOL"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1048"
+    | eval mitre_tactic="Exfiltration"
+    | eval alert_name="Alternative Protocol Exfil"
+    | table _time, host, user, exfil_protocol, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "ALT PROTOCOL EXFIL — $exfil_protocol$ from $host$ by $user$"
+        rule_description: >
+          Data exfiltration via alternative protocol on $host$ by $user$. Protocol:
+          $exfil_protocol$. Command: $cmdline$. Alternative protocol exfiltration
+          bypasses standard HTTP/SSH monitoring. Block the destination and investigate
+          what data was transferred.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 82
+        risk_message: "Alternative protocol exfil — $exfil_protocol$ — T1048"
+  false_positives:
+    - description: "Network troubleshooting may use netcat for port testing."
+      tuning: "Distinguish between nc -z (port scan) and nc with data transfer."
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  inv_1_staged_files:
+    name: "Files Staged in Temp Directories on Host"
+    search: |
+      index=linux sourcetype=linux:audit type=EXECVE hostname="$target_host$"
+          (comm="tar" OR comm="zip" OR comm="cp" OR comm="mv") earliest=-24h
+      | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+      | where match(cmdline, "(/tmp/|/dev/shm/|/var/tmp/)")
+      | sort _time
+      | table _time, auid, cmdline
+
+  inv_2_outbound_transfers:
+    name: "All Outbound File Transfers from Host"
+    search: |
+      index=linux sourcetype=linux:audit type=EXECVE hostname="$target_host$"
+          (comm="scp" OR comm="rsync" OR comm="curl" OR comm="wget" OR comm="ftp"
+           OR comm="nc" OR comm="ncat") earliest=-24h
+      | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,"")
+      | sort _time
+      | table _time, auid, comm, cmdline
+
+  inv_3_network_connections:
+    name: "Outbound Network Connections from Host"
+    search: |
+      index=linux sourcetype=sysmon_linux EventCode=3
+          Computer="$target_host$" Initiated=true earliest=-24h
+      | where NOT match(DestinationIp, "^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)")
+      | stats count by DestinationIp, DestinationPort, Image, User
+      | sort - count
+      | table DestinationIp, DestinationPort, Image, User, count
+
+  inv_4_dns_queries:
+    name: "DNS Queries from Host"
+    search: |
+      index=linux sourcetype=linux:audit type=EXECVE hostname="$target_host$"
+          (comm="dig" OR comm="nslookup" OR comm="host") earliest=-24h
+      | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")
+      | sort _time
+      | table _time, auid, cmdline
+
+  inv_5_database_activity:
+    name: "Database Tool Usage on Host"
+    search: |
+      index=linux sourcetype=linux:audit type=EXECVE hostname="$target_host$"
+          (comm="mysqldump" OR comm="pg_dump" OR comm="mongodump" OR comm="mysql"
+           OR comm="psql" OR comm="mongo" OR comm="redis-cli" OR comm="sqlite3")
+          earliest=-24h
+      | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+      | sort _time
+      | table _time, auid, comm, cmdline
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+incident_response_playbook:
+  name: "RHEL Data Exfiltration — Incident Response Playbook"
+
+  phase_1_triage:
+    - step: "Identify the exfiltration channel: HTTP, DNS, SSH, netcat, ICMP, alternative"
+    - step: "Determine what data was staged: credentials, databases, configs, user data"
+    - step: "Identify the destination: external IP, paste site, DNS tunnel domain"
+
+  phase_2_containment:
+    - step: "Block the exfiltration destination at the firewall"
+    - step: "Kill active exfiltration processes"
+    - step: "If DNS tunnel: block the tunnel domain at DNS resolver level"
+    - step: "Remove staged files from /tmp, /dev/shm, /var/tmp"
+
+  phase_3_assessment:
+    - step: "Quantify the data loss: what data was transferred and how much?"
+    - step: "Check staged archives: tar -tzf to list contents without extracting"
+    - step: "Review database dump commands to identify which databases were dumped"
+    - step: "Check DNS query logs for data-bearing queries"
+    - step: "Notify data protection / privacy team if PII was exfiltrated"
+
+  phase_4_remediation:
+    - step: "Rotate all credentials that may have been in exfiltrated data"
+    - step: "Implement egress filtering: block outbound connections to unauthorized destinations"
+    - step: "Deploy DLP monitoring for sensitive file patterns"
+    - step: "Restrict outbound DNS to authorized resolvers only"
+    - step: "Restrict curl/wget/nc to authorized users via sudo policies"

@@ -1,0 +1,968 @@
+# ==============================================================================
+#  RHEL Privilege Escalation Attack Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for privilege escalation attacks on
+#                Red Hat Enterprise Linux (RHEL) systems. Covers sudo abuse,
+#                SUID/SGID binary exploitation, kernel exploits (DirtyPipe,
+#                PwnKit, Looney Tunables), Linux capabilities abuse, Polkit
+#                exploitation, container escapes, and cgroup namespace
+#                manipulation. These rules leverage auditd syscall logs,
+#                Sysmon for Linux, and syslog to detect both known exploit
+#                tools and behavioral patterns indicative of escalation.
+#
+#  MITRE ATT&CK: T1548.003 - Abuse Elevation Control: Sudo and Sudo Caching
+#                 T1548.001 - Abuse Elevation Control: Setuid and Setgid
+#                 T1068     - Exploitation for Privilege Escalation
+#                 T1611     - Escape to Host (Container Escape)
+#  Kill Chain   : Privilege Escalation
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : auditd (EXECVE, PATH, SYSCALL), Sysmon for Linux, syslog
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-05
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Deploy auditd with the following rules on ALL RHEL hosts:
+#     -a always,exit -F arch=b64 -S execve -k exec_log
+#     -a always,exit -F arch=b32 -S execve -k exec_log
+#     -w /etc/sudoers -p wa -k sudoers_mod
+#     -w /etc/sudoers.d/ -p wa -k sudoers_mod
+#     -a always,exit -F arch=b64 -S chmod,fchmod,fchmodat -k chmod_log
+#     -a always,exit -F arch=b64 -S setuid,setgid,setreuid,setregid -k setid_log
+#     -w /proc/sys/kernel/ -p w -k kernel_write
+#     -a always,exit -F arch=b64 -S init_module,finit_module -k mod_load
+#
+#  2. Install and configure Sysmon for Linux (SysmonForLinux) with process
+#     creation (Event 1), file creation (Event 11), and module load events.
+#
+#  3. Forward all audit and syslog data to Splunk:
+#     index=linux sourcetype=linux:audit
+#     index=linux sourcetype=syslog
+#     index=linux sourcetype=linux_secure
+#     index=linux sourcetype=sysmon_linux
+#
+#  4. Lookup tables:
+#     - linux_bastion_hosts.csv  (host, role, is_bastion)
+#     - linux_admin_accounts.csv (user, team, authorized_sudo)
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: Suspicious Sudo Command Execution (T1548.003)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects non-root users executing dangerous commands via sudo. A burst of
+#  privileged commands from a single user in a short window suggests post-
+#  compromise escalation activity — an attacker testing what sudo allows.
+#
+#  Key indicators: sudo to bash/sh/su, sudo passwd, sudo chmod 777,
+#  sudo useradd, sudo visudo, sudo editing shadow/passwd files.
+#
+#  Confidence  : HIGH (85)
+#  Severity    : HIGH
+
+rule_1_suspicious_sudo_execution:
+  name: "Privilege Escalation — Suspicious Sudo Command Burst (T1548.003)"
+  description: >
+    Detects a single non-root user executing 5 or more distinct dangerous commands
+    via sudo within a 5-minute window. The rule targets auditd EXECVE syscall logs
+    where euid=0 (effective root) but auid!=0 (originating user is non-root),
+    filtering for commands commonly abused during privilege escalation: spawning
+    shells (bash, sh, su), modifying credentials (passwd, useradd, usermod),
+    changing permissions (chmod 777, chown root), editing sensitive files
+    (visudo, vi /etc/shadow), and policy tools (pkexec). Machine-generated
+    sudo (e.g., Ansible become) is excluded via the linux_admin_accounts lookup.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: T1548.003
+    technique_name: "Abuse Elevation Control Mechanism: Sudo and Sudo Caching"
+    related_techniques:
+      - "T1078.003: Valid Accounts: Local Accounts (post-escalation)"
+      - "T1059.004: Command and Scripting Interpreter: Unix Shell"
+  severity: high
+  confidence: 85
+  risk_score: 80
+  kill_chain_phase: "Privilege Escalation"
+  data_sources:
+    - "Linux Audit Log — EXECVE syscall with euid=0, auid!=0"
+
+  search: |
+    index=linux sourcetype=linux:audit type=EXECVE
+    ``` Filter for non-root users executing as root ```
+    | join ses
+        [ search index=linux sourcetype=linux:audit type=SYSCALL
+          syscall=execve euid=0 auid!=0 auid!=4294967295
+          | fields ses, auid, uid, euid, exe, comm, hostname ]
+    ``` Extract the full command line from EXECVE a0..aN fields ```
+    | eval cmd=coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+    | eval cmd=lower(trim(cmd))
+    ``` Flag dangerous sudo commands ```
+    | where match(cmd, "(\/bin\/bash|\/bin\/sh|\/bin\/su\b|passwd|visudo|chmod\s+777|chown\s+root|useradd|usermod\s+-aG|\/etc\/shadow|\/etc\/passwd|pkexec)")
+    ``` Exclude authorized automation accounts ```
+    | lookup linux_admin_accounts.csv user as auid OUTPUT authorized_sudo
+    | where authorized_sudo!="yes" OR isnull(authorized_sudo)
+    ``` 5-minute aggregation window ```
+    | bin span=5m _time
+    | stats
+        dc(cmd)             as distinct_cmds,
+        count               as total_sudo_exec,
+        values(cmd)         as commands_run,
+        values(exe)         as executables,
+        min(_time)          as window_start,
+        max(_time)          as window_end
+        by _time, auid, hostname
+    ``` Threshold: 5+ distinct dangerous commands in 5 minutes ```
+    | where distinct_cmds >= 5
+    | eval mitre_technique="T1548.003"
+    | eval mitre_tactic="Privilege Escalation"
+    | eval alert_name="Suspicious Sudo Command Burst"
+    | sort - distinct_cmds
+    | table _time, hostname, auid, distinct_cmds, total_sudo_exec,
+            commands_run, executables, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "auid"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Sudo Abuse — $auid$ executed $distinct_cmds$ dangerous commands on $hostname$"
+        rule_description: >
+          User $auid$ ran $distinct_cmds$ distinct dangerous commands via sudo in 5 minutes
+          on $hostname$ ($total_sudo_exec$ total executions). Commands: $commands_run$.
+          Investigate whether this is authorized administrative activity or post-compromise
+          privilege escalation. Cross-reference with SSH logon events for $auid$.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "auid"
+        risk_score: 80
+        risk_message: "Sudo command burst — $distinct_cmds$ dangerous cmds — T1548.003"
+  false_positives:
+    - description: >
+        Legitimate system administrators performing bulk configuration changes (e.g.,
+        server provisioning, patching) may trigger this rule. These typically occur
+        during planned maintenance windows.
+      tuning: "Add authorized admin accounts to linux_admin_accounts.csv with authorized_sudo=yes."
+    - description: >
+        Configuration management tools (Ansible, Puppet, Chef) using sudo become may
+        generate rapid sudo executions. These should run under dedicated service accounts.
+      tuning: "Exclude known automation service accounts in the lookup table."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Sudoers File Modification (T1548.003)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Any write to /etc/sudoers or /etc/sudoers.d/ is a high-fidelity indicator
+#  of privilege escalation preparation. Attackers add NOPASSWD entries or
+#  grant themselves ALL=(ALL) permissions. Legitimate changes go through
+#  change management and use visudo exclusively.
+#
+#  Confidence  : HIGH (92)
+#  Severity    : HIGH
+
+rule_2_sudoers_modification:
+  name: "Privilege Escalation — Sudoers File Modification Detected (T1548.003)"
+  description: >
+    Detects any write or attribute change to /etc/sudoers or files within
+    /etc/sudoers.d/. Auditd watch rules (-w /etc/sudoers -p wa) fire on open
+    for write, attribute changes, and renames. This rule captures the process
+    that made the change and flags NOPASSWD additions as CRITICAL. Legitimate
+    sudoers modifications should be performed exclusively via visudo and tracked
+    through change management. Any modification by vi, echo, sed, cp, or
+    direct file writes is suspicious.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: T1548.003
+    technique_name: "Abuse Elevation Control Mechanism: Sudo and Sudo Caching"
+    related_techniques:
+      - "T1098: Account Manipulation (granting elevated permissions)"
+  severity: high
+  confidence: 92
+  risk_score: 88
+  kill_chain_phase: "Privilege Escalation"
+  data_sources:
+    - "Linux Audit Log — watch on /etc/sudoers and /etc/sudoers.d/ (key=sudoers_mod)"
+
+  search: |
+    index=linux sourcetype=linux:audit key=sudoers_mod
+    ``` Capture PATH and SYSCALL events for sudoers modification ```
+    | where type IN ("PATH", "SYSCALL")
+    | stats
+        values(name)        as file_modified,
+        values(exe)         as modifying_process,
+        values(comm)        as command,
+        values(auid)        as orig_user,
+        values(uid)         as exec_user,
+        min(_time)          as first_seen
+        by hostname, ses
+    ``` Flag visudo vs non-visudo modification ```
+    | eval method=if(match(modifying_process, "visudo"), "visudo (expected)", "DIRECT WRITE (suspicious)")
+    ``` Check for NOPASSWD in the change context — requires content audit ```
+    | eval severity=if(method=="DIRECT WRITE (suspicious)", "HIGH", "MEDIUM")
+    | eval mitre_technique="T1548.003"
+    | eval mitre_tactic="Privilege Escalation"
+    | eval alert_name="Sudoers File Modification"
+    | sort - first_seen
+    | table first_seen, hostname, orig_user, exec_user, modifying_process,
+            command, file_modified, method, severity,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "hostname"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Sudoers Modified — $method$ by $orig_user$ on $hostname$"
+        rule_description: >
+          The sudoers configuration ($file_modified$) was modified on $hostname$ by user
+          $orig_user$ using $modifying_process$. Method: $method$. Non-visudo modifications
+          strongly suggest an attacker adding NOPASSWD or ALL privileges. Verify through
+          change management records immediately.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "hostname"
+        risk_score: 88
+        risk_message: "Sudoers modification via $method$ — T1548.003"
+  false_positives:
+    - description: >
+        Authorized administrators using visudo during planned maintenance windows.
+        These are expected but should still be verified against change tickets.
+      tuning: "Lower severity to INFORMATIONAL for visudo-based changes during approved maintenance windows."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: SUID/SGID Binary Exploitation (T1548.001)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects two attack vectors:
+#  (a) chmod +s applied to any binary (creating new SUID/SGID files)
+#  (b) GTFOBins-style exploitation of existing SUID binaries (find -exec,
+#      nmap --interactive, vim, python -c, perl -e executed with euid=0)
+#
+#  Confidence  : HIGH (88)
+#  Severity    : CRITICAL (new SUID) / HIGH (exploitation of existing SUID)
+
+rule_3_suid_sgid_exploitation:
+  name: "Privilege Escalation — SUID/SGID Binary Creation or Exploitation (T1548.001)"
+  description: >
+    Detects two SUID/SGID attack vectors: (1) The chmod syscall setting the setuid
+    or setgid bit on any file (creating a new SUID/SGID binary), which is a common
+    post-exploitation persistence and escalation technique. (2) Execution of known
+    GTFOBins SUID-exploitable binaries (find, nmap, vim, python, perl, bash, env,
+    awk, less, more, man, cp, mv, php, ruby, node, lua, tar, zip) with effective
+    UID 0 by non-root users, indicating active SUID abuse. Any chmod +s outside of
+    package installation is extremely suspicious on production RHEL systems.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: T1548.001
+    technique_name: "Abuse Elevation Control Mechanism: Setuid and Setgid"
+    related_techniques:
+      - "T1548.003: Sudo and Sudo Caching"
+      - "T1068: Exploitation for Privilege Escalation"
+  severity: critical
+  confidence: 88
+  risk_score: 90
+  kill_chain_phase: "Privilege Escalation"
+  data_sources:
+    - "Linux Audit Log — chmod/fchmod/fchmodat syscalls (key=chmod_log)"
+    - "Linux Audit Log — EXECVE syscall with euid=0 (key=exec_log)"
+
+  search: |
+    ``` Detection Vector A: New SUID/SGID bit being set via chmod ```
+    index=linux sourcetype=linux:audit type=SYSCALL
+        (syscall=chmod OR syscall=fchmod OR syscall=fchmodat)
+    | where match(a1, "^0?[2-7][0-7]{3}$")
+    ``` a1 is the mode argument — check for setuid (4xxx) or setgid (2xxx) bits ```
+    | eval mode=tonumber(a1, 8)
+    | where (mode >= 2048)
+    | eval suid_set=if(mode >= 4096, "SETUID", "SETGID")
+    | eval detection_type="NEW_SUID_CREATION"
+    | stats
+        values(exe)     as process,
+        values(comm)    as command,
+        values(auid)    as user,
+        min(_time)      as first_seen
+        by hostname, suid_set, detection_type
+    | append
+        [``` Detection Vector B: GTFOBins SUID binary execution with euid=0 ```
+         search index=linux sourcetype=linux:audit type=SYSCALL
+             syscall=execve euid=0 auid!=0 auid!=4294967295
+         | where match(comm, "^(find|nmap|vim|vi|python[23]?|perl|bash|env|awk|gawk|less|more|man|cp|mv|php|ruby|node|lua|tar|zip)$")
+         | eval detection_type="GTFOBINS_SUID_ABUSE"
+         | eval suid_set="EXECUTION"
+         | stats
+             values(exe)     as process,
+             values(comm)    as command,
+             values(auid)    as user,
+             min(_time)      as first_seen
+             by hostname, suid_set, detection_type]
+    | eval severity=if(detection_type=="NEW_SUID_CREATION", "CRITICAL", "HIGH")
+    | eval mitre_technique="T1548.001"
+    | eval mitre_tactic="Privilege Escalation"
+    | eval alert_name="SUID/SGID Exploitation"
+    | sort - first_seen
+    | table first_seen, hostname, user, detection_type, suid_set, process,
+            command, severity, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "hostname"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "SUID/SGID Alert — $detection_type$ by $user$ on $hostname$"
+        rule_description: >
+          $detection_type$ detected on $hostname$ by user $user$. Process: $process$,
+          Command: $command$. New SUID creation outside package management is almost
+          certainly malicious. GTFOBins exploitation indicates active privilege escalation.
+          Investigate the process tree and check file integrity immediately.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "hostname"
+        risk_score: 90
+        risk_message: "SUID/SGID exploitation — $detection_type$ — T1548.001"
+  false_positives:
+    - description: >
+        Package managers (rpm, dnf, yum) may set SUID bits during package installation
+        or updates. These run as root with auid=0 or under the rpm process.
+      tuning: "Exclude events where exe contains rpm, dnf, or yum in the detection vector A query."
+    - description: >
+        Some system binaries legitimately have SUID (ping, passwd, sudo). The GTFOBins
+        detection targets non-standard SUID exploitation, not normal SUID binary usage.
+      tuning: "Maintain a baseline of authorized SUID binaries and exclude known-good from vector B."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Kernel Exploit Indicators (T1068)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects execution of known Linux kernel exploit tools and indicators:
+#  DirtyCow (CVE-2016-5195), DirtyPipe (CVE-2022-0847), OverlayFS
+#  (CVE-2023-0386), PwnKit (CVE-2021-4034), Looney Tunables (CVE-2023-4911).
+#  Also detects suspicious writes to /proc/sys/kernel/ and kernel module
+#  loading by non-root users.
+#
+#  Confidence  : HIGH (90)
+#  Severity    : CRITICAL
+
+rule_4_kernel_exploit_indicators:
+  name: "Privilege Escalation — Kernel Exploit Tool or Indicator Detected (T1068)"
+  description: >
+    Detects indicators of Linux kernel exploitation by matching process names
+    and command-line arguments against known exploit tool signatures. Covers
+    DirtyCow (CVE-2016-5195), DirtyPipe (CVE-2022-0847), OverlayFS
+    (CVE-2023-0386), PwnKit/pkexec (CVE-2021-4034), and Looney Tunables
+    (CVE-2023-4911). Additionally detects suspicious writes to /proc/sys/kernel/
+    (kernel parameter tampering) and unauthorized kernel module loading via
+    insmod/modprobe by non-root users. Any match is CRITICAL — kernel exploits
+    grant immediate root access.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: T1068
+    technique_name: "Exploitation for Privilege Escalation"
+    related_techniques:
+      - "T1548.001: Setuid and Setgid (PwnKit exploits pkexec SUID)"
+      - "T1014: Rootkit (post-kernel-exploit persistence)"
+  severity: critical
+  confidence: 90
+  risk_score: 95
+  kill_chain_phase: "Privilege Escalation"
+  data_sources:
+    - "Linux Audit Log — EXECVE syscall (key=exec_log)"
+    - "Linux Audit Log — init_module/finit_module syscall (key=mod_load)"
+    - "Sysmon for Linux — Event 1 (Process Creation)"
+
+  search: |
+    index=linux (sourcetype=linux:audit OR sourcetype=sysmon_linux)
+    ``` Match known kernel exploit tool names and signatures ```
+    | eval cmdline=coalesce(CommandLine, comm." ".coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,""))
+    | eval cmdline=lower(cmdline)
+    | where match(cmdline, "(dirty.?cow|dirty.?pipe|dirtypipe|CVE-2016-5195|CVE-2022-0847|CVE-2023-0386|overlayfs.*exploit|pwnkit|CVE-2021-4034|looney.?tunables|CVE-2023-4911|GLIBC_TUNABLES)")
+        OR match(cmdline, "(exploit|privesc|escalat).*\.(sh|py|c|elf|bin)$")
+        OR (match(cmdline, "(insmod|modprobe)") AND auid!=0 AND auid!="unset")
+    ``` Also catch writes to kernel parameters ```
+    | append
+        [ search index=linux sourcetype=linux:audit key=kernel_write type=SYSCALL
+          | eval cmdline="kernel_param_write: ".exe
+          | fields _time, hostname, auid, cmdline ]
+    | eval exploit_category=case(
+        match(cmdline, "dirty.?cow|CVE-2016-5195"), "DirtyCow (CVE-2016-5195)",
+        match(cmdline, "dirty.?pipe|CVE-2022-0847"), "DirtyPipe (CVE-2022-0847)",
+        match(cmdline, "overlayfs|CVE-2023-0386"),   "OverlayFS (CVE-2023-0386)",
+        match(cmdline, "pwnkit|CVE-2021-4034"),       "PwnKit (CVE-2021-4034)",
+        match(cmdline, "looney|tunables|CVE-2023-4911"), "Looney Tunables (CVE-2023-4911)",
+        match(cmdline, "insmod|modprobe"),             "Unauthorized Module Load",
+        match(cmdline, "kernel_param_write"),          "Kernel Parameter Tampering",
+        1==1,                                          "Generic Kernel Exploit Tool"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1068"
+    | eval mitre_tactic="Privilege Escalation"
+    | eval alert_name="Kernel Exploit Indicator"
+    | table _time, host, user, exploit_category, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "KERNEL EXPLOIT — $exploit_category$ detected on $host$ by $user$"
+        rule_description: >
+          A kernel exploit indicator was detected on $host$. Category: $exploit_category$.
+          Command: $cmdline$. User: $user$. Kernel exploits grant immediate root access.
+          Isolate the host immediately, capture volatile evidence, and verify kernel version
+          and patch status. Check for rootkit persistence.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 95
+        risk_message: "Kernel exploit — $exploit_category$ — T1068"
+  false_positives:
+    - description: >
+        Security scanners (Nessus, Qualys, OpenVAS) may probe for kernel vulnerabilities
+        and generate log entries matching exploit CVE patterns. These run from known
+        scanner IP addresses or service accounts.
+      tuning: "Exclude known vulnerability scanner service accounts from the query."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Linux Capabilities Abuse (T1548)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Linux capabilities split root privileges into granular units. Attackers
+#  use setcap to grant dangerous capabilities (cap_setuid, cap_sys_admin,
+#  cap_dac_override) to otherwise unprivileged binaries, enabling privilege
+#  escalation without SUID. Any setcap on a production RHEL system outside
+#  package management is highly suspicious.
+#
+#  Confidence  : HIGH (87)
+#  Severity    : HIGH
+
+rule_5_capabilities_abuse:
+  name: "Privilege Escalation — Dangerous Linux Capabilities Granted (T1548)"
+  description: >
+    Detects the use of setcap to grant dangerous capabilities to binaries.
+    Capabilities like cap_setuid+ep allow a binary to change its UID to root
+    without being SUID. cap_sys_admin grants near-root privileges including
+    mount, BPF, and namespace operations. cap_dac_override bypasses all file
+    permission checks. cap_sys_ptrace allows process injection. Any setcap
+    invocation on production RHEL systems outside of package installation
+    warrants immediate investigation.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: T1548
+    technique_name: "Abuse Elevation Control Mechanism"
+    related_techniques:
+      - "T1548.001: Setuid and Setgid (capability-based equivalent)"
+      - "T1068: Exploitation for Privilege Escalation"
+  severity: high
+  confidence: 87
+  risk_score: 82
+  kill_chain_phase: "Privilege Escalation"
+  data_sources:
+    - "Linux Audit Log — EXECVE syscall matching setcap command"
+    - "Sysmon for Linux — Event 1 (Process Creation)"
+
+  search: |
+    index=linux (sourcetype=linux:audit OR sourcetype=sysmon_linux)
+    ``` Detect setcap commands granting dangerous capabilities ```
+    | eval cmdline=coalesce(CommandLine, comm." ".coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,""))
+    | where match(cmdline, "setcap")
+    ``` Flag dangerous capability grants ```
+    | eval dangerous_cap=case(
+        match(cmdline, "cap_setuid"),       "cap_setuid (UID switching)",
+        match(cmdline, "cap_setgid"),       "cap_setgid (GID switching)",
+        match(cmdline, "cap_sys_admin"),    "cap_sys_admin (near-root)",
+        match(cmdline, "cap_dac_override"), "cap_dac_override (file bypass)",
+        match(cmdline, "cap_sys_ptrace"),   "cap_sys_ptrace (process injection)",
+        match(cmdline, "cap_net_raw"),      "cap_net_raw (raw sockets)",
+        match(cmdline, "cap_net_admin"),    "cap_net_admin (network config)",
+        match(cmdline, "cap_chown"),        "cap_chown (ownership change)",
+        1==1,                               "other_capability"
+      )
+    | where dangerous_cap!="other_capability"
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval severity=if(match(dangerous_cap, "cap_setuid|cap_sys_admin|cap_dac_override"), "CRITICAL", "HIGH")
+    | eval mitre_technique="T1548"
+    | eval mitre_tactic="Privilege Escalation"
+    | eval alert_name="Linux Capabilities Abuse"
+    | table _time, host, user, dangerous_cap, cmdline, severity,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Capabilities Abuse — $dangerous_cap$ set on $host$ by $user$"
+        rule_description: >
+          The setcap command was used to grant $dangerous_cap$ on $host$ by user $user$.
+          Command: $cmdline$. Dangerous capabilities effectively grant root-equivalent
+          privileges without SUID. Verify the target binary, check for package manager
+          association, and investigate the user's session.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 82
+        risk_message: "Capability grant — $dangerous_cap$ — T1548"
+  false_positives:
+    - description: >
+        Package installations via rpm/dnf may set capabilities on legitimate binaries
+        (e.g., ping gets cap_net_raw). These run under the package manager process.
+      tuning: "Exclude events where the parent process is rpm, dnf, or yum."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Polkit/Pkexec Exploitation — PwnKit (T1068)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  CVE-2021-4034 (PwnKit) exploits a memory corruption in pkexec's argument
+#  handling, allowing any unprivileged user to gain root. The exploit runs
+#  pkexec with crafted environment variables and no arguments. Normal pkexec
+#  usage requires a desktop PolicyKit session — CLI exploitation from SSH
+#  sessions is a dead giveaway.
+#
+#  Confidence  : VERY HIGH (93)
+#  Severity    : CRITICAL
+
+rule_6_pwnkit_polkit_exploitation:
+  name: "Privilege Escalation — Polkit/Pkexec Exploitation (CVE-2021-4034 PwnKit)"
+  description: >
+    Detects exploitation of CVE-2021-4034 (PwnKit) and other Polkit/pkexec abuse.
+    The rule identifies pkexec execution by non-desktop users (SSH sessions, cron,
+    scripts) and pkexec spawning shell interpreters (bash, sh, zsh, dash). Normal
+    pkexec invocations occur within graphical desktop PolicyKit sessions and target
+    specific administrative tools — pkexec spawning a shell or executing from
+    a terminal without a desktop session is a strong exploitation indicator.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: T1068
+    technique_name: "Exploitation for Privilege Escalation"
+    related_techniques:
+      - "T1548.001: Setuid and Setgid (pkexec is SUID root)"
+  severity: critical
+  confidence: 93
+  risk_score: 95
+  kill_chain_phase: "Privilege Escalation"
+  data_sources:
+    - "Linux Audit Log — EXECVE syscall for pkexec"
+    - "Sysmon for Linux — Event 1 (Process Creation)"
+
+  search: |
+    index=linux (sourcetype=linux:audit OR sourcetype=sysmon_linux)
+    | eval cmdline=coalesce(CommandLine, comm." ".coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,""))
+    ``` Detect pkexec execution ```
+    | where match(cmdline, "pkexec")
+    ``` Flag pkexec spawning shell — strong PwnKit indicator ```
+    | eval spawns_shell=if(match(cmdline, "pkexec.*(bash|sh|zsh|dash|fish|csh|ksh)"), "YES", "NO")
+    ``` Flag pkexec with no arguments (PwnKit signature) ```
+    | eval no_args=if(match(cmdline, "pkexec\s*$"), "YES", "NO")
+    ``` Flag execution from non-desktop context (SSH, cron) ```
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval tty=coalesce(tty, "unknown")
+    | eval non_desktop=if(NOT match(tty, "tty[0-9]$") AND NOT match(tty, "pts/[0-9]+"), "SSH/CRON", "DESKTOP")
+    ``` Alert on any suspicious pkexec pattern ```
+    | where spawns_shell="YES" OR no_args="YES" OR non_desktop="SSH/CRON"
+    | eval exploit_confidence=case(
+        spawns_shell="YES" AND no_args="YES", "VERY HIGH — classic PwnKit",
+        spawns_shell="YES",                   "HIGH — pkexec spawning shell",
+        no_args="YES",                        "HIGH — pkexec no arguments (exploit)",
+        1==1,                                 "MEDIUM — non-desktop pkexec"
+      )
+    | eval mitre_technique="T1068"
+    | eval mitre_tactic="Privilege Escalation"
+    | eval alert_name="PwnKit/Polkit Exploitation"
+    | table _time, host, user, tty, cmdline, spawns_shell, no_args,
+            exploit_confidence, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "PWNKIT EXPLOIT — pkexec abuse on $host$ by $user$ ($exploit_confidence$)"
+        rule_description: >
+          Pkexec exploitation detected on $host$ by $user$. Confidence: $exploit_confidence$.
+          Command: $cmdline$. TTY: $tty$. Spawns shell: $spawns_shell$. No arguments: $no_args$.
+          PwnKit (CVE-2021-4034) grants instant root from any local user. Verify pkexec
+          version: polkit < 0.120 is vulnerable. Isolate host and check for persistence.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 95
+        risk_message: "PwnKit exploitation — $exploit_confidence$ — T1068"
+  false_positives:
+    - description: >
+        GNOME/KDE desktop environments use pkexec for authenticated administrative
+        actions (e.g., GNOME Software, system-config-*). These occur on graphical
+        sessions with proper PolicyKit authentication.
+      tuning: "Exclude events from graphical TTY sessions (tty1-tty6) on desktop workstations."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: Container Escape to Host (T1611)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects container escape techniques: nsenter targeting PID 1 (host init),
+#  unshare with mount/pid namespace manipulation, access to host's /proc/1/root,
+#  docker.sock exploitation, and privileged container operations. Container
+#  escapes are CRITICAL — they bypass all container isolation.
+#
+#  Confidence  : HIGH (88)
+#  Severity    : CRITICAL
+
+rule_7_container_escape:
+  name: "Privilege Escalation — Container Escape to Host Detected (T1611)"
+  description: >
+    Detects container escape techniques on RHEL hosts running Docker, Podman,
+    or Kubernetes. Key indicators include: nsenter targeting PID 1 or host
+    namespaces, unshare with --mount/--pid flags from non-systemd processes,
+    access to /proc/1/root (host filesystem from container), docker.sock
+    mount exploitation (docker -H unix:///var/run/docker.sock), and execution
+    with --privileged or --cap-add SYS_ADMIN flags. Any container escape
+    represents a complete compromise of container isolation.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: T1611
+    technique_name: "Escape to Host"
+    related_techniques:
+      - "T1610: Deploy Container (precursor)"
+      - "T1068: Exploitation for Privilege Escalation"
+  severity: critical
+  confidence: 88
+  risk_score: 92
+  kill_chain_phase: "Privilege Escalation"
+  data_sources:
+    - "Linux Audit Log — EXECVE syscall for nsenter, unshare, docker"
+    - "Sysmon for Linux — Event 1 (Process Creation)"
+    - "Linux Audit Log — open/openat syscall on /proc/1/root"
+
+  search: |
+    index=linux (sourcetype=linux:audit OR sourcetype=sysmon_linux)
+    | eval cmdline=coalesce(CommandLine, comm." ".coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect nsenter targeting host PID 1 namespace ```
+    | where match(cmdline_lower, "nsenter.*(-t\s*1|--target\s*1|-t1)")
+        OR match(cmdline_lower, "nsenter.*--mount.*--pid")
+    ``` Detect unshare with suspicious namespace flags ```
+        OR match(cmdline_lower, "unshare.*(--mount|--pid|--user|--net).*(-f|--fork)")
+    ``` Detect /proc/1/root access (host fs from container) ```
+        OR match(cmdline_lower, "/proc/1/root")
+    ``` Detect docker.sock exploitation ```
+        OR match(cmdline_lower, "docker.*(/var/run/docker.sock|docker\.sock)")
+    ``` Detect privileged container creation ```
+        OR match(cmdline_lower, "(docker|podman)\s+run.*--privileged")
+        OR match(cmdline_lower, "(docker|podman)\s+run.*--cap-add.*SYS_ADMIN")
+    | eval escape_type=case(
+        match(cmdline_lower, "nsenter.*(-t\s*1|--target\s*1)"), "nsenter PID 1 (host namespace)",
+        match(cmdline_lower, "unshare"),                        "unshare namespace manipulation",
+        match(cmdline_lower, "/proc/1/root"),                   "/proc/1/root host filesystem access",
+        match(cmdline_lower, "docker.sock"),                    "docker.sock exploitation",
+        match(cmdline_lower, "--privileged"),                    "privileged container",
+        match(cmdline_lower, "SYS_ADMIN"),                      "SYS_ADMIN capability container",
+        1==1,                                                   "generic container escape"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1611"
+    | eval mitre_tactic="Privilege Escalation"
+    | eval alert_name="Container Escape"
+    | table _time, host, user, escape_type, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "CONTAINER ESCAPE — $escape_type$ on $host$ by $user$"
+        rule_description: >
+          Container escape detected on $host$ by user $user$. Escape type: $escape_type$.
+          Command: $cmdline$. Container escapes bypass all isolation boundaries and grant
+          host-level access. Identify the source container, isolate the host, and audit
+          all container configurations for excessive privileges.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 92
+        risk_message: "Container escape — $escape_type$ — T1611"
+  false_positives:
+    - description: >
+        Container orchestration tools (Kubernetes kubelet, CRI-O, containerd) may
+        legitimately use nsenter for container management operations. These run as
+        root system services.
+      tuning: "Exclude nsenter invocations where the parent process is kubelet, containerd, or crio."
+    - description: >
+        System administrators may use nsenter for debugging container networking.
+        These should be infrequent and correlate with maintenance tickets.
+      tuning: "Add authorized container admin accounts to exclusion list."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: Cgroup Escape and Namespace Manipulation (T1611)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Cgroup escapes abuse the release_agent mechanism: writing a command to
+#  /sys/fs/cgroup/*/release_agent causes it to execute on the HOST when
+#  the last process in the cgroup exits. This is a well-known Docker/Podman
+#  escape technique. Also detects mount namespace manipulation for escalation.
+#
+#  Confidence  : VERY HIGH (94)
+#  Severity    : CRITICAL
+
+rule_8_cgroup_escape:
+  name: "Privilege Escalation — Cgroup Release Agent Escape (T1611)"
+  description: >
+    Detects the cgroup release_agent container escape technique where an attacker
+    writes a malicious command path to /sys/fs/cgroup/*/release_agent, enables
+    notify_on_release, then exits the cgroup — causing the command to execute
+    on the HOST outside the container. Also detects mount namespace manipulation
+    via mount commands targeting /sys/fs/cgroup from within containers and
+    suspicious cgroup filesystem writes. This is one of the most reliable
+    container escape techniques and any write to release_agent is near-certain
+    evidence of attack.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: T1611
+    technique_name: "Escape to Host"
+    related_techniques:
+      - "T1068: Exploitation for Privilege Escalation"
+      - "T1059.004: Unix Shell (release_agent executes shell command)"
+  severity: critical
+  confidence: 94
+  risk_score: 95
+  kill_chain_phase: "Privilege Escalation"
+  data_sources:
+    - "Linux Audit Log — open/openat/write syscall on /sys/fs/cgroup paths"
+    - "Linux Audit Log — EXECVE syscall for mount commands"
+    - "Sysmon for Linux — Event 11 (File Create) on cgroup paths"
+
+  search: |
+    index=linux (sourcetype=linux:audit OR sourcetype=sysmon_linux)
+    ``` Detect writes to cgroup release_agent ```
+    | eval cmdline=coalesce(CommandLine, comm." ".coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,""))
+    | eval filepath=coalesce(TargetFilename, name, cmdline)
+    | where match(filepath, "/sys/fs/cgroup.*release_agent")
+        OR match(filepath, "/sys/fs/cgroup.*notify_on_release")
+    ``` Also detect cgroup mount manipulation ```
+        OR match(cmdline, "mount.*cgroup")
+    ``` Detect writes to cgroup directories from non-systemd processes ```
+        OR (match(filepath, "/sys/fs/cgroup") AND NOT match(exe, "(systemd|containerd|dockerd|kubelet|crio)"))
+    | eval escape_vector=case(
+        match(filepath, "release_agent"),      "CGROUP RELEASE_AGENT WRITE",
+        match(filepath, "notify_on_release"),  "NOTIFY_ON_RELEASE ENABLE",
+        match(cmdline, "mount.*cgroup"),        "CGROUP MOUNT MANIPULATION",
+        1==1,                                  "CGROUP SUSPICIOUS WRITE"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1611"
+    | eval mitre_tactic="Privilege Escalation"
+    | eval alert_name="Cgroup Escape"
+    | table _time, host, user, escape_vector, filepath, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "CGROUP ESCAPE — $escape_vector$ on $host$ by $user$"
+        rule_description: >
+          Cgroup escape indicator detected on $host$ by user $user$. Vector:
+          $escape_vector$. Path: $filepath$. The cgroup release_agent escape is a
+          well-documented technique for breaking out of Docker/Podman containers.
+          Isolate the host immediately and investigate all container workloads.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 95
+        risk_message: "Cgroup escape — $escape_vector$ — T1611"
+  false_positives:
+    - description: >
+        Container runtimes (containerd, CRI-O, dockerd) and systemd manage cgroups
+        as part of normal operations. These processes are excluded in the query.
+      tuning: "Ensure container runtime process names are in the exclusion list."
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  inv_1_user_session_timeline:
+    name: "Full Session Timeline for Suspected Escalation User"
+    description: >
+      Retrieves the complete command execution timeline for a specific user on a
+      host, showing all commands run in the session to understand pre- and post-
+      escalation activity.
+    search: |
+      index=linux sourcetype=linux:audit type=EXECVE auid="$suspect_user$" hostname="$target_host$"
+      | eval cmdline=coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+      | join ses [ search index=linux sourcetype=linux:audit type=SYSCALL hostname="$target_host$"
+                   | fields ses, auid, euid, exe, comm, ppid ]
+      | sort _time
+      | table _time, auid, euid, exe, comm, cmdline, ses
+
+  inv_2_suid_binary_inventory:
+    name: "Current SUID/SGID Binary Inventory on Host"
+    description: >
+      Queries the latest file integrity data to list all SUID/SGID binaries
+      currently on the suspected host for comparison against known-good baseline.
+    search: |
+      index=linux sourcetype=linux:audit type=SYSCALL
+          (syscall=chmod OR syscall=fchmod) hostname="$target_host$"
+      | where a1>="4000"
+      | stats latest(_time) as last_modified, values(exe) as modifier by name
+      | sort - last_modified
+      | table last_modified, name, modifier
+
+  inv_3_kernel_module_loads:
+    name: "Recent Kernel Module Load Events on Host"
+    description: >
+      Lists all kernel modules loaded on the suspected host in the last 24 hours
+      to identify unauthorized or suspicious modules.
+    search: |
+      index=linux sourcetype=linux:audit type=SYSCALL
+          (syscall=init_module OR syscall=finit_module) hostname="$target_host$"
+          earliest=-24h
+      | stats count, values(auid) as loaded_by, min(_time) as first_load by comm, exe
+      | sort - first_load
+      | table first_load, comm, exe, loaded_by, count
+
+  inv_4_privilege_transition_events:
+    name: "UID/GID Transition Events on Host"
+    description: >
+      Tracks all setuid/setgid/setreuid/setregid syscalls on the host to
+      identify unauthorized privilege transitions.
+    search: |
+      index=linux sourcetype=linux:audit type=SYSCALL
+          (syscall=setuid OR syscall=setgid OR syscall=setreuid OR syscall=setregid)
+          hostname="$target_host$" auid!=0
+          earliest=-1h
+      | stats count, values(exe) as process, values(auid) as orig_user by syscall, a0
+      | eval target_uid=a0
+      | where target_uid="0"
+      | table _time, process, orig_user, syscall, target_uid, count
+
+  inv_5_container_activity_on_host:
+    name: "Container Runtime Activity on Suspected Host"
+    description: >
+      Lists all Docker/Podman/Kubernetes activity on the host in the last hour
+      to identify container creation, privilege settings, and escape indicators.
+    search: |
+      index=linux (sourcetype=linux:audit OR sourcetype=sysmon_linux)
+          hostname="$target_host$"
+          earliest=-1h
+      | eval cmdline=coalesce(CommandLine, comm." ".coalesce(a0,"")." ".coalesce(a1,""))
+      | where match(cmdline, "(docker|podman|kubectl|crictl|ctr)")
+      | sort _time
+      | table _time, cmdline, auid, euid, exe
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+incident_response_playbook:
+  name: "RHEL Privilege Escalation — Incident Response Playbook"
+  description: >
+    Step-by-step response procedure when privilege escalation is detected on
+    a RHEL system. Covers immediate containment, evidence collection, root
+    cause analysis, and remediation.
+
+  phase_1_detection_and_triage:
+    - step: "Verify the alert is not a false positive by reviewing the user's role and recent activity"
+    - step: "Check linux_admin_accounts.csv — is the user an authorized administrator?"
+    - step: "Review the full session timeline (inv_1) to understand what happened before and after escalation"
+    - step: "Determine the escalation vector: sudo, SUID, kernel exploit, capabilities, container escape"
+    - step: "Assign severity: CRITICAL for kernel exploits and container escapes, HIGH for sudo/SUID"
+
+  phase_2_containment:
+    - step: "IMMEDIATE: If kernel exploit or container escape — isolate the host from network (disable interface or VLAN quarantine)"
+    - step: "Lock the compromised user account: passwd -l <username> && chage -E 0 <username>"
+    - step: "Kill all sessions for the compromised user: pkill -KILL -u <username>"
+    - step: "If container escape: stop the offending container and disable Docker/Podman socket"
+    - step: "Preserve volatile evidence before reboot: capture /proc, network connections (ss -tlnp), process tree (ps auxf)"
+
+  phase_3_evidence_collection:
+    - step: "Collect /var/log/audit/audit.log, /var/log/secure, /var/log/messages from the host"
+    - step: "Capture full auditd logs for the user session: ausearch -ua <auid> --start <time>"
+    - step: "Dump process memory of any suspicious processes before killing"
+    - step: "Snapshot the filesystem: check for new SUID binaries (find / -perm -4000), capabilities (getcap -r /), cron jobs, systemd services"
+    - step: "Collect container logs if applicable: docker logs, podman logs, kubectl logs"
+
+  phase_4_root_cause_analysis:
+    - step: "Identify the initial access vector: SSH brute force? Compromised credentials? Web exploit?"
+    - step: "Determine the exploitation technique: which CVE, which tool (Mimikatz equivalent for Linux)"
+    - step: "Map the full attack chain: Initial Access -> Execution -> Escalation -> Persistence"
+    - step: "Check kernel version against CVE database: is the system missing patches?"
+    - step: "Review sudoers configuration: are there overly permissive rules?"
+    - step: "Check SUID binary inventory against RPM package verification: rpm -Va | grep '^S'"
+
+  phase_5_remediation:
+    - step: "Patch the kernel if vulnerable to known CVEs (DirtyPipe, PwnKit, Looney Tunables)"
+    - step: "Remove unauthorized SUID binaries and capabilities: chmod u-s, setcap -r"
+    - step: "Harden sudoers: remove NOPASSWD entries, restrict to specific commands"
+    - step: "Remove malicious cron jobs, systemd services, authorized_keys entries"
+    - step: "If container escape: rebuild container images, restrict --privileged and SYS_ADMIN"
+    - step: "Enable and enforce SELinux (enforcing mode) to prevent future escalations"
+    - step: "Deploy auditd rules for ongoing monitoring of escalation vectors"
+    - step: "Rotate all credentials on the affected host and any systems the compromised account had access to"

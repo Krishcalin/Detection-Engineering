@@ -1,0 +1,674 @@
+# ==============================================================================
+#  RHEL Discovery and Enumeration Attack Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detection rules for post-compromise discovery and enumeration
+#                on RHEL Linux. Covers LinPEAS/LinEnum execution, system info
+#                discovery, user/group enumeration, network recon, security
+#                software profiling, file/directory discovery, and container
+#                environment enumeration.
+#
+#  MITRE ATT&CK: T1059.004 - Unix Shell (enumeration scripts)
+#                 T1082     - System Information Discovery
+#                 T1087.001 - Account Discovery: Local Account
+#                 T1016     - System Network Configuration Discovery
+#                 T1518.001 - Software Discovery: Security Software Discovery
+#                 T1083     - File and Directory Discovery
+#                 T1613     - Container and Resource Discovery
+#  Kill Chain   : Discovery / Reconnaissance (post-compromise)
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-05
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Deploy auditd EXECVE logging on ALL RHEL hosts.
+#  2. Deploy Sysmon for Linux with Process Creation (Event 1) rules.
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: Linux Enumeration Script Execution (T1059.004)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_enumeration_script:
+  name: "Discovery — LinPEAS/LinEnum Enumeration Script Detected (T1059.004)"
+  description: >
+    Detects execution or download of known Linux enumeration scripts: linpeas,
+    linenum, linux-exploit-suggester, les.sh, lse.sh, unix-privesc-check,
+    linux-smart-enumeration, pspy, and GTFOBins-related enumeration. Also
+    detects curl/wget downloads from known enumeration script URLs (GitHub raw).
+    These scripts are the FIRST tools attackers run after gaining access —
+    detection indicates active post-compromise reconnaissance.
+  mitre:
+    tactic: "Discovery"
+    technique: T1059.004
+    technique_name: "Command and Scripting Interpreter: Unix Shell"
+    related_techniques:
+      - "T1082: System Information Discovery"
+      - "T1068: Exploitation for Privilege Escalation (scripts suggest targets)"
+  severity: critical
+  confidence: 93
+  risk_score: 90
+  kill_chain_phase: "Discovery"
+  data_sources:
+    - "Linux Audit Log — EXECVE for enumeration scripts"
+    - "Sysmon for Linux — Event 1 (Process Creation)"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect known enumeration script names ```
+    | where match(cmdline_lower, "(linpeas|linenum|linux-exploit-suggester|les\.sh|lse\.sh|unix-privesc-check|linux-smart-enumeration|pspy)")
+    ``` Detect downloads of enumeration scripts ```
+        OR match(cmdline_lower, "(curl|wget).*github.*(linpeas|linenum|PEASS|linux-exploit-suggester|pspy)")
+    ``` Detect GTFOBins enumeration ```
+        OR match(cmdline_lower, "gtfobins")
+    | eval enum_tool=case(
+        match(cmdline_lower, "linpeas"),                    "LINPEAS — privilege escalation audit",
+        match(cmdline_lower, "linenum"),                    "LINENUM — system enumeration",
+        match(cmdline_lower, "linux-exploit-suggester"),     "LINUX_EXPLOIT_SUGGESTER",
+        match(cmdline_lower, "(les|lse)\\.sh"),             "LINUX_SMART_ENUMERATION",
+        match(cmdline_lower, "unix-privesc-check"),          "UNIX_PRIVESC_CHECK",
+        match(cmdline_lower, "pspy"),                       "PSPY — process monitor (cron/service discovery)",
+        1==1,                                               "ENUMERATION_SCRIPT"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1059.004"
+    | eval mitre_tactic="Discovery"
+    | eval alert_name="Enumeration Script"
+    | table _time, host, user, enum_tool, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "ENUMERATION — $enum_tool$ on $host$ by $user$"
+        rule_description: >
+          Linux enumeration script detected on $host$ by $user$. Tool: $enum_tool$.
+          Command: $cmdline$. Enumeration scripts indicate active post-compromise
+          reconnaissance. The attacker is profiling the system for privilege
+          escalation vectors. Investigate initial access and contain immediately.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 90
+        risk_message: "Enumeration script — $enum_tool$ — T1059.004"
+  false_positives:
+    - description: >
+        Security teams running authorized vulnerability assessments.
+      tuning: "Exclude authorized security assessment accounts and scheduled scan windows."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: System Information Discovery Burst (T1082)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_system_info_discovery:
+  name: "Discovery — System Information Reconnaissance Burst (T1082)"
+  description: >
+    Detects a rapid burst of system reconnaissance commands from a single user
+    within a 2-minute window: uname, cat /etc/os-release, cat /proc/version,
+    hostnamectl, dmidecode, lscpu, free, df, mount, lsblk, lsmod, lspci.
+    A burst of 5+ distinct recon commands in 2 minutes from a non-admin user
+    indicates systematic host profiling by an attacker.
+  mitre:
+    tactic: "Discovery"
+    technique: T1082
+    technique_name: "System Information Discovery"
+    related_techniques:
+      - "T1016: System Network Configuration Discovery"
+      - "T1087: Account Discovery"
+  severity: medium
+  confidence: 75
+  risk_score: 55
+  kill_chain_phase: "Discovery"
+  data_sources:
+    - "Linux Audit Log — EXECVE syscall"
+
+  search: |
+    index=linux sourcetype=linux:audit type=EXECVE
+    | eval cmdline=lower(coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,""))
+    ``` Match system recon commands ```
+    | where match(cmdline, "^(uname|hostnamectl|dmidecode|lscpu|lsblk|lspci|lsmod)")
+        OR match(cmdline, "(cat|less)\s+(/etc/os-release|/proc/version|/etc/redhat-release|/proc/cpuinfo|/proc/meminfo)")
+        OR match(cmdline, "^(free|df|mount|uptime|dmesg|timedatectl)")
+    | eval recon_cmd=case(
+        match(cmdline, "uname"),        "uname",
+        match(cmdline, "os-release"),   "os-release",
+        match(cmdline, "hostnamectl"),  "hostnamectl",
+        match(cmdline, "lscpu"),        "lscpu",
+        match(cmdline, "free"),         "free",
+        match(cmdline, "df"),           "df",
+        match(cmdline, "mount"),        "mount",
+        1==1,                           cmdline
+      )
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    ``` 2-minute aggregation window ```
+    | bin span=2m _time
+    | stats
+        dc(recon_cmd)       as distinct_cmds,
+        count               as total_recon,
+        values(recon_cmd)   as commands
+        by _time, user, host
+    | where distinct_cmds >= 5
+    | eval mitre_technique="T1082"
+    | eval mitre_tactic="Discovery"
+    | eval alert_name="System Info Discovery Burst"
+    | table _time, host, user, distinct_cmds, total_recon, commands,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "user"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "System Recon — $distinct_cmds$ commands by $user$ on $host$"
+        rule_description: >
+          System information reconnaissance burst on $host$ by $user$:
+          $distinct_cmds$ distinct recon commands in 2 minutes. Commands: $commands$.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "user"
+        risk_score: 55
+        risk_message: "System info discovery — $distinct_cmds$ cmds — T1082"
+  false_positives:
+    - description: "System administrators and monitoring scripts may run these commands."
+      tuning: "Exclude known admin accounts and monitoring service accounts."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: User and Group Enumeration (T1087.001)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_user_group_enumeration:
+  name: "Discovery — User and Group Enumeration (T1087.001)"
+  description: >
+    Detects user and group enumeration commands in rapid succession: id, whoami,
+    groups, getent passwd, getent group, lastlog, w, who, last, and reading
+    /etc/passwd or /etc/group by non-standard processes. Also detects
+    enumeration of /home/ directories to discover user accounts.
+  mitre:
+    tactic: "Discovery"
+    technique: T1087.001
+    technique_name: "Account Discovery: Local Account"
+    related_techniques:
+      - "T1069.001: Permission Groups Discovery: Local Groups"
+  severity: medium
+  confidence: 78
+  risk_score: 58
+  kill_chain_phase: "Discovery"
+  data_sources:
+    - "Linux Audit Log — EXECVE for user enumeration commands"
+
+  search: |
+    index=linux sourcetype=linux:audit type=EXECVE
+    | eval cmdline=lower(coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,""))
+    | where match(cmdline, "^(id|whoami|groups|who|w\s|last\s|lastlog|finger)")
+        OR match(cmdline, "getent\s+(passwd|group|shadow)")
+        OR match(cmdline, "(cat|less)\s+(/etc/passwd|/etc/group|/etc/sudoers)")
+        OR match(cmdline, "ls\s+(-la?\s+)?/home")
+        OR match(cmdline, "awk.*(/etc/passwd|/etc/group)")
+        OR match(cmdline, "cut.*(/etc/passwd|/etc/group)")
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    | bin span=2m _time
+    | stats
+        dc(cmdline) as distinct_cmds,
+        count       as total,
+        values(cmdline) as commands
+        by _time, user, host
+    | where distinct_cmds >= 4
+    | eval mitre_technique="T1087.001"
+    | eval mitre_tactic="Discovery"
+    | eval alert_name="User Group Enumeration"
+    | table _time, host, user, distinct_cmds, total, commands,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "user"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "User Enumeration — $distinct_cmds$ commands by $user$ on $host$"
+        rule_description: >
+          User/group enumeration burst on $host$ by $user$: $distinct_cmds$ commands.
+          Commands: $commands$. Attacker is mapping accounts for privilege escalation.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "user"
+        risk_score: 58
+        risk_message: "User enumeration — $distinct_cmds$ cmds — T1087.001"
+  false_positives:
+    - description: "Login scripts and LDAP lookups generate user queries."
+      tuning: "Exclude sssd, nscd, and login-related processes."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Network Configuration Discovery (T1016)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_network_recon:
+  name: "Discovery — Network Configuration Reconnaissance Burst (T1016)"
+  description: >
+    Detects rapid execution of network recon commands: ip addr, ifconfig, route,
+    ip route, netstat -tlnp, ss -tlnp, arp -a, ip neigh, cat /etc/resolv.conf,
+    cat /etc/hosts, nmcli, dig, nslookup. Threshold: 4+ network recon commands
+    in 2 minutes from the same user.
+  mitre:
+    tactic: "Discovery"
+    technique: T1016
+    technique_name: "System Network Configuration Discovery"
+    related_techniques:
+      - "T1049: System Network Connections Discovery"
+      - "T1046: Network Service Discovery"
+  severity: medium
+  confidence: 78
+  risk_score: 58
+  kill_chain_phase: "Discovery"
+  data_sources:
+    - "Linux Audit Log — EXECVE for network recon commands"
+
+  search: |
+    index=linux sourcetype=linux:audit type=EXECVE
+    | eval cmdline=lower(coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,""))
+    | where match(cmdline, "^(ip\s+addr|ip\s+route|ip\s+neigh|ifconfig|route\s|arp\s|nmcli)")
+        OR match(cmdline, "^(netstat|ss)\s+.*(-t|-l|-n|-p)")
+        OR match(cmdline, "(cat|less)\s+(/etc/resolv.conf|/etc/hosts|/etc/hostname|/etc/networks)")
+        OR match(cmdline, "^(dig|nslookup|host\s)")
+        OR match(cmdline, "^(traceroute|tracepath|mtr)")
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    | bin span=2m _time
+    | stats
+        dc(cmdline) as distinct_cmds,
+        count       as total,
+        values(cmdline) as commands
+        by _time, user, host
+    | where distinct_cmds >= 4
+    | eval mitre_technique="T1016"
+    | eval mitre_tactic="Discovery"
+    | eval alert_name="Network Recon Burst"
+    | table _time, host, user, distinct_cmds, total, commands,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "user"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Network Recon — $distinct_cmds$ commands by $user$ on $host$"
+        rule_description: >
+          Network reconnaissance burst on $host$ by $user$: $distinct_cmds$ network
+          recon commands in 2 minutes. Commands: $commands$.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "user"
+        risk_score: 58
+        risk_message: "Network recon — $distinct_cmds$ cmds — T1016"
+  false_positives:
+    - description: "Network troubleshooting by administrators."
+      tuning: "Exclude known network admin accounts."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Security Software Discovery (T1518.001)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_security_software_discovery:
+  name: "Discovery — Security Software and Defense Profiling (T1518.001)"
+  description: >
+    Detects attacker reconnaissance of security tools: checking for auditd,
+    SELinux, firewalld, EDR agents (CrowdStrike, Wazuh, OSSEC, SentinelOne),
+    antimalware (ClamAV), and file integrity tools (AIDE, Tripwire). This
+    allows attackers to understand which defenses they need to evade.
+  mitre:
+    tactic: "Discovery"
+    technique: T1518.001
+    technique_name: "Software Discovery: Security Software Discovery"
+    related_techniques:
+      - "T1562.001: Impair Defenses (next step after discovery)"
+  severity: medium
+  confidence: 80
+  risk_score: 65
+  kill_chain_phase: "Discovery"
+  data_sources:
+    - "Linux Audit Log — EXECVE for security tool queries"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect security tool enumeration ```
+    | where match(cmdline_lower, "systemctl\s+(status|is-active|is-enabled)\s+(auditd|firewalld|selinux|clamd|ossec|wazuh|falcon-sensor|aide)")
+        OR match(cmdline_lower, "(sestatus|getenforce)")
+        OR match(cmdline_lower, "iptables\s+-L")
+        OR match(cmdline_lower, "firewall-cmd\s+--list")
+        OR match(cmdline_lower, "ps\s+aux.*grep.*(clamd|ossec|wazuh|falcon|crowdstrike|sentinel|auditd|aide|tripwire)")
+        OR match(cmdline_lower, "rpm\s+-qa.*grep.*(selinux|audit|firewall|tripwire|aide|ossec|wazuh|falcon|crowdstrike)")
+    | eval defense_checked=case(
+        match(cmdline_lower, "auditd"),                     "AUDITD",
+        match(cmdline_lower, "(selinux|sestatus|getenforce)"),"SELINUX",
+        match(cmdline_lower, "firewall"),                   "FIREWALL",
+        match(cmdline_lower, "(falcon|crowdstrike)"),        "CROWDSTRIKE_EDR",
+        match(cmdline_lower, "(wazuh|ossec)"),               "WAZUH_OSSEC_HIDS",
+        match(cmdline_lower, "clamd"),                       "CLAMAV_AV",
+        match(cmdline_lower, "(aide|tripwire)"),             "FILE_INTEGRITY",
+        1==1,                                               "SECURITY_SOFTWARE"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1518.001"
+    | eval mitre_tactic="Discovery"
+    | eval alert_name="Security Software Discovery"
+    | table _time, host, user, defense_checked, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "user"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Defense Profiling — $defense_checked$ checked by $user$ on $host$"
+        rule_description: >
+          Security software discovery on $host$ by $user$. Defense checked:
+          $defense_checked$. Command: $cmdline$. Attacker is profiling defenses
+          before attempting evasion. Expect defense evasion activity to follow.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "user"
+        risk_score: 65
+        risk_message: "Security software discovery — $defense_checked$ — T1518.001"
+  false_positives:
+    - description: "Monitoring scripts check service status routinely."
+      tuning: "Exclude known monitoring accounts (nagios, zabbix, prometheus)."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Sensitive File and Directory Discovery (T1083)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_file_discovery:
+  name: "Discovery — Sensitive File Search (SUID, Keys, Configs) (T1083)"
+  description: >
+    Detects find/locate commands searching for sensitive targets: SUID binaries
+    (find / -perm -4000), writable directories, SSH keys, configuration files,
+    backup files, and database files. These searches map escalation vectors
+    and data targets.
+  mitre:
+    tactic: "Discovery"
+    technique: T1083
+    technique_name: "File and Directory Discovery"
+    related_techniques:
+      - "T1548.001: Setuid and Setgid (SUID search)"
+      - "T1552: Unsecured Credentials"
+  severity: medium
+  confidence: 78
+  risk_score: 62
+  kill_chain_phase: "Discovery"
+  data_sources:
+    - "Linux Audit Log — EXECVE for find/locate with sensitive patterns"
+
+  search: |
+    index=linux sourcetype=linux:audit type=EXECVE
+    | eval cmdline=coalesce(a0,"")." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,"")
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect SUID/SGID binary discovery ```
+    | where match(cmdline_lower, "find\s+.*-perm\s+(-4000|-2000|/4000|/2000|u=s|g=s)")
+    ``` Detect writable directory/file search ```
+        OR match(cmdline_lower, "find\s+.*(-writable|-perm\s+-o=w)")
+    ``` Detect SSH key file search ```
+        OR match(cmdline_lower, "find\s+.*(-name\s+.?id_rsa|-name\s+.?id_ecdsa|-name\s+.?authorized_keys|-name\s+.?\\.pem)")
+    ``` Detect config file search ```
+        OR match(cmdline_lower, "find\s+.*(-name\s+.?\\.conf|-name\s+.?\\.cfg|-name\s+.?\\.ini|-name\s+.?\\.env)")
+    ``` Detect capability enumeration ```
+        OR match(cmdline_lower, "getcap\s+-r\s+/")
+    | eval search_target=case(
+        match(cmdline_lower, "perm.*4000|u=s"),    "SUID_BINARY_SEARCH",
+        match(cmdline_lower, "perm.*2000|g=s"),    "SGID_BINARY_SEARCH",
+        match(cmdline_lower, "writable"),           "WRITABLE_FILE_SEARCH",
+        match(cmdline_lower, "id_rsa|id_ecdsa"),    "SSH_KEY_SEARCH",
+        match(cmdline_lower, "\\.pem"),             "CERTIFICATE_SEARCH",
+        match(cmdline_lower, "getcap"),             "CAPABILITY_ENUMERATION",
+        1==1,                                       "CONFIG_FILE_SEARCH"
+      )
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    | eval mitre_technique="T1083"
+    | eval mitre_tactic="Discovery"
+    | eval alert_name="Sensitive File Discovery"
+    | table _time, host, user, search_target, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "user"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "File Discovery — $search_target$ by $user$ on $host$"
+        rule_description: >
+          Sensitive file search on $host$ by $user$. Target: $search_target$.
+          Command: $cmdline$. SUID searches map privilege escalation vectors.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "user"
+        risk_score: 62
+        risk_message: "File discovery — $search_target$ — T1083"
+  false_positives:
+    - description: "Security audits and compliance scans search for SUID files."
+      tuning: "Exclude authorized security audit accounts."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: Container and Cloud Environment Discovery (T1613)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_container_cloud_discovery:
+  name: "Discovery — Container and Cloud Environment Enumeration (T1613)"
+  description: >
+    Detects container and cloud environment enumeration: docker/podman commands,
+    Kubernetes kubectl queries, cloud metadata endpoint access (169.254.169.254),
+    and environment variable dumping (env, printenv, /proc/*/environ). On RHEL
+    hosts running containers, this maps the container infrastructure for escape
+    or lateral movement.
+  mitre:
+    tactic: "Discovery"
+    technique: T1613
+    technique_name: "Container and Resource Discovery"
+    related_techniques:
+      - "T1552.005: Cloud Instance Metadata API"
+      - "T1611: Escape to Host"
+  severity: medium
+  confidence: 80
+  risk_score: 68
+  kill_chain_phase: "Discovery"
+  data_sources:
+    - "Linux Audit Log — EXECVE for docker/kubectl/curl"
+    - "Sysmon for Linux — Event 1 and Event 3"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect container enumeration ```
+    | where match(cmdline_lower, "(docker|podman)\s+(ps|images|inspect|info|version)")
+    ``` Detect Kubernetes enumeration ```
+        OR match(cmdline_lower, "kubectl\s+(get|describe)\s+(pods|secrets|nodes|services|configmaps|namespaces)")
+    ``` Detect cloud metadata endpoint access ```
+        OR match(cmdline_lower, "curl.*169\\.254\\.169\\.254")
+        OR match(cmdline_lower, "wget.*169\\.254\\.169\\.254")
+    ``` Detect environment variable dumping ```
+        OR match(cmdline_lower, "^(env|printenv)$")
+        OR match(cmdline_lower, "cat\s+/proc/.*/environ")
+    ``` Detect container runtime socket discovery ```
+        OR match(cmdline_lower, "(find|ls).*docker\\.sock")
+    | eval enum_target=case(
+        match(cmdline_lower, "(docker|podman)"),        "CONTAINER_ENUMERATION",
+        match(cmdline_lower, "kubectl"),                "KUBERNETES_ENUMERATION",
+        match(cmdline_lower, "169\\.254\\.169\\.254"),  "CLOUD_METADATA_ACCESS",
+        match(cmdline_lower, "(env|printenv|environ)"),  "ENVIRONMENT_VARIABLE_DUMP",
+        match(cmdline_lower, "docker\\.sock"),          "CONTAINER_SOCKET_DISCOVERY",
+        1==1,                                           "ENVIRONMENT_DISCOVERY"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval severity=if(match(enum_target, "CLOUD_METADATA|KUBERNETES.*secrets"), "HIGH", "MEDIUM")
+    | eval mitre_technique="T1613"
+    | eval mitre_tactic="Discovery"
+    | eval alert_name="Container Cloud Discovery"
+    | table _time, host, user, enum_target, cmdline, severity,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "user"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Container/Cloud Recon — $enum_target$ by $user$ on $host$"
+        rule_description: >
+          Container/cloud enumeration on $host$ by $user$. Target: $enum_target$.
+          Command: $cmdline$. Cloud metadata access can expose credentials and
+          infrastructure details. Kubernetes secret enumeration exposes sensitive data.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "user"
+        risk_score: 68
+        risk_message: "Container/cloud discovery — $enum_target$ — T1613"
+  false_positives:
+    - description: "Container administrators routinely use docker/kubectl."
+      tuning: "Exclude known container admin and DevOps accounts."
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  inv_1_full_command_history:
+    name: "Complete Command History for User on Host"
+    search: |
+      index=linux sourcetype=linux:audit type=EXECVE
+          auid="$suspect_user$" hostname="$target_host$" earliest=-24h
+      | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+      | sort _time
+      | table _time, cmdline, exe
+
+  inv_2_recon_timeline:
+    name: "Reconnaissance Command Timeline"
+    search: |
+      index=linux sourcetype=linux:audit type=EXECVE
+          hostname="$target_host$" earliest=-1h
+      | eval cmdline=lower(a0." ".coalesce(a1,"")." ".coalesce(a2,""))
+      | where match(cmdline, "(uname|id|whoami|ifconfig|ip addr|netstat|ss|ps|find|cat /etc)")
+      | sort _time
+      | table _time, auid, cmdline
+
+  inv_3_downloaded_files:
+    name: "Files Downloaded on Host"
+    search: |
+      index=linux sourcetype=linux:audit type=EXECVE
+          (comm="curl" OR comm="wget") hostname="$target_host$" earliest=-24h
+      | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+      | sort _time
+      | table _time, auid, cmdline
+
+  inv_4_suid_files:
+    name: "SUID Binaries Found on Host"
+    search: |
+      index=linux sourcetype=linux:audit type=EXECVE comm="find"
+          hostname="$target_host$" earliest=-24h
+      | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+      | where match(cmdline, "perm.*4000|u=s")
+      | table _time, auid, cmdline
+
+  inv_5_metadata_access:
+    name: "Cloud Metadata Endpoint Access"
+    search: |
+      index=linux (sourcetype=linux:audit OR sourcetype=sysmon_linux)
+          hostname="$target_host$" earliest=-24h
+      | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,""))
+      | where match(cmdline, "169\\.254\\.169\\.254")
+      | table _time, cmdline
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+incident_response_playbook:
+  name: "RHEL Discovery/Enumeration — Incident Response Playbook"
+
+  phase_1_triage:
+    - step: "Identify the discovery scope: system info, users, network, security tools, containers"
+    - step: "LinPEAS/LinEnum detection is CRITICAL — indicates active post-compromise"
+    - step: "Determine initial access vector: how did the attacker get on the system?"
+
+  phase_2_containment:
+    - step: "Lock the compromised user account"
+    - step: "Kill any running enumeration scripts"
+    - step: "Remove downloaded enumeration tools from /tmp, /dev/shm"
+    - step: "If cloud metadata was accessed: rotate cloud credentials immediately"
+
+  phase_3_investigation:
+    - step: "Review the full command history for the user (inv_1)"
+    - step: "Determine what the attacker discovered: SUID files, credentials, keys"
+    - step: "Check for subsequent privilege escalation or lateral movement"
+    - step: "Identify if enumeration output was exfiltrated"
+
+  phase_4_remediation:
+    - step: "Fix discovered vulnerabilities: patch SUID exploits, fix misconfigs"
+    - step: "Remove unnecessary SUID bits and dangerous capabilities"
+    - step: "Restrict cloud metadata access via iptables"
+    - step: "Implement least-privilege access controls"

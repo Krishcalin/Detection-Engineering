@@ -1,0 +1,848 @@
+# ==============================================================================
+#  RHEL Malicious Execution Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for malicious code execution on Red
+#                Hat Enterprise Linux (RHEL) systems. Covers reverse shell
+#                patterns, suspicious script interpreter usage, fileless
+#                execution via /dev/shm and memfd, webshell command execution,
+#                download-and-execute chains, cron-based execution, process
+#                injection via ptrace, and exploitation of interpreted apps.
+#
+#  MITRE ATT&CK: T1059.004 - Command and Scripting Interpreter: Unix Shell
+#                 T1059.006 - Command and Scripting Interpreter: Python
+#                 T1620     - Reflective Code Loading
+#                 T1505.003 - Server Software Component: Web Shell
+#                 T1105     - Ingress Tool Transfer
+#                 T1053.003 - Scheduled Task/Job: Cron
+#                 T1055.008 - Process Injection: Ptrace System Calls
+#                 T1203     - Exploitation for Client Execution
+#  Kill Chain   : Execution
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-05
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Deploy auditd with EXECVE logging:
+#     -a always,exit -F arch=b64 -S execve -k exec_log
+#     -a always,exit -F arch=b32 -S execve -k exec_log
+#     -a always,exit -F arch=b64 -S ptrace -k ptrace_log
+#
+#  2. Deploy Sysmon for Linux with Process Creation (Event 1) rules.
+#
+#  3. Forward all logs to Splunk:
+#     index=linux sourcetype=linux:audit
+#     index=linux sourcetype=sysmon_linux
+#     index=linux sourcetype=syslog
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: Reverse Shell Execution (T1059.004)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Reverse shells are the primary method attackers use to establish interactive
+#  C2 on compromised Linux systems. This rule covers bash, python, perl, ruby,
+#  php, netcat, socat, and mkfifo-based reverse shell patterns.
+#
+#  Confidence  : VERY HIGH (94)
+#  Severity    : CRITICAL
+
+rule_1_reverse_shell:
+  name: "Execution — Reverse Shell Detected (T1059.004)"
+  description: >
+    Detects common reverse shell patterns in process command lines via auditd
+    EXECVE and Sysmon Event 1: bash -i >& /dev/tcp, nc/ncat -e /bin/bash,
+    python socket+subprocess, perl Socket, ruby rsocket, php fsockopen,
+    mkfifo pipe chains, socat TCP EXEC, and openssl s_client reverse shells.
+    Any reverse shell on a production RHEL system is a CRITICAL indicator
+    of active compromise with an attacker holding an interactive session.
+  mitre:
+    tactic: "Execution"
+    technique: T1059.004
+    technique_name: "Command and Scripting Interpreter: Unix Shell"
+    related_techniques:
+      - "T1571: Non-Standard Port (reverse shell to unusual ports)"
+      - "T1573: Encrypted Channel (openssl reverse shells)"
+  severity: critical
+  confidence: 94
+  risk_score: 95
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Linux Audit Log — EXECVE syscall (key=exec_log)"
+    - "Sysmon for Linux — Event 1 (Process Creation)"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Bash reverse shell: bash -i >& /dev/tcp ```
+    | where match(cmdline_lower, "bash\s+-i\s+.*(/dev/tcp|/dev/udp)")
+    ``` Netcat reverse shell: nc -e /bin/bash, ncat ```
+        OR match(cmdline_lower, "(nc|ncat|netcat)\s+.*(-e\s+/bin|exec\s+/bin)")
+    ``` Python reverse shell: socket, subprocess ```
+        OR match(cmdline_lower, "python[23]?\s+-c\s+.*import\s+socket.*subprocess")
+    ``` Perl reverse shell: Socket ```
+        OR match(cmdline_lower, "perl\s+-e\s+.*socket.*exec")
+    ``` Ruby reverse shell: rsocket ```
+        OR match(cmdline_lower, "ruby\s+.*(-rsocket|TCPSocket)")
+    ``` PHP reverse shell: fsockopen ```
+        OR match(cmdline_lower, "php\s+-r\s+.*fsockopen")
+    ``` Mkfifo pipe chain ```
+        OR match(cmdline_lower, "mkfifo.*/tmp/.*\|.*/bin/(sh|bash)")
+    ``` Socat reverse shell ```
+        OR match(cmdline_lower, "socat\s+.*tcp.*exec")
+    ``` OpenSSL reverse shell ```
+        OR match(cmdline_lower, "openssl\s+s_client.*exec")
+    ``` Generic /dev/tcp pattern ```
+        OR match(cmdline_lower, "/dev/tcp/[0-9]")
+    | eval shell_type=case(
+        match(cmdline_lower, "bash.*(/dev/tcp|/dev/udp)"),       "BASH_DEVTCP_REVSHELL",
+        match(cmdline_lower, "(nc|ncat|netcat).*-e"),            "NETCAT_REVSHELL",
+        match(cmdline_lower, "python.*socket.*subprocess"),      "PYTHON_REVSHELL",
+        match(cmdline_lower, "perl.*socket.*exec"),              "PERL_REVSHELL",
+        match(cmdline_lower, "ruby.*(rsocket|TCPSocket)"),       "RUBY_REVSHELL",
+        match(cmdline_lower, "php.*fsockopen"),                  "PHP_REVSHELL",
+        match(cmdline_lower, "mkfifo"),                          "MKFIFO_PIPE_REVSHELL",
+        match(cmdline_lower, "socat.*tcp.*exec"),                "SOCAT_REVSHELL",
+        match(cmdline_lower, "openssl.*s_client"),               "OPENSSL_ENCRYPTED_REVSHELL",
+        1==1,                                                    "REVERSE_SHELL"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1059.004"
+    | eval mitre_tactic="Execution"
+    | eval alert_name="Reverse Shell"
+    | table _time, host, user, shell_type, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/2 * * * *"
+    earliest: "-5m"
+    latest: "now"
+    window: "2m"
+  throttle:
+    field: "host"
+    period: "10m"
+  actions:
+    - notable_event:
+        rule_title: "REVERSE SHELL — $shell_type$ on $host$ by $user$"
+        rule_description: >
+          Reverse shell execution detected on $host$ by $user$. Type: $shell_type$.
+          Command: $cmdline$. An attacker has an interactive shell session. IMMEDIATE:
+          Kill the process, isolate the host, and investigate the initial access vector.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 95
+        risk_message: "Reverse shell — $shell_type$ — T1059.004"
+  false_positives:
+    - description: >
+        Authorized penetration testing may use reverse shells. These should have
+        documented scope and timing windows.
+      tuning: "Exclude during authorized pentest windows with documented IP ranges."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Suspicious Script Interpreter Execution (T1059.006)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Script interpreters (python, perl, ruby) executing inline code or spawned
+#  by web servers indicate exploitation. Scripts from /tmp or /dev/shm are
+#  almost certainly malicious.
+#
+#  Confidence  : HIGH (85)
+#  Severity    : HIGH
+
+rule_2_suspicious_script_interpreter:
+  name: "Execution — Suspicious Script Interpreter with Inline Code (T1059.006)"
+  description: >
+    Detects Python, Perl, and Ruby interpreters executing inline code (-c, -e
+    flags) with suspicious patterns (import os, import socket, exec, eval,
+    system, spawn). Also detects script interpreters spawned by web server
+    processes (httpd, nginx, php-fpm, tomcat) — a strong webshell indicator.
+    Scripts executing from temp directories (/tmp, /dev/shm, /var/tmp) are
+    flagged as high-risk.
+  mitre:
+    tactic: "Execution"
+    technique: T1059.006
+    technique_name: "Command and Scripting Interpreter: Python"
+    related_techniques:
+      - "T1059.004: Unix Shell"
+      - "T1059.009: Command and Scripting Interpreter: Cloud API"
+  severity: high
+  confidence: 85
+  risk_score: 80
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Linux Audit Log — EXECVE syscall"
+    - "Sysmon for Linux — Event 1 (Process Creation)"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,""))
+    | eval cmdline_lower=lower(cmdline)
+    | eval parent=coalesce(ParentImage, ppid, "unknown")
+    ``` Detect inline code execution with suspicious patterns ```
+    | where (match(cmdline_lower, "python[23]?\s+-c\s+") AND match(cmdline_lower, "(import\s+os|import\s+socket|exec\(|eval\(|subprocess|__import__)"))
+        OR (match(cmdline_lower, "perl\s+-e\s+") AND match(cmdline_lower, "(system|exec|socket|reverse|fork|open)"))
+        OR (match(cmdline_lower, "ruby\s+(-e\s+|-rsocket)") AND match(cmdline_lower, "(system|exec|spawn|TCPSocket)"))
+    ``` Detect web server spawning script interpreters ```
+        OR (match(parent, "(httpd|nginx|php-fpm|apache2|tomcat|java|uwsgi|gunicorn)") AND match(cmdline_lower, "(python|perl|ruby|bash|sh)\s"))
+    ``` Detect scripts from temp directories ```
+        OR match(cmdline_lower, "(python|perl|ruby)\s+(/tmp/|/dev/shm/|/var/tmp/)")
+    | eval script_risk=case(
+        match(parent, "(httpd|nginx|php-fpm|apache2|tomcat)"), "WEB_SERVER_CHILD — likely webshell",
+        match(cmdline_lower, "(/tmp/|/dev/shm/|/var/tmp/)"),  "TEMP_DIR_SCRIPT — staging area",
+        match(cmdline_lower, "socket|subprocess"),             "NETWORK_CAPABLE — potential C2",
+        1==1,                                                  "INLINE_CODE_EXECUTION"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1059.006"
+    | eval mitre_tactic="Execution"
+    | eval alert_name="Suspicious Script Interpreter"
+    | table _time, host, user, parent, script_risk, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Suspicious Script — $script_risk$ on $host$ by $user$"
+        rule_description: >
+          Suspicious script interpreter execution on $host$ by $user$. Risk:
+          $script_risk$. Parent: $parent$. Command: $cmdline$. Web server child
+          processes indicate webshell exploitation. Investigate the parent process
+          chain and check for network connections.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 80
+        risk_message: "Suspicious script — $script_risk$ — T1059.006"
+  false_positives:
+    - description: >
+        Application servers (Django, Flask, Rails) use Python/Ruby interpreters
+        normally. The rule targets inline code (-c/-e) specifically, which is
+        unusual for normal application operation.
+      tuning: "Exclude known application server processes from inline detection."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Fileless Execution via /dev/shm and memfd (T1620)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Fileless execution avoids writing to disk — malware runs from shared memory
+#  (/dev/shm), tmpfs, or memfd_create file descriptors. These are harder to
+#  detect and leave no on-disk artifacts for traditional file scanning.
+#
+#  Confidence  : HIGH (90)
+#  Severity    : CRITICAL
+
+rule_3_fileless_execution:
+  name: "Execution — Fileless Execution from /dev/shm or memfd (T1620)"
+  description: >
+    Detects execution of binaries from in-memory or tmpfs locations: /dev/shm/,
+    /run/shm/, memfd_create file descriptors (/proc/self/fd/), and processes
+    whose exe path contains "(deleted)" or "memfd:". Fileless execution avoids
+    disk-based detection and leaves no artifacts for traditional antimalware.
+  mitre:
+    tactic: "Execution"
+    technique: T1620
+    technique_name: "Reflective Code Loading"
+    related_techniques:
+      - "T1059.004: Unix Shell"
+      - "T1036.004: Masquerading (hiding execution)"
+  severity: critical
+  confidence: 90
+  risk_score: 90
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Linux Audit Log — EXECVE with exe path in /dev/shm or memfd"
+    - "Sysmon for Linux — Event 1 (Process Creation)"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=SYSCALL syscall=execve) OR
+        (sourcetype=sysmon_linux EventCode=1)
+    | eval exe_path=coalesce(Image, exe, "unknown")
+    | eval exe_lower=lower(exe_path)
+    ``` Detect execution from tmpfs/shared memory ```
+    | where match(exe_lower, "^/dev/shm/")
+        OR match(exe_lower, "^/run/shm/")
+    ``` Detect memfd_create fileless execution ```
+        OR match(exe_lower, "memfd:")
+        OR match(exe_lower, "/proc/self/fd/")
+        OR match(exe_lower, "/proc/[0-9]+/fd/")
+    ``` Detect deleted binary execution ```
+        OR match(exe_lower, "\\(deleted\\)")
+    | eval exec_type=case(
+        match(exe_lower, "/dev/shm/"),        "DEV_SHM_EXECUTION",
+        match(exe_lower, "memfd:"),           "MEMFD_FILELESS",
+        match(exe_lower, "/proc/.*/fd/"),     "PROC_FD_EXECUTION",
+        match(exe_lower, "\\(deleted\\)"),    "DELETED_BINARY_EXECUTION",
+        1==1,                                 "FILELESS_EXECUTION"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval cmdline=coalesce(CommandLine, comm, "unknown")
+    | eval mitre_technique="T1620"
+    | eval mitre_tactic="Execution"
+    | eval alert_name="Fileless Execution"
+    | table _time, host, user, exec_type, exe_path, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "FILELESS EXECUTION — $exec_type$ on $host$ by $user$"
+        rule_description: >
+          Fileless execution detected on $host$ by $user$. Type: $exec_type$.
+          Path: $exe_path$. Command: $cmdline$. Fileless execution avoids disk
+          artifacts. Capture /proc/PID/maps and memory before killing the process.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 90
+        risk_message: "Fileless execution — $exec_type$ — T1620"
+  false_positives:
+    - description: >
+        Some legitimate applications use /dev/shm for shared memory temporary
+        files (databases, JVM). These should not be executable binaries.
+      tuning: "Exclude known application tmpfs usage patterns."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Webshell Command Execution (T1505.003)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Webshells allow attackers to execute system commands through the web server.
+#  Key indicator: web server process spawning shell or system tool child procs.
+#
+#  Confidence  : VERY HIGH (92)
+#  Severity    : CRITICAL
+
+rule_4_webshell_execution:
+  name: "Execution — Web Server Spawning Shell Process (Webshell) (T1505.003)"
+  description: >
+    Detects web server processes (httpd, nginx, php-fpm, apache2, tomcat, java,
+    uwsgi, gunicorn) spawning shell processes or system reconnaissance tools
+    (bash, sh, id, whoami, uname, cat, wget, curl). This is the primary
+    detection pattern for webshell activity — web servers should never spawn
+    interactive shells or execute system commands directly.
+  mitre:
+    tactic: "Execution"
+    technique: T1505.003
+    technique_name: "Server Software Component: Web Shell"
+    related_techniques:
+      - "T1190: Exploit Public-Facing Application (initial access via webshell)"
+      - "T1059.004: Unix Shell"
+  severity: critical
+  confidence: 92
+  risk_score: 92
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Sysmon for Linux — Event 1 (Process Creation with parent process)"
+    - "Linux Audit Log — EXECVE with ppid correlation"
+
+  search: |
+    index=linux sourcetype=sysmon_linux EventCode=1
+    ``` Web server as parent process ```
+    | where match(ParentImage, "(httpd|nginx|php-fpm|apache2|tomcat|java|uwsgi|gunicorn|node|passenger)")
+    ``` Child is a shell or system tool ```
+    | where match(Image, "/(bash|sh|dash|zsh|csh|ksh|python|perl|ruby|id|whoami|uname|cat|wget|curl|nc|ncat|chmod|chown|useradd|passwd)")
+    | eval child_process=Image
+    | eval parent_process=ParentImage
+    | eval cmdline=CommandLine
+    | eval user=coalesce(User, "unknown")
+    | eval host=coalesce(Computer, "unknown")
+    | eval webshell_indicator=case(
+        match(Image, "/(bash|sh|dash|zsh)"),       "SHELL_SPAWN — interactive shell from web",
+        match(Image, "/(wget|curl)"),               "DOWNLOAD — file transfer from web",
+        match(Image, "/(id|whoami|uname)"),          "RECON — reconnaissance from web",
+        match(Image, "/(nc|ncat)"),                  "NETCAT — potential reverse shell from web",
+        match(Image, "/(python|perl|ruby)"),         "INTERPRETER — script from web",
+        1==1,                                       "SYSTEM_CMD_FROM_WEB"
+      )
+    | eval mitre_technique="T1505.003"
+    | eval mitre_tactic="Execution"
+    | eval alert_name="Webshell Execution"
+    | table _time, host, user, parent_process, child_process, webshell_indicator,
+            cmdline, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/2 * * * *"
+    earliest: "-5m"
+    latest: "now"
+    window: "2m"
+  throttle:
+    field: "host"
+    period: "10m"
+  actions:
+    - notable_event:
+        rule_title: "WEBSHELL — $parent_process$ spawned $child_process$ on $host$"
+        rule_description: >
+          Webshell activity detected on $host$. Web server $parent_process$ spawned
+          $child_process$ ($webshell_indicator$). Command: $cmdline$. Find the
+          webshell file in the web root, check access logs for the attacker's IP,
+          and investigate how the webshell was uploaded.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 92
+        risk_message: "Webshell — $parent_process$ → $child_process$ — T1505.003"
+  false_positives:
+    - description: >
+        CGI scripts and server-side applications may legitimately call system
+        commands. These should be well-documented and limited.
+      tuning: "Exclude known CGI paths and expected system commands per application."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Download-and-Execute Chain (T1105)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The most common post-exploitation pattern: download a tool or payload
+#  with curl/wget, make it executable, and run it. Also covers curl piped
+#  directly to bash (curl | bash).
+#
+#  Confidence  : HIGH (88)
+#  Severity    : HIGH
+
+rule_5_download_and_execute:
+  name: "Execution — Download and Execute Chain Detected (T1105)"
+  description: >
+    Detects download-and-execute patterns: curl/wget downloading files to temp
+    directories (/tmp, /dev/shm, /var/tmp) followed by chmod +x and execution,
+    curl piped directly to bash/sh (curl | bash), and wget -O- piped to shell.
+    This is the most common payload delivery mechanism for Linux malware,
+    cryptominers, and post-exploitation tools.
+  mitre:
+    tactic: "Execution"
+    technique: T1105
+    technique_name: "Ingress Tool Transfer"
+    related_techniques:
+      - "T1059.004: Unix Shell"
+      - "T1204.002: User Execution: Malicious File"
+  severity: high
+  confidence: 88
+  risk_score: 85
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Linux Audit Log — EXECVE for curl, wget, chmod, bash"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect curl/wget piped to shell ```
+    | where match(cmdline_lower, "(curl|wget)\s+.*\|\s*(bash|sh|dash|zsh)")
+    ``` Detect curl -o/-O to temp followed by execution ```
+        OR match(cmdline_lower, "(curl|wget)\s+.*(-o\s*|-O\s*)(/tmp/|/dev/shm/|/var/tmp/)")
+    ``` Detect wget -O- piped to shell ```
+        OR match(cmdline_lower, "wget\s+-O-?\s+.*\|\s*(bash|sh)")
+    ``` Detect chmod +x on temp directory files ```
+        OR match(cmdline_lower, "chmod\s+(\+x|[0-7]*[1357][0-7]*)\s+(/tmp/|/dev/shm/|/var/tmp/)")
+    ``` Detect execution from temp after download ```
+        OR match(cmdline_lower, "(/tmp/|/dev/shm/|/var/tmp/)\S+\.(sh|py|pl|rb|elf|bin)")
+    | eval download_exec_type=case(
+        match(cmdline_lower, "(curl|wget).*\\|.*(bash|sh)"), "PIPE_TO_SHELL — direct execution",
+        match(cmdline_lower, "chmod.*\\+x.*/tmp"),           "CHMOD_TEMP — making downloaded file executable",
+        match(cmdline_lower, "(curl|wget).*(/tmp|/dev/shm)"), "DOWNLOAD_TO_TEMP — payload staging",
+        match(cmdline_lower, "(/tmp|/dev/shm).*\\.(sh|py|pl|elf)"), "TEMP_SCRIPT_EXECUTION",
+        1==1,                                                "DOWNLOAD_AND_EXECUTE"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1105"
+    | eval mitre_tactic="Execution"
+    | eval alert_name="Download and Execute"
+    | table _time, host, user, download_exec_type, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Download-Execute — $download_exec_type$ on $host$ by $user$"
+        rule_description: >
+          Download-and-execute pattern detected on $host$ by $user$. Type:
+          $download_exec_type$. Command: $cmdline$. Check the downloaded URL/file,
+          investigate what was executed, and check for persistence.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 85
+        risk_message: "Download and execute — $download_exec_type$ — T1105"
+  false_positives:
+    - description: >
+        Installation scripts (e.g., Docker install, Node.js nvm) use curl | bash.
+        These should be infrequent and from known URLs.
+      tuning: "Exclude known installer URLs from trusted vendors."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Cron/At Executing Suspicious Commands (T1053.003)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_cron_suspicious_execution:
+  name: "Execution — Cron/At Executing Suspicious Commands (T1053.003)"
+  description: >
+    Detects the CROND process spawning suspicious child commands: reverse shells,
+    download operations, encoded payloads, or network connections. This
+    complements the persistence cron rule by detecting ACTIVE execution of
+    malicious cron entries (rather than their creation).
+  mitre:
+    tactic: "Execution"
+    technique: T1053.003
+    technique_name: "Scheduled Task/Job: Cron"
+    related_techniques:
+      - "T1059.004: Unix Shell"
+  severity: high
+  confidence: 85
+  risk_score: 80
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Sysmon for Linux — Event 1 (CROND parent)"
+    - "Linux Audit Log — EXECVE with CROND parent"
+
+  search: |
+    index=linux sourcetype=sysmon_linux EventCode=1
+        ParentImage="*/crond" OR ParentImage="*/cron" OR ParentImage="*/atd"
+    | eval cmdline=lower(CommandLine)
+    ``` Flag suspicious cron-executed commands ```
+    | where match(cmdline, "(curl|wget|/dev/tcp|nc\s+-|ncat|base64|python.*-c|perl.*-e|bash.*-i|socat|reverse)")
+        OR match(cmdline, "(/tmp/|/dev/shm/|/var/tmp/)")
+    | eval cron_risk=case(
+        match(cmdline, "(/dev/tcp|nc.*-e|reverse|socat.*exec)"), "REVERSE_SHELL_VIA_CRON",
+        match(cmdline, "(curl|wget)"),                           "DOWNLOAD_VIA_CRON",
+        match(cmdline, "base64"),                                "ENCODED_PAYLOAD_VIA_CRON",
+        match(cmdline, "(/tmp/|/dev/shm/)"),                     "TEMP_EXECUTION_VIA_CRON",
+        1==1,                                                    "SUSPICIOUS_CRON_EXECUTION"
+      )
+    | eval user=coalesce(User, "unknown")
+    | eval host=coalesce(Computer, "unknown")
+    | eval mitre_technique="T1053.003"
+    | eval mitre_tactic="Execution"
+    | eval alert_name="Malicious Cron Execution"
+    | table _time, host, user, cron_risk, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Malicious Cron — $cron_risk$ on $host$"
+        rule_description: >
+          CROND/ATD spawned a suspicious command on $host$. Risk: $cron_risk$.
+          Command: $cmdline$. Identify and remove the malicious cron entry.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 80
+        risk_message: "Malicious cron execution — $cron_risk$ — T1053.003"
+  false_positives:
+    - description: >
+        Legitimate cron jobs may use curl/wget for health checks or data pulls.
+      tuning: "Maintain an allowlist of expected cron job command patterns."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: Process Injection via ptrace (T1055.008)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_process_injection_ptrace:
+  name: "Execution — Process Injection via ptrace (T1055.008)"
+  description: >
+    Detects ptrace-based process injection: PTRACE_ATTACH followed by
+    PTRACE_POKETEXT/PTRACE_POKEDATA to write shellcode into a running process,
+    gdb attaching to processes and using set commands for injection, and
+    /proc/PID/mem writes. Process injection allows code execution in the
+    context of another process, evading process-based detections.
+  mitre:
+    tactic: "Execution"
+    technique: T1055.008
+    technique_name: "Process Injection: Ptrace System Calls"
+    related_techniques:
+      - "T1055: Process Injection"
+  severity: high
+  confidence: 85
+  risk_score: 82
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Linux Audit Log — ptrace syscall (key=ptrace_log)"
+
+  search: |
+    index=linux sourcetype=linux:audit type=SYSCALL syscall=ptrace
+    | eval ptrace_op=case(
+        a0=="16",  "PTRACE_ATTACH",
+        a0=="17",  "PTRACE_DETACH",
+        a0=="4",   "PTRACE_POKETEXT (code write)",
+        a0=="5",   "PTRACE_POKEDATA (data write)",
+        a0=="6",   "PTRACE_POKEUSR (register write)",
+        a0=="24",  "PTRACE_SYSCALL",
+        a0=="31",  "PTRACE_SEIZE",
+        1==1,      "PTRACE_OP_".a0
+      )
+    ``` Focus on write operations — these indicate injection ```
+    | where match(ptrace_op, "(POKETEXT|POKEDATA|POKEUSR|ATTACH|SEIZE)")
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    | eval target_pid=a2
+    ``` Aggregate rapid ptrace operations (injection pattern) ```
+    | bin span=1m _time
+    | stats
+        dc(ptrace_op)  as distinct_ops,
+        count           as total_calls,
+        values(ptrace_op) as operations,
+        values(target_pid) as targets
+        by _time, user, host, exe
+    | where distinct_ops >= 2 OR total_calls >= 5
+    | eval mitre_technique="T1055.008"
+    | eval mitre_tactic="Execution"
+    | eval alert_name="Ptrace Injection"
+    | table _time, host, user, exe, distinct_ops, total_calls,
+            operations, targets, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "PTRACE INJECTION — $distinct_ops$ ops by $exe$ on $host$"
+        rule_description: >
+          Process injection via ptrace detected on $host$ by $user$. Injector: $exe$.
+          Operations: $operations$. Target PIDs: $targets$. Total calls: $total_calls$.
+          Process injection allows code execution in another process's context.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 82
+        risk_message: "Ptrace injection — $distinct_ops$ ops — T1055.008"
+  false_positives:
+    - description: >
+        Debuggers (gdb, strace) use ptrace for legitimate debugging. Developer
+        workstations are more likely to see this.
+      tuning: "Exclude developer accounts and restrict to server environments."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: Application Exploitation — Java/Log4Shell (T1203)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_application_exploitation:
+  name: "Execution — Java/Application Exploitation Indicator (T1203)"
+  description: >
+    Detects indicators of application-level exploitation: Java processes spawning
+    shells (Log4Shell, Struts, Spring indicators), Log4Shell JNDI patterns in
+    logs, and known exploitation tool signatures (ysoserial, marshalsec) in
+    command lines. Web application frameworks spawning unexpected children is
+    a strong indicator of successful exploitation.
+  mitre:
+    tactic: "Execution"
+    technique: T1203
+    technique_name: "Exploitation for Client Execution"
+    related_techniques:
+      - "T1190: Exploit Public-Facing Application"
+      - "T1505.003: Web Shell"
+  severity: critical
+  confidence: 88
+  risk_score: 90
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Sysmon for Linux — Event 1 (Process Creation)"
+    - "Linux syslog — application logs with exploit patterns"
+
+  search: |
+    ``` Detect Java spawning shell processes ```
+    (index=linux sourcetype=sysmon_linux EventCode=1
+        ParentImage="*/java" OR ParentImage="*/javaw"
+    | where match(Image, "/(bash|sh|dash|cmd|python|perl|curl|wget|nc|ncat|id|whoami)")
+    | eval detection_type="JAVA_SHELL_SPAWN"
+    | eval cmdline=CommandLine
+    | eval parent=ParentImage)
+    | append
+        [``` Detect Log4Shell JNDI patterns in syslog ```
+         search index=linux sourcetype=syslog
+             ("${jndi:ldap://" OR "${jndi:rmi://" OR "${jndi:dns://" OR "${jndi:iiop://")
+         | eval detection_type="LOG4SHELL_JNDI_PATTERN"
+         | eval cmdline=_raw
+         | eval parent="syslog"]
+    | append
+        [``` Detect exploitation tools ```
+         search index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+         | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,""))
+         | where match(lower(cmdline), "(ysoserial|marshalsec|log4j.*exploit|spring4shell|struts.*exploit)")
+         | eval detection_type="EXPLOITATION_TOOL"
+         | eval parent="unknown"]
+    | eval user=coalesce(User, auid, "unknown")
+    | eval host=coalesce(Computer, hostname, "unknown")
+    | eval mitre_technique="T1203"
+    | eval mitre_tactic="Execution"
+    | eval alert_name="Application Exploitation"
+    | table _time, host, user, detection_type, parent, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/2 * * * *"
+    earliest: "-5m"
+    latest: "now"
+    window: "2m"
+  throttle:
+    field: "host"
+    period: "10m"
+  actions:
+    - notable_event:
+        rule_title: "APP EXPLOIT — $detection_type$ on $host$"
+        rule_description: >
+          Application exploitation indicator on $host$. Type: $detection_type$.
+          Parent: $parent$. Command: $cmdline$. Java spawning shell processes
+          indicates successful exploitation (Log4Shell, Struts, Spring).
+          Identify the vulnerable application and patch immediately.
+        severity: critical
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 90
+        risk_message: "Application exploitation — $detection_type$ — T1203"
+  false_positives:
+    - description: >
+        Some Java applications legitimately exec shell commands for system
+        integration (e.g., ImageMagick conversion). Document these.
+      tuning: "Exclude known Java applications that legitimately spawn shell commands."
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  inv_1_process_tree:
+    name: "Full Process Tree for Suspected Execution"
+    description: >
+      Reconstructs the parent-child process tree on the host around the
+      alert time.
+    search: |
+      index=linux sourcetype=sysmon_linux EventCode=1
+          Computer="$target_host$" earliest=-1h latest=+1h
+      | table _time, User, Image, ParentImage, CommandLine, ProcessId, ParentProcessId
+
+  inv_2_network_connections:
+    name: "Network Connections from Suspected Process"
+    description: >
+      Shows all network connections from the host during the alert window.
+    search: |
+      index=linux sourcetype=sysmon_linux EventCode=3
+          Computer="$target_host$" earliest=-1h
+      | table _time, User, Image, DestinationIp, DestinationPort, Protocol
+
+  inv_3_temp_dir_files:
+    name: "Files Created in Temp Directories on Host"
+    description: >
+      Lists files created in /tmp, /dev/shm, /var/tmp in the last 24 hours.
+    search: |
+      index=linux sourcetype=sysmon_linux EventCode=11
+          Computer="$target_host$"
+          (TargetFilename="/tmp/*" OR TargetFilename="/dev/shm/*" OR TargetFilename="/var/tmp/*")
+          earliest=-24h
+      | stats count by TargetFilename, Image, User
+      | sort - count
+
+  inv_4_web_server_children:
+    name: "All Processes Spawned by Web Server"
+    description: >
+      Shows all child processes of web server processes in the last 24 hours.
+    search: |
+      index=linux sourcetype=sysmon_linux EventCode=1
+          Computer="$target_host$"
+          (ParentImage="*httpd*" OR ParentImage="*nginx*" OR ParentImage="*php-fpm*"
+           OR ParentImage="*tomcat*" OR ParentImage="*java*")
+          earliest=-24h
+      | table _time, ParentImage, Image, CommandLine, User
+
+  inv_5_cron_executions:
+    name: "Recent Cron Job Executions on Host"
+    description: >
+      Shows commands executed by crond in the last 24 hours.
+    search: |
+      index=linux sourcetype=sysmon_linux EventCode=1
+          Computer="$target_host$" ParentImage="*crond*"
+          earliest=-24h
+      | table _time, Image, CommandLine, User
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+incident_response_playbook:
+  name: "RHEL Malicious Execution — Incident Response Playbook"
+
+  phase_1_triage:
+    - step: "Identify the execution type: reverse shell, webshell, fileless, download-and-execute"
+    - step: "PRIORITY: Reverse shells and webshells are CRITICAL — respond within 5 minutes"
+    - step: "Identify the PID and capture /proc/PID/ info before killing"
+    - step: "Check network connections from the malicious process: ss -tlnp, lsof -i"
+
+  phase_2_containment:
+    - step: "Kill the malicious process: kill -9 <PID>"
+    - step: "Block C2 IP at the firewall: firewall-cmd --add-rich-rule='rule family=ipv4 source address=<IP> drop'"
+    - step: "For webshells: identify and quarantine the webshell file"
+    - step: "Lock the compromised user account"
+    - step: "Network-isolate if multiple indicators suggest full compromise"
+
+  phase_3_evidence:
+    - step: "Collect process memory dump before killing: gcore <PID>"
+    - step: "Collect /proc/PID/maps, /proc/PID/cmdline, /proc/PID/environ"
+    - step: "Collect network connections: ss -tlnp > evidence.txt"
+    - step: "Collect auditd EXECVE logs for the user session"
+    - step: "For webshells: collect web server access logs to identify attacker IP and exploit"
+
+  phase_4_remediation:
+    - step: "Remove malicious files from /tmp, /dev/shm, /var/tmp"
+    - step: "Remove webshell files and patch the vulnerable web application"
+    - step: "Remove malicious cron entries and systemd services"
+    - step: "Patch vulnerable applications (Log4j, Struts, Spring)"
+    - step: "Rotate all credentials on the host"

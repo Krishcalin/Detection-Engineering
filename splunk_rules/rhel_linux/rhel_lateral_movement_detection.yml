@@ -1,0 +1,668 @@
+# ==============================================================================
+#  RHEL Lateral Movement Attack Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detection rules for lateral movement techniques on RHEL Linux.
+#                Covers unusual SSH connections, SSH tunneling/port forwarding,
+#                SSH agent forwarding abuse, configuration management tool abuse,
+#                suspicious file transfers, internal network scanning, and
+#                exploitation of internal services.
+#
+#  MITRE ATT&CK: T1021.004 - Remote Services: SSH
+#                 T1572     - Protocol Tunneling
+#                 T1563.001 - Remote Service Session Hijacking: SSH Hijacking
+#                 T1072     - Software Deployment Tools
+#                 T1105     - Ingress Tool Transfer
+#                 T1046     - Network Service Discovery
+#                 T1210     - Exploitation of Remote Services
+#  Kill Chain   : Lateral Movement
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-05
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Deploy auditd EXECVE logging on ALL RHEL hosts.
+#  2. Deploy Sysmon for Linux with network connection events (Event 3).
+#  3. Forward /var/log/secure for SSH auth events.
+#  4. Lookup tables:
+#     - linux_bastion_hosts.csv (host, is_bastion)
+#     - linux_server_inventory.csv (host, role, environment)
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: Unusual Outbound SSH from Server (T1021.004)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_unusual_outbound_ssh:
+  name: "Lateral Movement — Unusual Outbound SSH Connection (T1021.004)"
+  description: >
+    Detects SSH connections FROM servers to other internal servers when the
+    source is not a known bastion/jump host. Most application servers should
+    not initiate SSH to other servers — this pattern indicates an attacker
+    pivoting through a compromised host. Cross-references against
+    linux_bastion_hosts.csv to exclude authorized jump boxes.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: T1021.004
+    technique_name: "Remote Services: SSH"
+    related_techniques:
+      - "T1078: Valid Accounts (using stolen credentials)"
+  severity: high
+  confidence: 82
+  risk_score: 78
+  kill_chain_phase: "Lateral Movement"
+  data_sources:
+    - "Sysmon for Linux — Event 3 (Network Connection)"
+    - "Linux Secure Log — SSH login events"
+
+  search: |
+    index=linux sourcetype=sysmon_linux EventCode=3
+        DestinationPort=22 Initiated=true
+    ``` Get source host info ```
+    | eval src_host=Computer
+    | eval dst_ip=DestinationIp
+    | eval user=User
+    ``` Exclude loopback and non-RFC1918 ```
+    | where NOT match(dst_ip, "^(127\.|::1)")
+    ``` Cross-reference bastion hosts — exclude authorized jump boxes ```
+    | lookup linux_bastion_hosts.csv host as src_host OUTPUT is_bastion
+    | where is_bastion!="true" OR isnull(is_bastion)
+    ``` Filter for internal-to-internal SSH ```
+    | where match(dst_ip, "^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)")
+    ``` Aggregate per source-destination pair ```
+    | stats
+        count           as connection_count,
+        values(user)    as users,
+        min(_time)      as first_seen,
+        max(_time)      as last_seen
+        by src_host, dst_ip
+    | eval mitre_technique="T1021.004"
+    | eval mitre_tactic="Lateral Movement"
+    | eval alert_name="Unusual Outbound SSH"
+    | table first_seen, src_host, dst_ip, users, connection_count,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "src_host"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "SSH Lateral — $src_host$ → $dst_ip$ ($connection_count$ connections)"
+        rule_description: >
+          Non-bastion host $src_host$ initiated SSH to $dst_ip$ ($connection_count$
+          connections). Users: $users$. Servers should not SSH to other servers unless
+          they are designated jump boxes. Investigate the user session on $src_host$
+          for initial access indicators.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "src_host"
+        risk_score: 78
+        risk_message: "Unusual outbound SSH — $src_host$ → $dst_ip$ — T1021.004"
+  false_positives:
+    - description: >
+        Ansible/Puppet control nodes SSH to managed hosts. Add these to
+        linux_bastion_hosts.csv with is_bastion=true.
+      tuning: "Add config management hosts to the bastion hosts lookup."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: SSH Tunneling and Port Forwarding (T1572)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_ssh_tunneling:
+  name: "Lateral Movement — SSH Tunnel or Port Forwarding Detected (T1572)"
+  description: >
+    Detects SSH connections with tunnel flags: -L (local forward), -R (remote
+    forward), -D (SOCKS proxy), -N (no command, tunnel only), autossh (persistent
+    tunnels), and sshuttle (VPN-over-SSH). SSH tunneling is commonly used for
+    C2 traffic, pivoting into internal networks, and bypassing firewalls.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: T1572
+    technique_name: "Protocol Tunneling"
+    related_techniques:
+      - "T1021.004: Remote Services: SSH"
+      - "T1090.001: Proxy: Internal Proxy"
+  severity: high
+  confidence: 88
+  risk_score: 82
+  kill_chain_phase: "Lateral Movement"
+  data_sources:
+    - "Linux Audit Log — EXECVE for ssh with tunnel flags"
+    - "Sysmon for Linux — Event 1 (Process Creation)"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect SSH tunnel flags ```
+    | where match(cmdline_lower, "ssh\s+.*(-L\s|-R\s|-D\s)")
+    ``` Detect SSH with no-command (tunnel-only) ```
+        OR match(cmdline_lower, "ssh\s+.*-N\s")
+    ``` Detect autossh (persistent tunnels) ```
+        OR match(cmdline_lower, "autossh")
+    ``` Detect sshuttle (VPN-over-SSH) ```
+        OR match(cmdline_lower, "sshuttle")
+    | eval tunnel_type=case(
+        match(cmdline_lower, "ssh.*-L"),     "LOCAL_FORWARD (-L)",
+        match(cmdline_lower, "ssh.*-R"),     "REMOTE_FORWARD (-R)",
+        match(cmdline_lower, "ssh.*-D"),     "SOCKS_PROXY (-D)",
+        match(cmdline_lower, "ssh.*-N"),     "NO_COMMAND_TUNNEL (-N)",
+        match(cmdline_lower, "autossh"),     "PERSISTENT_TUNNEL (autossh)",
+        match(cmdline_lower, "sshuttle"),    "VPN_OVER_SSH (sshuttle)",
+        1==1,                                "SSH_TUNNEL"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1572"
+    | eval mitre_tactic="Lateral Movement"
+    | eval alert_name="SSH Tunneling"
+    | table _time, host, user, tunnel_type, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "SSH Tunnel — $tunnel_type$ on $host$ by $user$"
+        rule_description: >
+          SSH tunneling detected on $host$ by $user$. Type: $tunnel_type$.
+          Command: $cmdline$. SSH tunnels are used for C2, pivoting, and firewall
+          bypass. Investigate the tunnel endpoints and the traffic flowing through.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 82
+        risk_message: "SSH tunnel — $tunnel_type$ — T1572"
+  false_positives:
+    - description: >
+        Developers may use SSH tunnels for database access or internal services.
+      tuning: "Exclude developer workstations and known tunnel configurations."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: SSH Agent Forwarding Abuse (T1563.001)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_ssh_agent_forwarding:
+  name: "Lateral Movement — SSH Agent Forwarding Detected (T1563.001)"
+  description: >
+    Detects SSH connections with agent forwarding enabled (-A flag or
+    ForwardAgent=yes) and access to SSH_AUTH_SOCK from unexpected processes.
+    Agent forwarding allows anyone with root on the intermediate host to
+    use the forwarded agent to authenticate as the original user to any
+    server — a significant lateral movement risk.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: T1563.001
+    technique_name: "Remote Service Session Hijacking: SSH Hijacking"
+    related_techniques:
+      - "T1021.004: Remote Services: SSH"
+  severity: medium
+  confidence: 80
+  risk_score: 70
+  kill_chain_phase: "Lateral Movement"
+  data_sources:
+    - "Linux Audit Log — EXECVE for ssh -A"
+    - "Linux Audit Log — openat on /tmp/ssh-* agent sockets"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect ssh -A (agent forwarding) ```
+    | where match(cmdline_lower, "ssh\s+.*-A\s")
+        OR match(cmdline_lower, "ssh\s+.*-o\s+ForwardAgent=yes")
+    ``` Detect direct access to agent socket from unexpected process ```
+        OR match(cmdline_lower, "SSH_AUTH_SOCK=/tmp/ssh-")
+    | eval agent_risk=case(
+        match(cmdline_lower, "ssh.*-A"),            "AGENT_FORWARDING_ENABLED",
+        match(cmdline_lower, "ForwardAgent=yes"),    "AGENT_FORWARDING_CONFIG",
+        match(cmdline_lower, "SSH_AUTH_SOCK"),        "AGENT_SOCKET_ACCESS",
+        1==1,                                        "SSH_AGENT_ABUSE"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1563.001"
+    | eval mitre_tactic="Lateral Movement"
+    | eval alert_name="SSH Agent Forwarding"
+    | table _time, host, user, agent_risk, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "user"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "SSH Agent Forward — $agent_risk$ on $host$ by $user$"
+        rule_description: >
+          SSH agent forwarding detected on $host$ by $user$. Type: $agent_risk$.
+          Agent forwarding allows root on the remote host to impersonate $user$.
+          Recommend using ProxyJump (-J) instead of agent forwarding.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "user"
+        risk_score: 70
+        risk_message: "SSH agent forwarding — $agent_risk$ — T1563.001"
+  false_positives:
+    - description: >
+        Some workflows require agent forwarding for multi-hop SSH access.
+      tuning: "Document authorized agent forwarding use cases."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Config Management Tool Abuse (T1072)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_config_management_abuse:
+  name: "Lateral Movement — Ansible/Puppet/Chef from Unexpected Host (T1072)"
+  description: >
+    Detects Ansible ad-hoc commands, ansible-playbook execution, and Puppet/Chef
+    operations from hosts that are not designated management servers. Attackers
+    abuse configuration management tools post-compromise to push malicious
+    configurations or execute commands across the fleet.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: T1072
+    technique_name: "Software Deployment Tools"
+    related_techniques:
+      - "T1021.004: Remote Services: SSH (Ansible uses SSH)"
+  severity: medium
+  confidence: 80
+  risk_score: 72
+  kill_chain_phase: "Lateral Movement"
+  data_sources:
+    - "Linux Audit Log — EXECVE for ansible, ansible-playbook, puppet, chef, knife"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,""))
+    | eval cmdline_lower=lower(cmdline)
+    | where match(cmdline_lower, "^(ansible|ansible-playbook|ansible-pull|puppet\s+agent|knife|chef-client)")
+    | eval tool=case(
+        match(cmdline_lower, "ansible-playbook"), "ANSIBLE_PLAYBOOK",
+        match(cmdline_lower, "ansible-pull"),     "ANSIBLE_PULL",
+        match(cmdline_lower, "ansible\s"),        "ANSIBLE_ADHOC",
+        match(cmdline_lower, "puppet"),           "PUPPET_AGENT",
+        match(cmdline_lower, "knife"),            "CHEF_KNIFE",
+        match(cmdline_lower, "chef-client"),      "CHEF_CLIENT",
+        1==1,                                     "CONFIG_MANAGEMENT"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    ``` Exclude known management servers ```
+    | lookup linux_bastion_hosts.csv host as host OUTPUT role
+    | where role!="config_management" OR isnull(role)
+    | eval mitre_technique="T1072"
+    | eval mitre_tactic="Lateral Movement"
+    | eval alert_name="Config Management Abuse"
+    | table _time, host, user, tool, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "host"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Config Mgmt Abuse — $tool$ on $host$ by $user$"
+        rule_description: >
+          Configuration management tool ($tool$) executed from non-management host
+          $host$ by $user$. Command: $cmdline$. Investigate whether the host is
+          compromised and the attacker is using config management for fleet-wide access.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 72
+        risk_message: "Config management abuse — $tool$ — T1072"
+  false_positives:
+    - description: >
+        Ansible developers may test playbooks from workstations.
+      tuning: "Add developer workstations to authorized hosts."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Suspicious SCP/Rsync File Transfer (T1105)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_suspicious_file_transfer:
+  name: "Lateral Movement — Suspicious SCP/Rsync Transfer (T1105)"
+  description: >
+    Detects SCP/rsync transfers of sensitive files (shadow, passwd, SSH keys,
+    attack tools) or transfers to/from unexpected hosts. Flags transfers of
+    known offensive tools (nmap, nc, chisel, ligolo, socat) to other hosts
+    and unusual-hour transfers.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: T1105
+    technique_name: "Ingress Tool Transfer"
+    related_techniques:
+      - "T1021.004: Remote Services: SSH (SCP uses SSH)"
+  severity: medium
+  confidence: 80
+  risk_score: 68
+  kill_chain_phase: "Lateral Movement"
+  data_sources:
+    - "Linux Audit Log — EXECVE for scp, rsync"
+
+  search: |
+    index=linux sourcetype=linux:audit type=EXECVE (comm="scp" OR comm="rsync")
+    | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,"")
+    | eval cmdline_lower=lower(cmdline)
+    ``` Flag sensitive file transfers ```
+    | eval sensitive_transfer=case(
+        match(cmdline_lower, "(shadow|gshadow|passwd)"),         "CREDENTIAL_FILE_TRANSFER",
+        match(cmdline_lower, "\.ssh/(id_rsa|id_ecdsa|id_ed25519|authorized_keys)"), "SSH_KEY_TRANSFER",
+        match(cmdline_lower, "(nmap|nc|ncat|chisel|ligolo|socat|pspy|linpeas|linenum)"), "OFFENSIVE_TOOL_TRANSFER",
+        match(cmdline_lower, "(\.env|keytab|\.pem|\.key)"),      "SECRET_FILE_TRANSFER",
+        1==1,                                                    "GENERAL_TRANSFER"
+      )
+    | where sensitive_transfer!="GENERAL_TRANSFER"
+    | eval user=coalesce(auid, "unknown")
+    | eval host=coalesce(hostname, "unknown")
+    | eval mitre_technique="T1105"
+    | eval mitre_tactic="Lateral Movement"
+    | eval alert_name="Suspicious File Transfer"
+    | table _time, host, user, sensitive_transfer, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Suspicious Transfer — $sensitive_transfer$ on $host$ by $user$"
+        rule_description: >
+          Suspicious SCP/rsync transfer on $host$ by $user$. Type:
+          $sensitive_transfer$. Command: $cmdline$. Credential files and offensive
+          tools indicate active lateral movement.
+        severity: medium
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 68
+        risk_message: "Suspicious transfer — $sensitive_transfer$ — T1105"
+  false_positives:
+    - description: >
+        Backup and deployment scripts may transfer configuration files.
+      tuning: "Exclude known backup service accounts and scheduled transfers."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Internal Network Scanning (T1046)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_internal_network_scanning:
+  name: "Lateral Movement — Internal Network Scanning Detected (T1046)"
+  description: >
+    Detects network scanning tools (nmap, masscan, rustscan, zmap) execution
+    on internal hosts and proxychains usage (indicating pivoting). Also detects
+    rapid outbound connection attempts to multiple internal IPs/ports via
+    Sysmon network events.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: T1046
+    technique_name: "Network Service Discovery"
+    related_techniques:
+      - "T1018: Remote System Discovery"
+      - "T1590: Gather Victim Network Information"
+  severity: high
+  confidence: 88
+  risk_score: 82
+  kill_chain_phase: "Lateral Movement"
+  data_sources:
+    - "Linux Audit Log — EXECVE for scanning tools"
+    - "Sysmon for Linux — Event 3 (Network Connection)"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect scanning tools ```
+    | where match(cmdline_lower, "^(nmap|masscan|rustscan|zmap|unicornscan)")
+    ``` Detect proxychains (pivoting indicator) ```
+        OR match(cmdline_lower, "proxychains")
+    ``` Detect netcat port scanning ```
+        OR match(cmdline_lower, "(nc|ncat)\s+.*-z")
+    ``` Detect ping sweep ```
+        OR match(cmdline_lower, "fping\s+-g")
+    | eval scan_type=case(
+        match(cmdline_lower, "nmap"),         "NMAP_SCAN",
+        match(cmdline_lower, "masscan"),      "MASSCAN_SCAN",
+        match(cmdline_lower, "proxychains"),  "PROXYCHAINS_PIVOT",
+        match(cmdline_lower, "(nc|ncat).*-z"),"NETCAT_PORT_SCAN",
+        match(cmdline_lower, "fping"),        "PING_SWEEP",
+        match(cmdline_lower, "rustscan"),     "RUSTSCAN",
+        1==1,                                 "NETWORK_SCAN"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1046"
+    | eval mitre_tactic="Lateral Movement"
+    | eval alert_name="Internal Network Scan"
+    | table _time, host, user, scan_type, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "NETWORK SCAN — $scan_type$ on $host$ by $user$"
+        rule_description: >
+          Internal network scanning detected on $host$ by $user$. Type: $scan_type$.
+          Command: $cmdline$. Network scanning from a compromised host indicates
+          the attacker is mapping the internal network for lateral movement targets.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 82
+        risk_message: "Network scan — $scan_type$ — T1046"
+  false_positives:
+    - description: >
+        Authorized vulnerability scanners (Nessus, Qualys) scan the network.
+      tuning: "Exclude known scanner hosts and scanning service accounts."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: Exploitation of Internal Services (T1210)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_internal_service_exploitation:
+  name: "Lateral Movement — Internal Service Exploitation Indicators (T1210)"
+  description: >
+    Detects exploitation of internal services from compromised RHEL hosts:
+    Shellshock patterns (curl with () { in headers), Redis CLI connecting to
+    other hosts, MongoDB shell exploitation, internal web service exploitation
+    via curl/wget, and unauthorized NFS/SMB mounts to other servers.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: T1210
+    technique_name: "Exploitation of Remote Services"
+    related_techniques:
+      - "T1190: Exploit Public-Facing Application"
+  severity: high
+  confidence: 82
+  risk_score: 78
+  kill_chain_phase: "Lateral Movement"
+  data_sources:
+    - "Linux Audit Log — EXECVE for exploitation commands"
+
+  search: |
+    index=linux (sourcetype=linux:audit type=EXECVE) OR (sourcetype=sysmon_linux EventCode=1)
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,""))
+    | eval cmdline_lower=lower(cmdline)
+    ``` Detect Shellshock exploitation ```
+    | where match(cmdline_lower, "curl.*\\(\\)\\s*\\{")
+    ``` Detect Redis exploitation ```
+        OR match(cmdline_lower, "redis-cli\s+-h\s")
+    ``` Detect unauthorized NFS mounts ```
+        OR match(cmdline_lower, "mount\s+-t\s+nfs")
+    ``` Detect SMB/CIFS mounts ```
+        OR match(cmdline_lower, "mount\s+-t\s+cifs")
+    ``` Detect internal web exploitation ```
+        OR match(cmdline_lower, "curl.*(-d|--data).*(<script|union\s+select|;.*cat\s+/etc|\\$\\{jndi)")
+    | eval exploit_type=case(
+        match(cmdline_lower, "\\(\\)\\s*\\{"),     "SHELLSHOCK_EXPLOIT",
+        match(cmdline_lower, "redis-cli"),          "REDIS_EXPLOITATION",
+        match(cmdline_lower, "mount.*nfs"),          "NFS_MOUNT_LATERAL",
+        match(cmdline_lower, "mount.*cifs"),          "SMB_MOUNT_LATERAL",
+        match(cmdline_lower, "jndi"),                "JNDI_INJECTION",
+        match(cmdline_lower, "union.*select"),        "SQL_INJECTION_INTERNAL",
+        1==1,                                        "INTERNAL_EXPLOITATION"
+      )
+    | eval user=coalesce(auid, User, "unknown")
+    | eval host=coalesce(hostname, Computer, "unknown")
+    | eval mitre_technique="T1210"
+    | eval mitre_tactic="Lateral Movement"
+    | eval alert_name="Internal Service Exploitation"
+    | table _time, host, user, exploit_type, cmdline,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Internal Exploit — $exploit_type$ from $host$ by $user$"
+        rule_description: >
+          Internal service exploitation detected from $host$ by $user$. Type:
+          $exploit_type$. Command: $cmdline$. The attacker is exploiting internal
+          services for lateral movement. Identify the target and patch the vulnerability.
+        severity: high
+        status: "new"
+    - risk_analysis:
+        risk_object: "host"
+        risk_score: 78
+        risk_message: "Internal exploitation — $exploit_type$ — T1210"
+  false_positives:
+    - description: >
+        Legitimate NFS mounts for shared filesystems are common in RHEL environments.
+      tuning: "Exclude known NFS mount points from the linux_server_inventory lookup."
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  inv_1_ssh_connection_map:
+    name: "SSH Connection Map from Suspected Host"
+    search: |
+      index=linux sourcetype=sysmon_linux EventCode=3 DestinationPort=22
+          Computer="$target_host$" earliest=-24h
+      | stats count by Computer, DestinationIp, User
+      | sort - count
+      | table Computer, DestinationIp, User, count
+
+  inv_2_auth_from_host:
+    name: "Authentication Events Originating from Suspected Host"
+    search: |
+      index=linux sourcetype=linux_secure "Accepted" earliest=-24h
+      | rex "from (?<src_ip>\S+)"
+      | where src_ip="$target_host_ip$"
+      | table _time, host, src_ip, _raw
+
+  inv_3_tools_on_host:
+    name: "Offensive Tools Present on Host"
+    search: |
+      index=linux sourcetype=linux:audit type=EXECVE hostname="$target_host$" earliest=-24h
+      | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")
+      | where match(lower(cmdline), "(nmap|masscan|chisel|ligolo|socat|proxychains|sshuttle|linpeas|pspy)")
+      | table _time, cmdline, auid
+
+  inv_4_tunnel_sessions:
+    name: "Active SSH Tunnel Sessions"
+    search: |
+      index=linux sourcetype=linux:audit type=EXECVE hostname="$target_host$"
+          (comm="ssh" OR comm="autossh") earliest=-24h
+      | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+      | where match(cmdline, "(-L|-R|-D|-N)")
+      | table _time, cmdline, auid
+
+  inv_5_file_transfers:
+    name: "SCP/Rsync Transfers from Host"
+    search: |
+      index=linux sourcetype=linux:audit type=EXECVE
+          (comm="scp" OR comm="rsync") hostname="$target_host$" earliest=-24h
+      | eval cmdline=a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")
+      | table _time, cmdline, auid
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+incident_response_playbook:
+  name: "RHEL Lateral Movement — Incident Response Playbook"
+
+  phase_1_triage:
+    - step: "Map the lateral movement path: which hosts are involved?"
+    - step: "Identify stolen credentials or keys used for movement"
+    - step: "Determine scope: how many hosts are compromised?"
+
+  phase_2_containment:
+    - step: "Block SSH from compromised host to other internal hosts"
+    - step: "Terminate active SSH tunnels: kill SSH processes with tunnel flags"
+    - step: "Disable the compromised user account on all systems"
+    - step: "Quarantine all confirmed compromised hosts"
+
+  phase_3_investigation:
+    - step: "Trace the full lateral movement chain from initial access to current position"
+    - step: "Check each hop for persistence mechanisms"
+    - step: "Identify data accessed on each compromised host"
+    - step: "Collect SSH auth logs from all involved hosts"
+
+  phase_4_remediation:
+    - step: "Rotate all credentials used across the movement chain"
+    - step: "Remove persistence from all compromised hosts"
+    - step: "Patch exploited internal services"
+    - step: "Implement network segmentation to limit future lateral movement"
+    - step: "Deploy SSH certificate authentication to replace key-based auth"
