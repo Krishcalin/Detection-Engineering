@@ -1,0 +1,1365 @@
+# ==============================================================================
+#  CVE-2026-21509 / APT28 Operation Neusploit — Splunk Detection Rules
+# ==============================================================================
+#  Description : Multi-layered detection for CVE-2026-21509 exploitation and
+#                APT28 (UAC-0001 / Fancy Bear) Operation Neusploit campaign.
+#                CVE-2026-21509 is a Microsoft Office OLE Security Feature Bypass
+#                (CVSS 7.8) that abuses the Shell.Explorer.1 COM object
+#                (CLSID {EAB22AC3-30C1-11CF-A7EB-0000C05BAE0B}) embedded in
+#                malicious RTF documents to achieve remote code execution without
+#                macros or user interaction beyond opening the file.
+#
+#                The campaign delivers two payloads:
+#                  1. MiniDoor — Outlook VBA-based email stealer
+#                  2. PixyNetLoader — COM-hijacking loader deploying Covenant
+#                     Grunt C2 implant via steganographic PNG shellcode
+#
+#  MITRE ATT&CK: T1566.001, T1203, T1204.002, T1106, T1053.005, T1546.015,
+#                T1137.006, T1140, T1027.003, T1027.007, T1480.002, T1497.003,
+#                T1114, T1071.001, T1102.002, T1112
+#  Kill Chain   : Initial Access → Execution → Persistence → Collection → C2
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : XmlWinEventLog:Security, XmlWinEventLog:Microsoft-Windows-Sysmon/Operational,
+#                 XmlWinEventLog:Microsoft-Windows-PowerShell/Operational,
+#                 XmlWinEventLog:System
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-06
+#  License      : MIT
+#
+#  References:
+#    - https://www.zscaler.com/blogs/security-research/apt28-leverages-cve-2026-21509-operation-neusploit
+#    - https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-21509
+#    - https://www.cisa.gov/news-events/alerts/2026/01/26/cisa-adds-five-known-exploited-vulnerabilities-catalog
+#    - https://logpoint.com/en/blog/breaking-the-kill-bit-active-exploitation-of-cve-2026-21509-in-microsoft-office
+#    - https://github.com/decalage2/detect_CVE-2026-21509
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Sysmon deployed on all endpoints with the following event types enabled:
+#     - Event 1  (Process Creation) with command-line and parent process logging
+#     - Event 3  (Network Connection) for Office process outbound connections
+#     - Event 7  (Image Load) for DLL loading into Office and explorer.exe
+#     - Event 11 (File Create) for dropped files in AppData, ProgramData, Temp
+#     - Event 12/13 (Registry Create/Set) for COM hijacking and Outlook keys
+#
+#  2. Enable Audit Policy on all endpoints:
+#     - "Audit Process Creation" (Success) with command-line logging
+#     - "Audit Object Access" (Success) for scheduled task creation
+#
+#  3. PowerShell Script Block Logging (Event 4104) enabled via GPO
+#
+#  4. Splunk Universal Forwarder on all endpoints forwarding:
+#     - Security, Sysmon, PowerShell, and System event logs
+#
+#  5. Upload the following lookup tables to Splunk:
+#     - neusploit_ioc_hashes.csv   (sha256, md5, sha1, filename, malware_family)
+#     - neusploit_ioc_domains.csv  (domain, url, description)
+#
+# ==============================================================================
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#  IOC REFERENCE — Operation Neusploit File Hashes (SHA256)
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+#  RTF Exploit Documents:
+#    b2ba51b4491da8604ff9410d6e004971e3cd9a321390d0258e294ac42010b546  Consultation_Topics_Ukraine(Final).doc
+#    1ed863a32372160b3a25549aad25d48d5352d9b4f58d4339408c4eea69807f50  Courses.doc
+#    5a17cfaea0cc3a82242fdd11b53140c0b56256d769b07c33757d61e0a0a6ec02  (unnamed RTF)
+#    fd3f13db41cd5b442fa26ba8bc0e9703ed243b3516374e3ef89be71cbf07436b  1291.doc
+#    c91183175ce77360006f964841eb4048cf37cb82103f2573e262927be4c7607f  BULLETEN_H.doc
+#
+#  MiniDoor Dropper:
+#    a944a09783023a2c6c62d3601cbd5392a03d808a6a51728e07a3270861c2a8ee  2_2.d
+#
+#  MiniDoor VBA Project:
+#    bb23545380fde9f48ad070f88fe0afd695da5fcae8c5274814858c5a681d8c4e  VbaProject.OTM
+#
+#  PixyNetLoader Dropper:
+#    0bb0d54033767f081cae775e3cf9ede7ae6bea75f35fbfb748ccba9325e28e5e  table.d
+#
+#  Shellcode Loader:
+#    a876f648991711e44a8dcf888a271880c6c930e5138f284cd6ca6128eca56ba1  EhStoreShell.dll
+#
+#  Steganographic PNG:
+#    2822c72a59b58c00fc088aa551cdeeb92ca10fd23e23745610ff207f53118db9  SplashScreen.png
+#
+#  Scheduled Task XML:
+#    9f4672c1374034ac4556264f0d4bf96ee242c0b5a9edab4715b5e61fe8d55cc8  office.xml
+#
+#  Covenant Grunt Implant:
+#    3f446d316efe2514efd70c975d0c87e12357db9fca54a25834d60b28192c6a69  (in-memory)
+#
+#  Malicious Domains:
+#    freefoodaid[.]com
+#    wellnesscaremed[.]com
+#
+#  Exfiltration Email Addresses:
+#    ahmeclaw2002@outlook[.]com
+#    ahmeclaw@proton[.]me
+#
+#  Mutex Names:
+#    adjgfenkbe        (MiniDoor)
+#    asagdugughi41     (PixyNetLoader)
+#    dvyubgbqfusdv32   (Shellcode loader)
+#
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: CVE-2026-21509 — Office Spawning Suspicious Child Process
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Core exploit detection. When CVE-2026-21509 is triggered via a malicious RTF,
+#  WINWORD.EXE instantiates Shell.Explorer.1 which downloads and executes a
+#  payload. This manifests as Office spawning cmd.exe, powershell.exe, rundll32,
+#  mshta, schtasks, or other suspicious child processes.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very low — Office should never spawn shell interpreters
+#  Tools caught: All CVE-2026-21509 exploits, Operation Neusploit, generic
+#                Office RCE exploitation
+
+rule_1_office_spawning_suspicious_child:
+  name: "CVE-2026-21509 — Office Application Spawning Suspicious Child Process"
+  description: >
+    Detects Microsoft Office applications (WINWORD.EXE, EXCEL.EXE, POWERPNT.EXE,
+    OUTLOOK.EXE) spawning suspicious child processes such as cmd.exe, powershell.exe,
+    mshta.exe, wscript.exe, cscript.exe, rundll32.exe, regsvr32.exe, schtasks.exe,
+    or certutil.exe. This is the primary behavioral indicator of CVE-2026-21509
+    exploitation where the Shell.Explorer.1 COM object bypass triggers payload
+    download and execution without macro interaction. In Operation Neusploit,
+    APT28 used this technique to drop MiniDoor and PixyNetLoader payloads.
+  mitre:
+    tactic: "Execution"
+    technique: "T1203"
+    sub_technique: ""
+    technique_name: "Exploitation for Client Execution"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 95
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=1
+    (ParentImage="*\\winword.exe" OR ParentImage="*\\excel.exe"
+     OR ParentImage="*\\powerpnt.exe" OR ParentImage="*\\outlook.exe"
+     OR ParentImage="*\\msaccess.exe" OR ParentImage="*\\mspub.exe")
+    (Image="*\\cmd.exe" OR Image="*\\powershell.exe" OR Image="*\\pwsh.exe"
+     OR Image="*\\mshta.exe" OR Image="*\\wscript.exe" OR Image="*\\cscript.exe"
+     OR Image="*\\rundll32.exe" OR Image="*\\regsvr32.exe"
+     OR Image="*\\schtasks.exe" OR Image="*\\certutil.exe"
+     OR Image="*\\bitsadmin.exe" OR Image="*\\msiexec.exe"
+     OR Image="*\\net.exe" OR Image="*\\net1.exe"
+     OR Image="*\\taskkill.exe" OR Image="*\\whoami.exe")
+    | eval parent_process=mvindex(split(ParentImage, "\\"), -1)
+    | eval child_process=mvindex(split(Image, "\\"), -1)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(CommandLine) as command_lines
+      values(child_process) as child_processes
+      values(User) as users
+      values(ParentCommandLine) as parent_cmdlines
+      by Computer parent_process
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer parent_process child_processes command_lines users
+      parent_cmdlines first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-21509: Office spawned suspicious child process on $Computer$"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        EventCode=1 Computer="$Computer$"
+        (ParentImage="*\\winword.exe" OR ParentImage="*\\outlook.exe")
+        earliest=-1h
+    risk:
+      score: 95
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Legitimate Office add-ins that invoke cmd.exe or powershell.exe — add to allowlist by ParentCommandLine"
+    - "Macro-enabled documents in trusted workflows — filter by User and CommandLine pattern"
+    - "IT administration scripts triggered from Office — validate with user and source document"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: CVE-2026-21509 — Office Outbound Network Connection to Unknown Host
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects WINWORD.EXE or other Office processes initiating outbound network
+#  connections. In the exploit chain, the Shell.Explorer.1 COM object downloads
+#  the dropper DLL (2_2.d or table.d) from freefoodaid[.]com or
+#  wellnesscaremed[.]com. Legitimate Office should rarely make outbound HTTP(S)
+#  connections to non-Microsoft domains.
+#
+#  Confidence  : HIGH
+#  Severity    : HIGH
+#  FP Rate     : Medium — Office contacts Microsoft/CDN domains legitimately
+
+rule_2_office_outbound_network_connection:
+  name: "CVE-2026-21509 — Office Process Outbound Network Connection"
+  description: >
+    Detects Microsoft Office processes making outbound network connections to
+    external IP addresses. CVE-2026-21509 exploitation triggers the embedded
+    Shell.Explorer.1 COM object to download malicious payloads from
+    attacker-controlled infrastructure. In Operation Neusploit, dropper DLLs
+    were retrieved from freefoodaid[.]com and wellnesscaremed[.]com. This rule
+    excludes known Microsoft CDN and update domains to reduce false positives.
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1071.001"
+    sub_technique: ""
+    technique_name: "Application Layer Protocol: Web Protocols"
+  severity: HIGH
+  confidence: HIGH
+  risk_score: 85
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=3 Initiated=true
+    (Image="*\\winword.exe" OR Image="*\\excel.exe"
+     OR Image="*\\powerpnt.exe" OR Image="*\\outlook.exe")
+    NOT (DestinationHostname="*.microsoft.com"
+         OR DestinationHostname="*.office.com"
+         OR DestinationHostname="*.office365.com"
+         OR DestinationHostname="*.live.com"
+         OR DestinationHostname="*.windows.net"
+         OR DestinationHostname="*.sharepoint.com"
+         OR DestinationHostname="*.msftconnecttest.com"
+         OR DestinationHostname="*.akamaized.net"
+         OR DestinationHostname="*.microsoftonline.com"
+         OR DestinationHostname="ocsp.digicert.com"
+         OR DestinationHostname="*.verisign.com"
+         OR DestinationHostname="*.symantec.com")
+    NOT (DestinationIp="10.*" OR DestinationIp="172.16.*"
+         OR DestinationIp="172.17.*" OR DestinationIp="172.18.*"
+         OR DestinationIp="172.19.*" OR DestinationIp="172.2*"
+         OR DestinationIp="172.30.*" OR DestinationIp="172.31.*"
+         OR DestinationIp="192.168.*" OR DestinationIp="127.*")
+    | eval office_process=mvindex(split(Image, "\\"), -1)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(DestinationIp) as dest_ips
+      values(DestinationHostname) as dest_hosts
+      values(DestinationPort) as dest_ports
+      values(User) as users
+      by Computer office_process
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer office_process dest_hosts dest_ips dest_ports users
+      first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-21509: Office process connected to external host on $Computer$"
+      severity: high
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        EventCode=3 Computer="$Computer$" Image="*\\winword.exe"
+        earliest=-1h
+    risk:
+      score: 85
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Office connecting to legitimate third-party cloud services (Dropbox, Google) — add to domain exclusion list"
+    - "Office add-ins with telemetry callbacks — validate by DestinationHostname and add to allowlist"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Operation Neusploit — Known IOC Domain Communication
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Direct IOC match. Detects any DNS query or network connection to the known
+#  Operation Neusploit C2 domains: freefoodaid[.]com, wellnesscaremed[.]com,
+#  and filen[.]io (used for Covenant Grunt C2).
+#
+#  Confidence  : CRITICAL
+#  Severity    : CRITICAL
+#  FP Rate     : Near-zero — these domains are confirmed APT28 infrastructure
+
+rule_3_neusploit_known_domains:
+  name: "Operation Neusploit — Communication with Known APT28 C2 Domains"
+  description: >
+    Detects DNS queries or network connections to confirmed Operation Neusploit
+    infrastructure. APT28 used freefoodaid[.]com and wellnesscaremed[.]com to
+    host dropper payloads (2_2.d, table.d) downloaded via the CVE-2026-21509
+    exploit. The Covenant Grunt implant communicates with filen.io as C2.
+    Any communication to these domains indicates active compromise.
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1071.001"
+    sub_technique: ""
+    technique_name: "Application Layer Protocol: Web Protocols"
+  severity: CRITICAL
+  confidence: CRITICAL
+  risk_score: 100
+  search: >
+    (index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+     EventCode=22
+     (QueryName="*freefoodaid.com" OR QueryName="*wellnesscaremed.com"))
+    OR
+    (index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+     EventCode=3
+     (DestinationHostname="*freefoodaid.com"
+      OR DestinationHostname="*wellnesscaremed.com"))
+    OR
+    (index=main sourcetype="stream:dns"
+     (query="*freefoodaid.com" OR query="*wellnesscaremed.com"))
+    OR
+    (index=proxy OR index=web
+     (url="*freefoodaid.com*" OR url="*wellnesscaremed.com*"
+      OR dest="*freefoodaid.com" OR dest="*wellnesscaremed.com"))
+    | eval data_source=sourcetype
+    | eval domain=coalesce(QueryName, DestinationHostname, query, dest)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(Image) as processes
+      values(DestinationIp) as dest_ips
+      values(User) as users
+      values(data_source) as sources
+      by Computer domain
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | eval alert_context="CONFIRMED APT28 INFRASTRUCTURE — IMMEDIATE ESCALATION REQUIRED"
+    | table Computer domain dest_ips processes users sources
+      first_seen last_seen count alert_context
+  schedule:
+    cron: "*/2 * * * *"
+    window: "-3m@m"
+  throttle:
+    field: "Computer"
+    period: "5m"
+  actions:
+    notable:
+      rule_title: "CRITICAL: APT28 Neusploit C2 domain contacted by $Computer$"
+      severity: critical
+      drilldown_search: >
+        index=main Computer="$Computer$"
+        ("freefoodaid.com" OR "wellnesscaremed.com")
+        earliest=-24h
+    risk:
+      score: 100
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "None expected — these are confirmed APT28 attack infrastructure domains"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Operation Neusploit — Known IOC File Hash Match
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Hash-based IOC matching against all known Operation Neusploit file artifacts.
+#  Matches SHA256, MD5, and SHA1 hashes from Sysmon FileCreate (11), Process
+#  Create (1), and Image Load (7) events.
+#
+#  Confidence  : CRITICAL
+#  Severity    : CRITICAL
+#  FP Rate     : Zero — cryptographic hash match
+
+rule_4_neusploit_file_hash_ioc:
+  name: "Operation Neusploit — Known Malware File Hash Detected"
+  description: >
+    Detects the presence of known Operation Neusploit malware artifacts by
+    matching SHA256, MD5, or SHA1 file hashes against confirmed IOCs from
+    the Zscaler ThreatLabz report. Covers RTF exploit documents, MiniDoor
+    dropper, PixyNetLoader dropper, EhStoreShell.dll shellcode loader,
+    SplashScreen.png steganographic payload, office.xml scheduled task,
+    VbaProject.OTM macro persistence, and Covenant Grunt implant.
+  mitre:
+    tactic: "Execution"
+    technique: "T1204.002"
+    sub_technique: ""
+    technique_name: "User Execution: Malicious File"
+  severity: CRITICAL
+  confidence: CRITICAL
+  risk_score: 100
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    (EventCode=1 OR EventCode=6 OR EventCode=7 OR EventCode=11 OR EventCode=15)
+    (Hashes="*b2ba51b4491da8604ff9410d6e004971e3cd9a321390d0258e294ac42010b546*"
+     OR Hashes="*1ed863a32372160b3a25549aad25d48d5352d9b4f58d4339408c4eea69807f50*"
+     OR Hashes="*5a17cfaea0cc3a82242fdd11b53140c0b56256d769b07c33757d61e0a0a6ec02*"
+     OR Hashes="*fd3f13db41cd5b442fa26ba8bc0e9703ed243b3516374e3ef89be71cbf07436b*"
+     OR Hashes="*c91183175ce77360006f964841eb4048cf37cb82103f2573e262927be4c7607f*"
+     OR Hashes="*a944a09783023a2c6c62d3601cbd5392a03d808a6a51728e07a3270861c2a8ee*"
+     OR Hashes="*bb23545380fde9f48ad070f88fe0afd695da5fcae8c5274814858c5a681d8c4e*"
+     OR Hashes="*0bb0d54033767f081cae775e3cf9ede7ae6bea75f35fbfb748ccba9325e28e5e*"
+     OR Hashes="*a876f648991711e44a8dcf888a271880c6c930e5138f284cd6ca6128eca56ba1*"
+     OR Hashes="*2822c72a59b58c00fc088aa551cdeeb92ca10fd23e23745610ff207f53118db9*"
+     OR Hashes="*9f4672c1374034ac4556264f0d4bf96ee242c0b5a9edab4715b5e61fe8d55cc8*"
+     OR Hashes="*3f446d316efe2514efd70c975d0c87e12357db9fca54a25834d60b28192c6a69*"
+     OR Hashes="*95e59536455a089ced64f5af2539a449*"
+     OR Hashes="*2f7b4dca1c79e525aef8da537294a6c4*"
+     OR Hashes="*f3b869a8d5ad243e35963ba6d7f89855*"
+     OR Hashes="*859c4b85ed85e6cc4eadb1a037a61e16*"
+     OR Hashes="*e4a5c4b205e1b80dc20d9a2fb4126d06*"
+     OR Hashes="*ea6615942f2c23dba7810a6f7d69e2da*")
+    | eval file_name=coalesce(TargetFilename, Image, ImageLoaded)
+    | eval hash_value=Hashes
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(file_name) as file_paths
+      values(EventCode) as event_codes
+      values(User) as users
+      by Computer hash_value
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | eval alert_context="CONFIRMED NEUSPLOIT MALWARE — ISOLATE HOST IMMEDIATELY"
+    | table Computer file_paths hash_value event_codes users
+      first_seen last_seen count alert_context
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "10m"
+  actions:
+    notable:
+      rule_title: "CRITICAL: Neusploit malware hash detected on $Computer$"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$" earliest=-24h
+        | search Hashes="*$hash_value$*"
+    risk:
+      score: 100
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "None — cryptographic hash collision is computationally infeasible"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: PixyNetLoader — COM Hijacking via EhStoreShell.dll
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects COM object hijacking used by PixyNetLoader for persistence.
+#  The malware creates/modifies the registry key:
+#    HKCU\Software\Classes\CLSID\{D9144DCD-E998-4ECA-AB6A-DCD83CCBA16D}\InProcServer32
+#  pointing to EhStoreShell.dll in %ProgramData%\USOPublic\Data\User\.
+#  When explorer.exe loads this COM object, it executes the shellcode loader.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very low — this specific CLSID hijack is unique to Neusploit
+
+rule_5_pixynetloader_com_hijacking:
+  name: "PixyNetLoader — COM Object Hijacking for Persistence"
+  description: >
+    Detects COM object hijacking used by APT28's PixyNetLoader malware. The
+    malware registers a malicious InProcServer32 DLL (EhStoreShell.dll) under
+    CLSID {D9144DCD-E998-4ECA-AB6A-DCD83CCBA16D} in HKCU\Software\Classes.
+    When explorer.exe instantiates this COM object, it loads the attacker's DLL
+    which extracts shellcode from a steganographic PNG (SplashScreen.png) and
+    deploys a Covenant Grunt C2 implant. This rule also detects generic COM
+    hijacking where InProcServer32 points to DLLs in ProgramData or user-writable
+    directories.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1546.015"
+    sub_technique: ""
+    technique_name: "Event Triggered Execution: Component Object Model Hijacking"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 90
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    (EventCode=12 OR EventCode=13)
+    TargetObject="*\\Software\\Classes\\CLSID\\*\\InProcServer32*"
+    NOT (Details="*\\Windows\\System32\\*"
+         OR Details="*\\Windows\\SysWOW64\\*"
+         OR Details="*\\Program Files\\*"
+         OR Details="*\\Program Files (x86)\\*")
+    | eval is_neusploit_clsid=if(like(TargetObject,
+      "%D9144DCD-E998-4ECA-AB6A-DCD83CCBA16D%"), "YES", "NO")
+    | eval is_suspicious_path=if(
+      like(Details, "%ProgramData%") OR like(Details, "%AppData%")
+      OR like(Details, "%Temp%") OR like(Details, "%Public%")
+      OR like(Details, "%Users%"), "YES", "NO")
+    | where is_neusploit_clsid="YES" OR is_suspicious_path="YES"
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(TargetObject) as registry_keys
+      values(Details) as dll_paths
+      values(Image) as writing_processes
+      values(User) as users
+      values(is_neusploit_clsid) as exact_neusploit_match
+      by Computer
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer registry_keys dll_paths writing_processes users
+      exact_neusploit_match first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "COM Hijacking detected on $Computer$ (PixyNetLoader persistence)"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        (EventCode=12 OR EventCode=13) Computer="$Computer$"
+        TargetObject="*InProcServer32*" earliest=-24h
+    risk:
+      score: 90
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Legitimate software installing COM objects in user directories — validate publisher and DLL signature"
+    - "Development tools registering debug COM objects — add specific CLSIDs to allowlist"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: MiniDoor — Outlook Macro Security Downgrade
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects MiniDoor's Outlook persistence mechanism. The malware modifies
+#  Outlook registry settings to enable all macros (Level=1), disable content
+#  warnings (PONT_STRING=0x20), and auto-load macros at boot
+#  (LoadMacroProviderOnBoot=1). It then installs a malicious VbaProject.OTM
+#  that steals emails and forwards them to attacker-controlled addresses.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very low — these specific registry changes are highly suspicious
+
+rule_6_minidoor_outlook_macro_downgrade:
+  name: "MiniDoor — Outlook Macro Security Registry Downgrade"
+  description: >
+    Detects the MiniDoor email stealer's persistence mechanism. APT28's MiniDoor
+    modifies Outlook registry settings to: (1) enable all VBA macros by setting
+    Security Level=1, (2) disable content download warnings via PONT_STRING=0x20,
+    and (3) force macro loading on boot via LoadMacroProviderOnBoot=1. These
+    changes allow the malicious VbaProject.OTM to execute silently on every
+    Outlook startup, stealing emails from Inbox, Junk, and Drafts folders and
+    forwarding them to ahmeclaw2002@outlook.com and ahmeclaw@proton.me.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1137.006"
+    sub_technique: ""
+    technique_name: "Office Application Startup: Add-ins"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 95
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    (EventCode=12 OR EventCode=13)
+    (
+      (TargetObject="*\\Office\\*\\Outlook\\Security*" Details="DWORD (0x00000001)")
+      OR (TargetObject="*\\Outlook\\Options\\General*PONT_STRING*")
+      OR (TargetObject="*\\Outlook*LoadMacroProviderOnBoot*" Details="DWORD (0x00000001)")
+    )
+    | eval registry_change=case(
+      like(TargetObject, "%Security%") AND Details="DWORD (0x00000001)",
+        "Macro Security Level set to ENABLE ALL (Level=1)",
+      like(TargetObject, "%PONT_STRING%"),
+        "Content Download Warning DISABLED (PONT_STRING modified)",
+      like(TargetObject, "%LoadMacroProviderOnBoot%"),
+        "Macro Auto-Load on Boot ENABLED (LoadMacroProviderOnBoot=1)")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(registry_change) as changes
+      values(TargetObject) as registry_keys
+      values(Details) as values_set
+      values(Image) as writing_processes
+      values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | eval changes_count=mvcount(changes)
+    | eval severity=if(changes_count>=2, "CRITICAL — Multiple Outlook security controls weakened", "HIGH")
+    | table Computer changes registry_keys values_set writing_processes users
+      severity first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "MiniDoor: Outlook macro security downgraded on $Computer$"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        (EventCode=12 OR EventCode=13) Computer="$Computer$"
+        TargetObject="*Outlook*" earliest=-24h
+    risk:
+      score: 95
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Enterprise GPO deploying specific Outlook macro settings — validate against GPO baseline"
+    - "IT admin manually enabling macros for a specific business purpose — verify change ticket"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: PixyNetLoader — Suspicious File Drops in Staging Directories
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects creation of PixyNetLoader staging artifacts in known drop locations:
+#    - EhStoreShell.dll in %ProgramData%\USOPublic\Data\User\
+#    - SplashScreen.png in %ProgramData%\Microsoft OneDrive\setup\Cache\
+#    - office.xml in %TEMP%\Diagnostics\
+#    - VbaProject.OTM in %AppData%\Microsoft\Outlook\
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Low — these specific path+filename combinations are unique
+
+rule_7_neusploit_file_staging:
+  name: "Operation Neusploit — Suspicious File Drop in Staging Directory"
+  description: >
+    Detects file creation events matching the known Operation Neusploit staging
+    pattern. PixyNetLoader drops EhStoreShell.dll (shellcode loader) in
+    ProgramData\USOPublic\Data\User, SplashScreen.png (steganographic shellcode)
+    in ProgramData\Microsoft OneDrive\setup\Cache, and office.xml (scheduled
+    task configuration) in %TEMP%\Diagnostics. MiniDoor installs VbaProject.OTM
+    in the Outlook profile directory. Also detects dropper files with .d extension
+    and files named 2_2.d or table.d in any temporary directory.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1027.003"
+    sub_technique: ""
+    technique_name: "Obfuscated Files or Information: Steganography"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 90
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=11
+    (
+      (TargetFilename="*\\USOPublic\\Data\\User\\EhStoreShell.dll")
+      OR (TargetFilename="*\\Microsoft OneDrive\\setup\\Cache\\SplashScreen.png")
+      OR (TargetFilename="*\\Diagnostics\\office.xml")
+      OR (TargetFilename="*\\Microsoft\\Outlook\\VbaProject.OTM")
+      OR (TargetFilename="*\\2_2.d")
+      OR (TargetFilename="*\\table.d")
+      OR (TargetFilename="*\\2_2.lNk")
+      OR (TargetFilename="*\\temp_email.msg")
+    )
+    | eval artifact_type=case(
+      like(TargetFilename, "%EhStoreShell.dll"), "PixyNetLoader Shellcode Loader",
+      like(TargetFilename, "%SplashScreen.png"), "PixyNetLoader Steganographic Payload",
+      like(TargetFilename, "%office.xml") AND like(TargetFilename, "%Diagnostics%"),
+        "PixyNetLoader Scheduled Task XML",
+      like(TargetFilename, "%VbaProject.OTM"), "MiniDoor Outlook VBA Persistence",
+      like(TargetFilename, "%2_2.d"), "MiniDoor Dropper DLL",
+      like(TargetFilename, "%table.d"), "PixyNetLoader Dropper DLL",
+      like(TargetFilename, "%temp_email.msg"), "MiniDoor Email Staging File",
+      1=1, "Neusploit Related Artifact")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(TargetFilename) as file_paths
+      values(artifact_type) as malware_components
+      values(Image) as creating_processes
+      values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer malware_components file_paths creating_processes users
+      first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "Neusploit staging artifact detected on $Computer$: $malware_components$"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        EventCode=11 Computer="$Computer$" earliest=-24h
+        ("EhStoreShell" OR "SplashScreen" OR "VbaProject.OTM" OR "office.xml"
+         OR "2_2.d" OR "table.d")
+    risk:
+      score: 90
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Legitimate Microsoft OneDrive creating SplashScreen.png — validate file hash against known IOCs"
+    - "Outlook repairing VbaProject.OTM — verify hash and check for concurrent registry changes"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: PixyNetLoader — OneDriveHealth Scheduled Task Creation
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects creation of the "OneDriveHealth" scheduled task used by PixyNetLoader.
+#  The task runs: cmd.exe /c (taskkill /f /IM explorer.exe) & (start explorer)
+#  & (schtasks /delete /f /tn OneDriveHealth)
+#  This kills and restarts explorer.exe (triggering the COM-hijacked DLL load)
+#  and then self-deletes the scheduled task to erase persistence evidence.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very low — this specific task name and self-delete pattern is unique
+
+rule_8_pixynetloader_scheduled_task:
+  name: "PixyNetLoader — OneDriveHealth Scheduled Task Creation"
+  description: >
+    Detects the creation of a scheduled task named "OneDriveHealth" which is
+    used by APT28's PixyNetLoader to trigger COM object loading. The task
+    kills explorer.exe, restarts it (causing the hijacked COM DLL to load),
+    and then self-deletes via schtasks /delete. This is a critical persistence
+    mechanism in the Operation Neusploit kill chain. The rule also detects
+    schtasks.exe loading task XML from %TEMP%\Diagnostics\office.xml, which
+    is the specific artifact used in this campaign.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1053.005"
+    sub_technique: ""
+    technique_name: "Scheduled Task/Job: Scheduled Task"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 90
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=1
+    (
+      (Image="*\\schtasks.exe"
+       (CommandLine="*OneDriveHealth*" OR CommandLine="*Diagnostics\\office.xml*"))
+      OR
+      (Image="*\\cmd.exe"
+       CommandLine="*taskkill*explorer*"
+       CommandLine="*schtasks*delete*OneDriveHealth*")
+    )
+    | eval detection_type=case(
+      like(CommandLine, "%OneDriveHealth%") AND like(Image, "%schtasks.exe%"),
+        "Scheduled task OneDriveHealth created",
+      like(CommandLine, "%taskkill%explorer%") AND like(CommandLine, "%OneDriveHealth%"),
+        "Explorer restart + task self-deletion sequence",
+      like(CommandLine, "%Diagnostics%office.xml%"),
+        "Task XML loaded from Neusploit staging path",
+      1=1, "Related schtasks activity")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(CommandLine) as command_lines
+      values(detection_type) as detections
+      values(ParentImage) as parent_processes
+      values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer detections command_lines parent_processes users
+      first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "PixyNetLoader scheduled task detected on $Computer$"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        EventCode=1 Computer="$Computer$"
+        ("OneDriveHealth" OR "taskkill*explorer") earliest=-24h
+    risk:
+      score: 90
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "None expected — the OneDriveHealth task name combined with explorer kill/restart is unique to Neusploit"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 9: MiniDoor — VbaProject.OTM Email Theft via Outlook Macro
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects Outlook loading VBA DLLs (VBE7.DLL, VBEUI.DLL) combined with
+#  outbound email to known MiniDoor exfiltration addresses. Also detects
+#  creation of temp_email.msg staging files used by MiniDoor to buffer
+#  stolen emails before forwarding.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Low — Outlook loading VBA runtime is suspicious unless macros are organizationally used
+
+rule_9_minidoor_outlook_vba_email_theft:
+  name: "MiniDoor — Outlook VBA Macro Loading and Email Exfiltration"
+  description: >
+    Detects indicators of MiniDoor email theft activity. MiniDoor installs a
+    malicious VbaProject.OTM that causes Outlook to load VBA runtime DLLs
+    (VBE7.DLL, VBEUI.DLL) on startup. The macro then systematically harvests
+    emails from Inbox, Junk, and Drafts folders, creates temp_email.msg staging
+    files, and forwards stolen content to ahmeclaw2002@outlook.com and
+    ahmeclaw@proton.me. This rule detects both the VBA DLL loading pattern and
+    any reference to the known exfiltration email addresses in process memory,
+    script blocks, or network traffic.
+  mitre:
+    tactic: "Collection"
+    technique: "T1114"
+    sub_technique: ""
+    technique_name: "Email Collection"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 90
+  search: >
+    (index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+     EventCode=7
+     Image="*\\outlook.exe"
+     (ImageLoaded="*\\VBE7.DLL" OR ImageLoaded="*\\VBEUI.DLL"
+      OR ImageLoaded="*\\VBE7INTL.DLL"))
+    OR
+    (index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+     EventCode=11
+     TargetFilename="*\\temp_email.msg")
+    OR
+    (index=main
+     ("ahmeclaw2002@outlook.com" OR "ahmeclaw@proton.me" OR "ahmeclaw2002"
+      OR "ahmeclaw"))
+    | eval indicator_type=case(
+      EventCode=7 AND like(Image, "%outlook.exe%"), "Outlook loading VBA runtime DLL",
+      EventCode=11 AND like(TargetFilename, "%temp_email.msg%"),
+        "MiniDoor email staging file created",
+      like(_raw, "%ahmeclaw%"), "Known MiniDoor exfiltration address detected",
+      1=1, "Related MiniDoor activity")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(indicator_type) as indicators
+      values(ImageLoaded) as loaded_dlls
+      values(TargetFilename) as file_paths
+      values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer indicators loaded_dlls file_paths users
+      first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-11m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "MiniDoor email theft indicators on $Computer$"
+      severity: critical
+      drilldown_search: >
+        index=main Computer="$Computer$"
+        ("VBE7.DLL" OR "VbaProject.OTM" OR "temp_email.msg" OR "ahmeclaw")
+        earliest=-24h
+    risk:
+      score: 90
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Legitimate Outlook VBA macros used for business automation — validate against macro inventory"
+    - "Organizations using Outlook macros for mail merge or reporting — add specific users to allowlist"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 10: PixyNetLoader — Explorer.exe Loading Suspicious DLL
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects explorer.exe loading DLLs from non-standard paths (ProgramData,
+#  AppData, Temp). In the Neusploit kill chain, explorer.exe loads
+#  EhStoreShell.dll via COM hijacking, which then extracts shellcode from
+#  SplashScreen.png and loads the Covenant Grunt .NET implant.
+#
+#  Confidence  : HIGH
+#  Severity    : HIGH
+#  FP Rate     : Low — explorer.exe rarely loads DLLs from user-writable paths
+
+rule_10_explorer_suspicious_dll_load:
+  name: "PixyNetLoader — Explorer.exe Loading DLL from Suspicious Path"
+  description: >
+    Detects explorer.exe loading DLL files from non-standard, user-writable
+    directories such as ProgramData, AppData, Temp, or Public. In Operation
+    Neusploit, the COM-hijacked CLSID {D9144DCD-E998-4ECA-AB6A-DCD83CCBA16D}
+    causes explorer.exe to load EhStoreShell.dll from
+    ProgramData\USOPublic\Data\User. The DLL then loads the CLR runtime, extracts
+    shellcode from SplashScreen.png via steganography, and deploys a .NET-based
+    Covenant Grunt C2 implant. This is a critical late-stage detection in the
+    PixyNetLoader execution chain.
+  mitre:
+    tactic: "Execution"
+    technique: "T1106"
+    sub_technique: ""
+    technique_name: "Native API"
+  severity: HIGH
+  confidence: HIGH
+  risk_score: 85
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=7
+    Image="*\\explorer.exe"
+    (ImageLoaded="*\\ProgramData\\*"
+     OR ImageLoaded="*\\AppData\\*"
+     OR ImageLoaded="*\\Temp\\*"
+     OR ImageLoaded="*\\Public\\*"
+     OR ImageLoaded="*\\Users\\*\\Downloads\\*")
+    ImageLoaded="*.dll"
+    NOT (ImageLoaded="*\\ProgramData\\Microsoft\\*\\*.dll"
+         AND Signed="true")
+    | eval is_ehstoreshell=if(like(ImageLoaded, "%EhStoreShell.dll"), "YES", "NO")
+    | eval dll_name=mvindex(split(ImageLoaded, "\\"), -1)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(ImageLoaded) as loaded_dlls
+      values(dll_name) as dll_names
+      values(Signed) as signature_status
+      values(is_ehstoreshell) as neusploit_match
+      values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer dll_names loaded_dlls signature_status neusploit_match
+      users first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-11m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "Explorer loaded suspicious DLL on $Computer$: $dll_names$"
+      severity: high
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        EventCode=7 Computer="$Computer$" Image="*\\explorer.exe"
+        earliest=-24h
+    risk:
+      score: 85
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Shell extensions installed in non-standard paths — validate DLL signature and publisher"
+    - "Some legitimate software installs COM objects in ProgramData — build allowlist by ImageLoaded path"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 11: CVE-2026-21509 — Shell.Explorer.1 COM Object Instantiation
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects the Shell.Explorer.1 COM object (CLSID EAB22AC3-30C1-11CF-A7EB-
+#  0000C05BAE0B) being loaded by Office processes. This is the specific OLE
+#  bypass mechanism used by CVE-2026-21509 to embed an Internet Explorer
+#  browser control inside Office documents, enabling script execution and
+#  remote payload download.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very low — Shell.Explorer.1 in Office documents has no legitimate use
+
+rule_11_shell_explorer_com_instantiation:
+  name: "CVE-2026-21509 — Shell.Explorer.1 COM Object Loaded by Office"
+  description: >
+    Detects the instantiation of the Shell.Explorer.1 COM object
+    (CLSID {EAB22AC3-30C1-11CF-A7EB-0000C05BAE0B}) by Microsoft Office
+    processes. CVE-2026-21509 abuses this embedded Internet Explorer browser
+    control to bypass OLE security mitigations, enabling the loading of local
+    files, script execution, and connection to remote servers for payload
+    download — all without macro interaction. Microsoft's mitigation applies
+    a kill bit to this CLSID. Detection of this COM object loading indicates
+    either an unpatched system under active exploitation or an exploit attempt
+    against the Shell.Explorer.1 bypass.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1203"
+    sub_technique: ""
+    technique_name: "Exploitation for Client Execution"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 95
+  search: >
+    (index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+     (EventCode=7 OR EventCode=12 OR EventCode=13)
+     (Image="*\\winword.exe" OR Image="*\\excel.exe"
+      OR Image="*\\powerpnt.exe" OR Image="*\\outlook.exe")
+     ("EAB22AC3-30C1-11CF-A7EB-0000C05BAE0B"
+      OR "Shell.Explorer.1"
+      OR ImageLoaded="*\\ieframe.dll"
+      OR ImageLoaded="*\\mshtml.dll"
+      OR ImageLoaded="*\\shdocvw.dll"))
+    OR
+    (index=main sourcetype="XmlWinEventLog:Security"
+     EventCode=4688
+     (ParentProcessName="*\\winword.exe" OR ParentProcessName="*\\excel.exe")
+     (NewProcessName="*\\iexplore.exe" OR NewProcessName="*\\msedge.exe"))
+    | eval detection=case(
+      like(_raw, "%EAB22AC3%"), "Shell.Explorer.1 CLSID directly referenced",
+      like(ImageLoaded, "%ieframe.dll%"), "IE frame DLL loaded by Office",
+      like(ImageLoaded, "%mshtml.dll%"), "MSHTML engine loaded by Office",
+      like(ImageLoaded, "%shdocvw.dll%"), "Shell DocObject Viewer loaded by Office",
+      1=1, "Browser control activated from Office")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(detection) as detection_details
+      values(Image) as office_processes
+      values(ImageLoaded) as loaded_components
+      values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer detection_details office_processes loaded_components users
+      first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-21509: Shell.Explorer.1 COM loaded by Office on $Computer$"
+      severity: critical
+      drilldown_search: >
+        index=main Computer="$Computer$"
+        ("EAB22AC3" OR "Shell.Explorer" OR "ieframe.dll" OR "mshtml.dll")
+        earliest=-24h
+    risk:
+      score: 95
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Legacy ActiveX controls embedded in old documents — validate document origin and Office version"
+    - "Some SharePoint-integrated Office workflows may load IE components — validate with web traffic"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 12: Kill Chain Correlation — CVE-2026-21509 Full Attack Sequence
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Multi-stage correlation rule that combines early-stage (exploit) indicators
+#  with late-stage (persistence/C2) indicators to detect the complete Operation
+#  Neusploit kill chain. Fires when 3+ stages are observed on the same host
+#  within 60 minutes, providing the highest-confidence detection with the
+#  lowest false positive rate.
+#
+#  Confidence  : CRITICAL
+#  Severity    : CRITICAL
+#  FP Rate     : Near-zero — requires multiple independent indicators to correlate
+
+rule_12_neusploit_kill_chain_correlation:
+  name: "Operation Neusploit — Full Kill Chain Correlation"
+  description: >
+    Multi-stage correlation detecting the complete Operation Neusploit attack
+    sequence on a single host within a 60-minute window. Combines: (1) Office
+    spawning suspicious child process or outbound connection (exploit stage),
+    (2) file drops in known staging directories (payload delivery), (3) COM
+    hijacking or Outlook registry modification (persistence), (4) scheduled
+    task creation or explorer.exe DLL loading (execution). When 3 or more
+    stages are detected on the same host, this indicates confirmed APT28
+    compromise with extremely high confidence. Triggers immediate
+    host isolation and IR escalation.
+  mitre:
+    tactic: "Initial Access, Execution, Persistence, Command and Control"
+    technique: "T1566.001, T1203, T1546.015, T1053.005, T1071.001"
+    sub_technique: ""
+    technique_name: "Operation Neusploit Full Kill Chain"
+  severity: CRITICAL
+  confidence: CRITICAL
+  risk_score: 100
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    (
+      (EventCode=1
+       (ParentImage="*\\winword.exe" OR ParentImage="*\\outlook.exe")
+       (Image="*\\cmd.exe" OR Image="*\\powershell.exe"
+        OR Image="*\\schtasks.exe" OR Image="*\\rundll32.exe"))
+      OR
+      (EventCode=3 Initiated=true
+       (Image="*\\winword.exe" OR Image="*\\outlook.exe")
+       NOT DestinationHostname="*.microsoft.com")
+      OR
+      (EventCode=11
+       (TargetFilename="*EhStoreShell.dll"
+        OR TargetFilename="*SplashScreen.png"
+        OR TargetFilename="*VbaProject.OTM"
+        OR TargetFilename="*\\2_2.d"
+        OR TargetFilename="*\\table.d"
+        OR TargetFilename="*Diagnostics\\office.xml"))
+      OR
+      (EventCode IN (12,13)
+       (TargetObject="*D9144DCD-E998-4ECA-AB6A-DCD83CCBA16D*"
+        OR (TargetObject="*\\Outlook\\Security*" Details="DWORD (0x00000001)")
+        OR TargetObject="*LoadMacroProviderOnBoot*"))
+      OR
+      (EventCode=1 Image="*\\schtasks.exe"
+       CommandLine="*OneDriveHealth*")
+      OR
+      (EventCode=7 Image="*\\explorer.exe"
+       ImageLoaded="*\\ProgramData\\*\\EhStoreShell.dll")
+    )
+    | eval stage=case(
+      EventCode=1 AND (like(ParentImage, "%winword.exe") OR like(ParentImage, "%outlook.exe")),
+        "1_exploit_execution",
+      EventCode=3, "1_exploit_download",
+      EventCode=11, "2_payload_delivery",
+      EventCode IN (12,13), "3_persistence_install",
+      EventCode=1 AND like(CommandLine, "%OneDriveHealth%"), "3_scheduled_task",
+      EventCode=7 AND like(Image, "%explorer.exe%"), "4_implant_loading",
+      1=1, "related_activity")
+    | stats dc(stage) as stages_observed
+      values(stage) as attack_stages
+      count min(_time) as first_seen max(_time) as last_seen
+      values(Image) as processes
+      values(TargetFilename) as dropped_files
+      values(TargetObject) as registry_keys
+      values(CommandLine) as commands
+      values(User) as users
+      by Computer
+    | where stages_observed >= 3
+    | eval time_span_minutes=round((last_seen - first_seen)/60, 1)
+    | where time_span_minutes <= 60
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | eval alert_context="CONFIRMED APT28 OPERATION NEUSPLOIT — ISOLATE HOST, INVOKE IR PLAN"
+    | table Computer stages_observed attack_stages processes dropped_files
+      registry_keys commands users time_span_minutes first_seen last_seen
+      alert_context
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-65m@m"
+  throttle:
+    field: "Computer"
+    period: "60m"
+  actions:
+    notable:
+      rule_title: "CRITICAL: APT28 Neusploit kill chain confirmed on $Computer$ ($stages_observed$ stages)"
+      severity: critical
+      drilldown_search: >
+        index=main Computer="$Computer$" earliest=-2h
+        sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        ("winword" OR "outlook" OR "EhStoreShell" OR "SplashScreen"
+         OR "VbaProject" OR "OneDriveHealth" OR "D9144DCD"
+         OR "freefoodaid" OR "wellnesscaremed")
+    risk:
+      score: 100
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "None expected — correlation of 3+ independent Neusploit-specific indicators within 60 minutes is definitive"
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+#
+#  Run these manually during triage and incident response after any of the
+#  above rules fire. Replace $HOSTNAME$ with the affected system name.
+# ==============================================================================
+
+investigation_queries:
+
+  inv_1_full_process_tree:
+    name: "Full Process Tree — Office Child Process Genealogy"
+    description: >
+      Reconstruct the complete process tree from the Office application
+      through all descendant processes to identify the full exploit chain.
+    search: >
+      index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+      EventCode=1 Computer="$HOSTNAME$"
+      earliest=-24h
+      | eval parent=ParentImage, child=Image
+      | search parent="*\\winword.exe" OR parent="*\\outlook.exe"
+        OR parent="*\\cmd.exe" OR parent="*\\powershell.exe"
+        OR parent="*\\schtasks.exe" OR parent="*\\rundll32.exe"
+        OR parent="*\\explorer.exe"
+      | table _time Computer User ParentImage ParentCommandLine
+        Image CommandLine Hashes
+      | sort _time
+
+  inv_2_registry_modifications:
+    name: "Registry Modifications — COM Hijacking and Outlook Persistence"
+    description: >
+      Identify all registry modifications on the compromised host, focusing
+      on COM object registration, Outlook security settings, and Run keys.
+    search: >
+      index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+      (EventCode=12 OR EventCode=13 OR EventCode=14) Computer="$HOSTNAME$"
+      earliest=-24h
+      (TargetObject="*\\Classes\\CLSID\\*"
+       OR TargetObject="*\\Outlook\\*"
+       OR TargetObject="*\\Run\\*"
+       OR TargetObject="*\\RunOnce\\*"
+       OR TargetObject="*\\InProcServer32*"
+       OR TargetObject="*LoadMacroProviderOnBoot*")
+      | table _time EventCode TargetObject Details Image User
+      | sort _time
+
+  inv_3_file_creation_timeline:
+    name: "File Creation Timeline — Dropped Artifacts"
+    description: >
+      List all files created on the compromised host in staging directories
+      to identify dropped payloads, scripts, and persistence artifacts.
+    search: >
+      index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+      EventCode=11 Computer="$HOSTNAME$"
+      earliest=-24h
+      (TargetFilename="*\\ProgramData\\*"
+       OR TargetFilename="*\\AppData\\*"
+       OR TargetFilename="*\\Temp\\*"
+       OR TargetFilename="*\\Public\\*"
+       OR TargetFilename="*\\Downloads\\*"
+       OR TargetFilename="*VbaProject*"
+       OR TargetFilename="*.d"
+       OR TargetFilename="*.dll"
+       OR TargetFilename="*.xml"
+       OR TargetFilename="*.msg")
+      | table _time TargetFilename Image User
+      | sort _time
+
+  inv_4_network_connections:
+    name: "Network Connections — C2 and Exfiltration"
+    description: >
+      Map all outbound network connections from the compromised host to
+      identify C2 channels, data exfiltration, and attacker infrastructure.
+    search: >
+      index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+      EventCode=3 Initiated=true Computer="$HOSTNAME$"
+      earliest=-24h
+      NOT (DestinationIp="10.*" OR DestinationIp="172.16.*"
+           OR DestinationIp="192.168.*" OR DestinationIp="127.*")
+      | table _time Image DestinationIp DestinationHostname DestinationPort
+        User Protocol
+      | sort _time
+
+  inv_5_scheduled_task_audit:
+    name: "Scheduled Task Audit — Persistence Mechanism"
+    description: >
+      Identify all scheduled task creation and modification events on the
+      host, focusing on tasks created after the exploit timestamp.
+    search: >
+      (index=main sourcetype="XmlWinEventLog:Security"
+       (EventCode=4698 OR EventCode=4699 OR EventCode=4702)
+       Computer="$HOSTNAME$" earliest=-24h)
+      OR
+      (index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+       EventCode=1 Computer="$HOSTNAME$" Image="*\\schtasks.exe"
+       earliest=-24h)
+      | table _time EventCode sourcetype TaskName CommandLine User
+      | sort _time
+
+  inv_6_dll_loads_by_explorer:
+    name: "DLL Loads by Explorer.exe — COM Hijacking Verification"
+    description: >
+      List all DLLs loaded by explorer.exe to identify hijacked COM objects
+      and malicious modules loaded via the PixyNetLoader persistence chain.
+    search: >
+      index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+      EventCode=7 Image="*\\explorer.exe" Computer="$HOSTNAME$"
+      earliest=-24h
+      NOT (ImageLoaded="C:\\Windows\\System32\\*"
+           OR ImageLoaded="C:\\Windows\\SysWOW64\\*"
+           OR ImageLoaded="C:\\Program Files\\*"
+           OR ImageLoaded="C:\\Program Files (x86)\\*")
+      | table _time ImageLoaded Hashes Signed SignatureStatus Company User
+      | sort _time
+
+  inv_7_email_exfiltration:
+    name: "Email Exfiltration — MiniDoor Activity"
+    description: >
+      Search for evidence of MiniDoor email theft including references to
+      known exfiltration addresses, temp_email.msg staging files, and
+      Outlook VBA project modifications.
+    search: >
+      index=main Computer="$HOSTNAME$" earliest=-72h
+      ("ahmeclaw2002" OR "ahmeclaw@proton" OR "temp_email.msg"
+       OR "VbaProject.OTM" OR "adjgfenkbe")
+      | table _time sourcetype EventCode _raw
+      | sort _time
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK — CVE-2026-21509 / Operation Neusploit
+# ==============================================================================
+
+incident_response_playbook:
+
+  step_1_immediate_containment:
+    action: "ISOLATE affected host from the network immediately"
+    details: >
+      CVE-2026-21509 exploitation delivers persistent implants within minutes.
+      Network isolation prevents C2 communication (Covenant Grunt via filen.io)
+      and email exfiltration (MiniDoor via ahmeclaw addresses). Do NOT power off
+      the host — preserve volatile memory for forensic analysis.
+
+  step_2_identify_scope:
+    action: "Determine blast radius — identify all recipients of the phishing email"
+    details: >
+      Search email gateway logs for the malicious RTF attachment by subject line,
+      sender, or attachment hash. Cross-reference with mail flow rules to identify
+      all recipients who may have received the weaponized document. Check if any
+      other hosts contacted freefoodaid[.]com or wellnesscaremed[.]com.
+
+  step_3_collect_evidence:
+    action: "Preserve forensic artifacts before remediation"
+    details: >
+      Collect the following before any cleanup:
+        1. Memory dump of the affected system (for Covenant Grunt implant analysis)
+        2. Copy of %AppData%\Microsoft\Outlook\VbaProject.OTM (MiniDoor macro)
+        3. Copy of %ProgramData%\USOPublic\Data\User\EhStoreShell.dll
+        4. Copy of %ProgramData%\Microsoft OneDrive\setup\Cache\SplashScreen.png
+        5. Registry export of HKCU\Software\Classes\CLSID
+        6. Registry export of HKCU\Software\Microsoft\Office\16.0\Outlook
+        7. Scheduled task export: schtasks /query /v /fo csv
+        8. Full Sysmon and Security event log export
+
+  step_4_analyze_email_compromise:
+    action: "Assess email data theft scope (MiniDoor)"
+    details: >
+      MiniDoor steals emails from Inbox, Junk, and Drafts folders. Determine:
+        1. How long was VbaProject.OTM active? (Check file creation timestamp)
+        2. Review Outlook Sent Items for emails to ahmeclaw2002@outlook.com
+           and ahmeclaw@proton.me
+        3. Estimate volume of compromised emails
+        4. Identify sensitive content in stolen emails (credentials, strategy docs,
+           classified information)
+        5. Notify affected parties per data breach notification requirements
+
+  step_5_remediate:
+    action: "Remove all persistence mechanisms and patch the vulnerability"
+    details: >
+      Execute in order:
+        1. Delete VbaProject.OTM from %AppData%\Microsoft\Outlook\
+        2. Delete EhStoreShell.dll from %ProgramData%\USOPublic\Data\User\
+        3. Delete SplashScreen.png from %ProgramData%\Microsoft OneDrive\setup\Cache\
+        4. Remove registry key: HKCU\Software\Classes\CLSID\{D9144DCD-E998-4ECA-AB6A-DCD83CCBA16D}
+        5. Restore Outlook security registry settings:
+           - HKCU\...\Outlook\Security\Level = 3 (or delete)
+           - Delete LoadMacroProviderOnBoot value
+           - Reset PONT_STRING to default
+        6. Delete scheduled task "OneDriveHealth" if still present
+        7. Apply Microsoft patch for CVE-2026-21509 (KB5053624 or later)
+        8. Apply COM Compatibility kill bit for {EAB22AC3-30C1-11CF-A7EB-0000C05BAE0B}
+        9. Reset user credentials — assume all cached credentials are compromised
+       10. Scan host with updated AV/EDR signatures for Covenant Grunt artifacts
+
+  step_6_hunt_for_lateral_movement:
+    action: "Hunt for evidence of lateral movement from the compromised host"
+    details: >
+      The Covenant Grunt implant provides full C2 capabilities including:
+        1. Search for RDP, SMB, WinRM connections originating from the
+           compromised host to internal systems
+        2. Check for new user accounts or privilege escalation events
+        3. Review authentication logs for pass-the-hash or token theft
+        4. Check network logs for Cobalt Strike, Covenant, or Grunt beacons
+        5. Scan for the filen.io C2 parent folder UUID (fe644d8c-2601-46ea-bf7d-3db110aa08d4)
+           in proxy/web logs
+
+  step_7_report_and_share:
+    action: "Report to CISA and share IOCs with sector ISAC"
+    details: >
+      APT28 campaigns typically target multiple organizations simultaneously.
+      Report the incident to CISA (us-cert.cisa.gov/report) and share
+      sanitized IOCs with your sector ISAC. Include any new infrastructure
+      indicators (domains, IPs, hashes) not covered in the original
+      Zscaler ThreatLabz report. Update organizational threat intelligence
+      feeds with all confirmed IOCs from this incident.
