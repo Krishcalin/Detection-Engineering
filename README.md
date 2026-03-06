@@ -1,12 +1,39 @@
-# Detection-Engineering
+<p align="center">
+  <img src="docs/banner.svg" alt="Detection Engineering" width="800"/>
+</p>
+
+<p align="center">
+  <strong>SOC attack detection and response rules for Splunk SIEM with MITRE ATT&CK mapping, investigation queries, and incident response playbooks</strong>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Splunk-SPL-dc2626?style=flat-square&logo=splunk&logoColor=white" alt="Splunk SPL"/>
+  <img src="https://img.shields.io/badge/MITRE-ATT%26CK-f59e0b?style=flat-square" alt="MITRE ATT&CK"/>
+  <img src="https://img.shields.io/badge/rules-130%2B-22c55e?style=flat-square" alt="130+ Rules"/>
+  <img src="https://img.shields.io/badge/platforms-Windows%20AD%20%7C%20RHEL%20Linux-3b82f6?style=flat-square" alt="Windows AD | RHEL Linux"/>
+  <img src="https://img.shields.io/badge/license-GPL--3.0-orange?style=flat-square" alt="GPL-3.0 License"/>
+</p>
+
+---
+
+## Overview
 
 Security Operation Center (SOC) attack detection and response rules for Splunk SIEM. Each rule includes comprehensive SPL queries, MITRE ATT&CK mapping, false positive tuning guidance, investigation queries, and incident response playbooks.
+
+- **130+ detection rules** across Windows AD, RHEL Linux, and recent threat campaigns
+- **MITRE ATT&CK mapped** -- every rule tagged with technique IDs and tactics
+- **Investigation queries** -- ready-to-run SPL for SOC analyst triage
+- **Incident response playbooks** -- step-by-step response procedures per attack type
+
+---
 
 ## Repository Structure
 
 ```
 Detection-Engineering/
 ├── README.md
+├── docs/
+│   └── banner.svg
 └── splunk_rules/
     ├── credential_access/
     │   ├── adcs_attack_detection.yml
@@ -19,6 +46,8 @@ Detection-Engineering/
     │   ├── pass_the_hash_detection.yml
     │   ├── password_spraying_detection.yml
     │   └── privileged_group_membership_modification_detection.yml
+    ├── recent_attacks/
+    │   └── cve_2026_21509_apt28_operation_neusploit_detection.yml
     └── rhel_linux/
         ├── rhel_privilege_escalation_detection.yml
         ├── rhel_persistence_detection.yml
@@ -607,6 +636,37 @@ All RHEL rules rely on the following Splunk data sources:
 5. Deploy **Credential Access** rules — shadow file access and SSH key theft are critical indicators
 6. Deploy **Lateral Movement** and **Exfiltration** rules last — these benefit from the bastion host lookup table being fully populated
 7. Run **Discovery/Enumeration** rules in report mode for 14 days before alerting to establish a baseline of normal admin activity
+
+---
+
+## Recent Attack Campaign Detection
+
+Detection rules for active threat campaigns and recently disclosed CVEs.
+
+| Rule File | Threat Actor / CVE | MITRE ID | Severity | Detection Vectors |
+|-----------|-------------------|----------|----------|-------------------|
+| `cve_2026_21509_apt28_operation_neusploit_detection.yml` | UAC-0001 (APT28) / CVE-2026-21509 | T1203, T1559.001, T1547.012, T1071.001 | CRITICAL | 12 rules + 7 investigation queries + IR playbook |
+
+### CVE-2026-21509 -- APT28 Operation Neusploit
+
+**File**: `splunk_rules/recent_attacks/cve_2026_21509_apt28_operation_neusploit_detection.yml`
+
+Detects APT28 (UAC-0001) exploitation of CVE-2026-21509 (Microsoft Office OLE Security Feature Bypass via Shell.Explorer.1 COM object) through 12 detection rules covering two attack variants -- MiniDoor (Outlook email stealer) and PixyNetLoader (COM-hijacking loader with steganographic shellcode):
+
+| Rule | Detection Method | Data Source | Confidence |
+|------|-----------------|-------------|------------|
+| Rule 1 | Office child process spawning cmd/powershell/mshta | Sysmon 1, 4688 | HIGH |
+| Rule 2 | Office outbound connections to non-standard ports | Sysmon 3 | HIGH |
+| Rule 3 | Known C2 domains (freefoodaid.com, wellnesscaremed.com) | DNS, Proxy | CRITICAL |
+| Rule 4 | File hash IOC matching (12 SHA256 + 6 MD5) | Sysmon 1/7/11 | CRITICAL |
+| Rule 5 | PixyNetLoader COM hijacking (CLSID D9144DCD) | Sysmon 13 | CRITICAL |
+| Rule 6 | MiniDoor Outlook macro security downgrade | Sysmon 13 | HIGH |
+| Rule 7 | File staging in suspicious paths (AppData, Temp) | Sysmon 11 | HIGH |
+| Rule 8 | OneDriveHealth scheduled task persistence | Sysmon 1, 4698 | HIGH |
+| Rule 9 | Outlook VBA email theft indicators | Sysmon 1, 4104 | HIGH |
+| Rule 10 | Explorer.exe suspicious DLL side-load | Sysmon 7 | HIGH |
+| Rule 11 | Shell.Explorer.1 COM instantiation from Office | Sysmon 1, 4104 | HIGH |
+| Rule 12 | Full kill chain correlation (multi-stage) | Combined | CRITICAL |
 
 ---
 
