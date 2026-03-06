@@ -1,0 +1,633 @@
+# ==============================================================================
+#  Apache Path Traversal & Directory Traversal Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for path traversal attacks targeting
+#                Apache HTTP Server. Covers CVE-2021-41773 and CVE-2021-42013
+#                (Apache 2.4.49/2.4.50 path normalization bypass), generic
+#                directory traversal sequences, null byte injection, URL-encoded
+#                traversal variants, and /proc/self/environ LFI.
+#
+#  MITRE ATT&CK: T1190     - Exploit Public-Facing Application
+#                 T1083     - File and Directory Discovery
+#                 T1005     - Data from Local System
+#  Kill Chain   : Initial Access / Exploitation
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-06
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Apache access logs forwarded to Splunk:
+#     index=web sourcetype=access_combined (Combined Log Format)
+#     OR sourcetype=access_common (Common Log Format)
+#
+#  2. Apache error logs forwarded to Splunk:
+#     index=web sourcetype=apache:error
+#
+#  3. Recommended Apache LogFormat with response time:
+#     LogFormat "%h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"
+#               %D %{X-Forwarded-For}i" combined_extended
+#
+#  4. If using a reverse proxy / load balancer, ensure X-Forwarded-For is
+#     logged so the true client IP is available for correlation.
+#
+# ==============================================================================
+#
+#  CVE REFERENCE:
+#
+#  CVE-2021-41773 — Apache 2.4.49 path traversal via %2e normalization bypass
+#                   Allows reading arbitrary files outside DocumentRoot when
+#                   "Require all granted" is set. With mod_cgi, enables RCE.
+#                   CVSS: 7.5 (HIGH)
+#
+#  CVE-2021-42013 — Apache 2.4.50 incomplete fix for CVE-2021-41773.
+#                   Double-URL-encoding (%252e) bypasses the 2.4.50 patch.
+#                   CVSS: 9.8 (CRITICAL) — active exploitation in the wild.
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: CVE-2021-41773 — Apache 2.4.49 Path Normalization Bypass (T1190)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects the specific path traversal payload that exploits the incomplete
+#  path normalization in Apache 2.4.49. Attackers use ".%2e/" or "%2e%2e/"
+#  sequences to bypass directory restrictions and access files outside
+#  DocumentRoot, including /etc/passwd and CGI-bin for RCE.
+#
+#  Confidence  : VERY HIGH (95)
+#  Severity    : CRITICAL
+#  FP Rate     : Near zero — these encoded sequences never appear in legitimate traffic
+
+rule_1_cve_2021_41773:
+  name: "Path Traversal — CVE-2021-41773 Apache 2.4.49 Exploit (T1190)"
+  description: >
+    Detects exploitation of CVE-2021-41773 in Apache HTTP Server 2.4.49 where
+    a path normalization flaw allows traversal via ".%2e/" or "%2e%2e/"
+    sequences. With mod_cgi enabled, attackers can achieve remote code
+    execution. This CVE was actively exploited in the wild within days of
+    disclosure and remains a common target for automated scanners.
+  mitre:
+    tactic: "Initial Access"
+    technique: T1190
+    technique_name: "Exploit Public-Facing Application"
+    related_techniques:
+      - "T1059.004: Command and Scripting Interpreter: Unix Shell (post-exploit RCE)"
+      - "T1083: File and Directory Discovery (reading /etc/passwd)"
+  severity: critical
+  confidence: 95
+  risk_score: 95
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+    - "Apache Error Log (sourcetype=apache:error)"
+  cve:
+    - "CVE-2021-41773"
+  prerequisites:
+    - "Apache access logs forwarded to Splunk"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    ``` CVE-2021-41773 specific patterns ```
+    | where match(uri_path, "(?i)(\.%2e|%2e\.|\.\./|%2e%2e).*(/etc/|/bin/|/cgi-bin/|/proc/|/var/)")
+        OR match(uri_path, "(?i)(/icons/|/cgi-bin/)\.%2e/")
+    ``` Classify the exploit variant ```
+    | eval exploit_variant=case(
+        match(uri_path, "(?i)\.%2e/\.%2e/"),                        "CVE-2021-41773_DOUBLE_TRAVERSE",
+        match(uri_path, "(?i)cgi-bin.*\.%2e.*\.%2e.*(sh|bash)"),    "CVE-2021-41773_RCE_VIA_CGI",
+        match(uri_path, "(?i)/icons/\.%2e"),                        "CVE-2021-41773_ICONS_TRAVERSE",
+        1==1,                                                        "CVE-2021-41773_GENERIC"
+      )
+    | eval is_rce_attempt=if(match(uri_path, "(?i)(cgi-bin|sh|bash|cmd|exec|system)"), "YES", "NO")
+    | eval target_file=case(
+        match(uri_path, "(?i)/etc/passwd"),   "/etc/passwd",
+        match(uri_path, "(?i)/etc/shadow"),   "/etc/shadow",
+        match(uri_path, "(?i)/proc/self"),    "/proc/self/*",
+        match(uri_path, "(?i)/bin/sh"),       "RCE: /bin/sh",
+        match(uri_path, "(?i)/bin/bash"),     "RCE: /bin/bash",
+        1==1,                                  uri_path
+      )
+    | eval mitre_technique="T1190"
+    | eval mitre_tactic="Initial Access"
+    | eval alert_name="CVE-2021-41773 — Apache 2.4.49 Path Traversal"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as attempt_count,
+        dc(uri_path) as unique_payloads,
+        values(uri_path) as payloads,
+        values(status) as http_statuses,
+        values(exploit_variant) as variants,
+        values(target_file) as targets,
+        max(is_rce_attempt) as rce_attempted
+        by src_ip, http_method
+    | eval severity=if(rce_attempted=="YES", "CRITICAL", "HIGH")
+    | table first_seen, last_seen, src_ip, http_method, attempt_count,
+            unique_payloads, payloads, http_statuses, variants, targets,
+            rce_attempted, severity, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+  throttle:
+    field: "src_ip"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "CVE-2021-41773 Exploit — $src_ip$ ($attempt_count$ attempts)"
+        rule_description: >
+          Source IP $src_ip$ sent $attempt_count$ requests matching CVE-2021-41773
+          path traversal patterns targeting Apache 2.4.49. Variants: $variants$.
+          RCE attempted: $rce_attempted$. HTTP responses: $http_statuses$.
+        severity: critical
+        drilldown_search: >
+          index=web src_ip="$src_ip$" uri_path="*%2e*"
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 95
+
+  known_false_positives:
+    - "Security scanners (Nessus, Qualys) running authenticated vulnerability scans — correlate with scan schedule"
+    - "Penetration testing engagements — add pentest source IPs to an allowlist lookup during engagement window"
+  tuning_guidance: |
+    1. This rule has near-zero false positive rate in production environments
+    2. Any match should trigger immediate investigation regardless of HTTP response code
+    3. HTTP 200 responses indicate SUCCESSFUL exploitation — escalate immediately
+    4. HTTP 403/404 responses indicate the server may be patched but is still being targeted
+    5. Correlate with apache:error logs for "AH01797" error messages (traversal blocked)
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: CVE-2021-42013 — Apache 2.4.50 Double-Encoding Bypass (T1190)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The patch in Apache 2.4.50 for CVE-2021-41773 was incomplete. Attackers
+#  bypass it using double-URL-encoding: %%32%65 decodes to %2e which then
+#  decodes to "." — traversing past the patched normalization.
+#
+#  Confidence  : VERY HIGH (95)
+#  Severity    : CRITICAL
+#  FP Rate     : Near zero — double-encoded dots never appear in legitimate requests
+
+rule_2_cve_2021_42013:
+  name: "Path Traversal — CVE-2021-42013 Apache 2.4.50 Double-Encoding Bypass (T1190)"
+  description: >
+    Detects exploitation of CVE-2021-42013 where the Apache 2.4.50 patch for
+    CVE-2021-41773 is bypassed using double-URL-encoding. The sequence
+    "%%32%65" decodes to "%2e" then to "." allowing directory traversal.
+    This vulnerability has a CVSS score of 9.8 (CRITICAL) and was mass-
+    exploited by botnets within 24 hours of public PoC availability.
+  mitre:
+    tactic: "Initial Access"
+    technique: T1190
+    technique_name: "Exploit Public-Facing Application"
+  severity: critical
+  confidence: 95
+  risk_score: 98
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+  cve:
+    - "CVE-2021-42013"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    ``` Double-URL-encoded traversal patterns specific to CVE-2021-42013 ```
+    | where match(uri_path, "(?i)(%%32%65|%252e|%%30%30|%25%32%65)")
+        OR match(uri_path, "(?i)\.%%32%65/")
+    | eval exploit_type=case(
+        match(uri_path, "(?i)%%32%65"),                   "DOUBLE_ENCODE_PCT32_65",
+        match(uri_path, "(?i)%252e"),                     "DOUBLE_ENCODE_PCT252E",
+        match(uri_path, "(?i)%25%32%65"),                 "TRIPLE_ENCODE",
+        1==1,                                              "ENCODING_BYPASS"
+      )
+    | eval is_rce_attempt=if(match(uri_path, "(?i)(cgi-bin|sh|bash|cmd|exec|system|curl|wget)"), "YES", "NO")
+    | eval mitre_technique="T1190"
+    | eval mitre_tactic="Initial Access"
+    | eval alert_name="CVE-2021-42013 — Apache 2.4.50 Double-Encoding Bypass"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as attempt_count,
+        values(uri_path) as payloads,
+        values(status) as http_statuses,
+        values(exploit_type) as encoding_types,
+        max(is_rce_attempt) as rce_attempted
+        by src_ip, http_method
+    | table first_seen, last_seen, src_ip, http_method, attempt_count,
+            payloads, http_statuses, encoding_types, rce_attempted,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "CVE-2021-42013 Exploit — $src_ip$ ($attempt_count$ attempts)"
+        severity: critical
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 98
+
+  known_false_positives:
+    - "Legitimate security scanners during authorized vulnerability assessments"
+    - "Extremely rare — double-encoded percent sequences have no legitimate use"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Generic Directory Traversal Sequences in URI (T1083)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Catches classic "../" traversal attempts including URL-encoded, Unicode,
+#  and overlong UTF-8 variants. These target any Apache version and are the
+#  most common web application attack vector for file disclosure.
+#
+#  Confidence  : HIGH (85)
+#  Severity    : HIGH
+#  FP Rate     : Low — tune for web apps that legitimately use ".." in URLs
+
+rule_3_generic_directory_traversal:
+  name: "Path Traversal — Generic Directory Traversal Sequences (T1083)"
+  description: >
+    Detects classic directory traversal attacks using "../" sequences and their
+    encoded variants: %2e%2e%2f, %2e%2e/, ..%2f, %c0%ae%c0%ae/ (overlong
+    UTF-8), and ..%255c (IIS-style double-encoded backslash tested against
+    Apache). Targets sensitive system files like /etc/passwd, /etc/shadow,
+    /proc/self/environ, and Windows paths via \..\..\..\.
+  mitre:
+    tactic: "Discovery"
+    technique: T1083
+    technique_name: "File and Directory Discovery"
+    related_techniques:
+      - "T1005: Data from Local System"
+  severity: high
+  confidence: 85
+  risk_score: 80
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    ``` Classic traversal patterns and all known encoding variants ```
+    | where match(uri_path, "(?i)(\.\./|\.\.\\\\|%2e%2e%2f|%2e%2e/|\.\.%2f|%2e%2e%5c|%c0%ae%c0%ae|%c0%2e%c0%2e|%252e%252e|\.\.%255c)")
+    ``` Exclude known-safe application paths (customize per environment) ```
+    | where NOT match(uri_path, "^/(static|assets|css|js|images|fonts)/")
+    ``` Determine traversal depth ```
+    | rex field=uri_path max_match=20 "(?<traversal_seq>\.\.|%2e%2e|%c0%ae%c0%ae)"
+    | eval traversal_depth=mvcount(traversal_seq)
+    ``` Identify the target resource ```
+    | eval target_resource=case(
+        match(uri_path, "(?i)/etc/passwd"),          "UNIX_PASSWD",
+        match(uri_path, "(?i)/etc/shadow"),          "UNIX_SHADOW",
+        match(uri_path, "(?i)/proc/self"),           "PROC_SELF",
+        match(uri_path, "(?i)/var/log"),             "LOG_FILES",
+        match(uri_path, "(?i)win\.ini|boot\.ini"),   "WINDOWS_CONFIG",
+        match(uri_path, "(?i)web\.config|\.htaccess"),"WEB_CONFIG",
+        match(uri_path, "(?i)\.env"),                "ENV_FILE",
+        match(uri_path, "(?i)wp-config"),            "WORDPRESS_CONFIG",
+        1==1,                                         "OTHER"
+      )
+    | eval severity=case(
+        match(uri_path, "(?i)/etc/shadow"),    "CRITICAL",
+        traversal_depth>=5,                     "HIGH",
+        1==1,                                   "MEDIUM"
+      )
+    | eval mitre_technique="T1083"
+    | eval mitre_tactic="Discovery"
+    | eval alert_name="Generic Directory Traversal"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as attempt_count,
+        dc(uri_path) as unique_payloads,
+        max(traversal_depth) as max_depth,
+        values(target_resource) as targeted_files,
+        values(status) as http_statuses,
+        values(uri_path) as sample_payloads
+        by src_ip, http_method
+    | where attempt_count>=3
+    | table first_seen, last_seen, src_ip, http_method, attempt_count,
+            unique_payloads, max_depth, targeted_files, http_statuses,
+            sample_payloads, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Directory Traversal — $src_ip$ targeting $targeted_files$ ($attempt_count$ attempts)"
+        severity: high
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "Web applications with legitimate relative path references containing '..' — add specific URI prefixes to exclusion"
+    - "CDN or proxy health check URLs that contain encoded characters — add probe user-agents to allowlist"
+  tuning_guidance: |
+    1. Set threshold to >=3 attempts (default) to filter single accidental requests
+    2. Customize the exclusion regex for your application's known-safe paths
+    3. HTTP 200 with large byte count on traversal requests = LIKELY SUCCESSFUL — investigate immediately
+    4. Correlate with apache:error sourcetype for "client denied by server configuration" messages
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Null Byte Injection in URI Path (T1190)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Null byte (%00) injection truncates file paths in older Apache/PHP
+#  combinations, allowing attackers to bypass extension checks. For example:
+#  /page.php?file=../../../../etc/passwd%00.jpg appears to request a .jpg
+#  but the null byte terminates the string at /etc/passwd.
+#
+#  Confidence  : HIGH (88)
+#  Severity    : HIGH
+
+rule_4_null_byte_injection:
+  name: "Path Traversal — Null Byte Injection in URI (T1190)"
+  description: >
+    Detects null byte (%00) injection in HTTP request URIs. Null bytes
+    terminate C-style strings, allowing attackers to bypass file extension
+    validation. Classic attack: /include.php?page=../../../etc/passwd%00.html
+    bypasses checks that require .html extension. Affects Apache with older
+    PHP (< 5.3.4) and other CGI languages. Modern versions are patched but
+    the pattern still indicates active exploitation attempts.
+  mitre:
+    tactic: "Initial Access"
+    technique: T1190
+    technique_name: "Exploit Public-Facing Application"
+  severity: high
+  confidence: 88
+  risk_score: 82
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    ``` Null byte variants ```
+    | where match(uri_path, "(?i)(%00|%2500|\\x00)")
+    ``` Often combined with traversal ```
+    | eval combined_with_traversal=if(match(uri_path, "(?i)(\.\./|%2e%2e)"), "YES", "NO")
+    | eval mitre_technique="T1190"
+    | eval alert_name="Null Byte Injection"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as attempt_count,
+        values(uri_path) as payloads,
+        values(status) as http_statuses,
+        max(combined_with_traversal) as with_traversal
+        by src_ip
+    | table first_seen, last_seen, src_ip, attempt_count, payloads,
+            http_statuses, with_traversal, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Null Byte Injection — $src_ip$ ($attempt_count$ requests)"
+        severity: high
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 82
+
+  known_false_positives:
+    - "Extremely rare in legitimate traffic — nearly all matches are attack attempts"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Local File Inclusion via /proc/self/environ (T1005)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Attackers use LFI vulnerabilities to read /proc/self/environ which contains
+#  environment variables including injected User-Agent payloads. This classic
+#  technique enables code execution through LFI when log poisoning fails.
+#
+#  Confidence  : HIGH (90)
+#  Severity    : CRITICAL
+
+rule_5_proc_self_environ_lfi:
+  name: "LFI — /proc/self/environ Access Attempt (T1005)"
+  description: >
+    Detects attempts to read /proc/self/environ through Local File Inclusion.
+    Attackers leverage this to inject code via the HTTP_USER_AGENT environment
+    variable: first set a malicious User-Agent header containing PHP code, then
+    include /proc/self/environ to execute it. Also detects access to
+    /proc/self/fd, /proc/self/cmdline, and /proc/version for information
+    disclosure.
+  mitre:
+    tactic: "Collection"
+    technique: T1005
+    technique_name: "Data from Local System"
+    related_techniques:
+      - "T1059.004: Command Interpreter: Unix Shell"
+  severity: critical
+  confidence: 90
+  risk_score: 90
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    | rex field=_raw "\"(?<user_agent>[^\"]+)\"\s*$"
+    ``` /proc filesystem access via LFI ```
+    | where match(uri_path, "(?i)/proc/self/(environ|fd|cmdline|status|maps|mem)")
+        OR match(uri_path, "(?i)/proc/version")
+        OR match(uri_path, "(?i)(\.\./)+proc/self")
+        OR match(uri_path, "(?i)(%2e%2e%2f)+proc/self")
+    ``` Check if User-Agent contains code injection payload ```
+    | eval ua_has_code=if(match(user_agent, "(?i)(<\?php|system\(|exec\(|passthru|base64_decode|eval\()"), "YES", "NO")
+    | eval target=case(
+        match(uri_path, "(?i)environ"),     "proc_self_environ",
+        match(uri_path, "(?i)fd"),          "proc_self_fd",
+        match(uri_path, "(?i)cmdline"),     "proc_self_cmdline",
+        match(uri_path, "(?i)maps"),        "proc_self_maps",
+        match(uri_path, "(?i)version"),     "proc_version",
+        1==1,                                "proc_other"
+      )
+    | eval mitre_technique="T1005"
+    | eval alert_name="LFI via /proc/self/environ"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as attempt_count,
+        values(target) as proc_targets,
+        values(status) as http_statuses,
+        max(ua_has_code) as code_in_user_agent,
+        values(user_agent) as user_agents
+        by src_ip
+    | table first_seen, last_seen, src_ip, attempt_count, proc_targets,
+            http_statuses, code_in_user_agent, user_agents,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "LFI /proc/self/environ — $src_ip$ (code in UA: $code_in_user_agent$)"
+        severity: critical
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "None expected — /proc/self/environ should never appear in legitimate HTTP requests"
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+#  Run these manually during incident response to scope the attack.
+
+investigation_queries:
+
+  - name: "IQ-1: Full request history from attacker IP"
+    description: "Retrieve all HTTP requests from the suspected attacker IP in the last 24 hours"
+    search: |
+      index=web src_ip="$ATTACKER_IP$" earliest=-24h latest=now
+      | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+(?<http_ver>\S+)\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+      | table _time, src_ip, http_method, uri_path, status, bytes
+      | sort _time
+
+  - name: "IQ-2: Successful traversal exploitation (HTTP 200 with content)"
+    description: "Find traversal requests that returned HTTP 200 — indicates successful file read"
+    search: |
+      index=web sourcetype=access_combined status=200
+        (uri_path="*../*" OR uri_path="*%2e%2e*" OR uri_path="*%252e*")
+      | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+      | where bytes!="-" AND bytes!="0"
+      | eval bytes_num=tonumber(bytes)
+      | where bytes_num > 50
+      | table _time, src_ip, http_method, uri_path, status, bytes_num
+      | sort -bytes_num
+
+  - name: "IQ-3: Apache error log correlation for blocked traversals"
+    description: "Check Apache error logs for directory traversal denial messages"
+    search: |
+      index=web sourcetype=apache:error earliest=-24h latest=now
+        ("client denied" OR "AH01797" OR "AH00126" OR "directory traversal")
+      | rex "client\s+(?<src_ip>\d+\.\d+\.\d+\.\d+)"
+      | stats count as blocked_count by src_ip
+      | sort -blocked_count
+
+  - name: "IQ-4: POST-based traversal with body data (RCE via CGI)"
+    description: "Find POST requests to cgi-bin paths with traversal patterns — indicates RCE attempt"
+    search: |
+      index=web sourcetype=access_combined http_method=POST
+        (uri_path="*cgi-bin*" AND (uri_path="*%2e*" OR uri_path="*..*"))
+      | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+      | table _time, src_ip, uri_path, status, bytes
+
+  - name: "IQ-5: All traversal attempts by encoding type over 7 days"
+    description: "Trend analysis of traversal attacks by encoding technique used"
+    search: |
+      index=web sourcetype=access_combined earliest=-7d latest=now
+        (uri_path="*../*" OR uri_path="*%2e*" OR uri_path="*%252e*" OR uri_path="*%%32*" OR uri_path="*%c0%ae*" OR uri_path="*%00*")
+      | rex field=_raw "\"(?<http_method>\S+)\s+(?<uri_path>\S+)"
+      | eval encoding_type=case(
+          match(uri_path, "%%32%65"),          "CVE-2021-42013_DOUBLE",
+          match(uri_path, "%252e"),            "DOUBLE_ENCODE",
+          match(uri_path, "%c0%ae"),           "OVERLONG_UTF8",
+          match(uri_path, "\.%2e"),            "CVE-2021-41773",
+          match(uri_path, "%2e%2e"),           "SINGLE_ENCODE",
+          match(uri_path, "%00"),              "NULL_BYTE",
+          match(uri_path, "\.\./"),            "PLAINTEXT",
+          1==1,                                "OTHER"
+        )
+      | timechart span=1h count by encoding_type
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+response_playbook:
+  name: "Apache Path Traversal Incident Response"
+  steps:
+    - step: 1
+      action: "Triage and Confirm"
+      details: >
+        Run IQ-2 to determine if any traversal requests returned HTTP 200 with
+        a non-zero body size. This confirms successful file read exploitation.
+        Check the specific files targeted (passwd, shadow, .env, config files).
+
+    - step: 2
+      action: "Identify Apache Version"
+      details: >
+        Determine if the targeted server runs Apache 2.4.49 or 2.4.50 (vulnerable
+        to CVE-2021-41773 / CVE-2021-42013). Run: httpd -v or check Server header
+        in responses. If vulnerable, proceed to Step 5 immediately.
+
+    - step: 3
+      action: "Scope the Attack"
+      details: >
+        Run IQ-1 to retrieve the full request history from the attacker IP.
+        Look for: (a) reconnaissance phase before traversal, (b) POST requests
+        to cgi-bin (RCE), (c) requests to other servers from the same IP.
+
+    - step: 4
+      action: "Check for RCE Exploitation"
+      details: >
+        Run IQ-4 for POST-based cgi-bin traversal. If found, assume the server
+        is compromised. Check for: new processes spawned by httpd/apache2,
+        new files in /tmp or /var/tmp, outbound connections from the web server.
+
+    - step: 5
+      action: "Patch and Mitigate"
+      details: >
+        Upgrade Apache to >= 2.4.51 immediately. If immediate patching is not
+        possible, apply: (a) "Require all denied" on directory roots,
+        (b) disable mod_cgi if not required, (c) WAF rule blocking encoded
+        traversal sequences.
+
+    - step: 6
+      action: "Block Attacker"
+      details: >
+        Add attacker IP to firewall deny list and WAF blocklist. If multiple
+        source IPs are involved, check if they belong to the same ASN/cloud
+        provider and consider blocking the range.
+
+    - step: 7
+      action: "Post-Incident Review"
+      details: >
+        Document: which files were accessed, whether RCE was achieved, how long
+        the vulnerability was exposed, and whether any data was exfiltrated.
+        Update vulnerability management SLA for critical Apache CVEs.

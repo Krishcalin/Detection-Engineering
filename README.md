@@ -9,8 +9,8 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Splunk-SPL-dc2626?style=flat-square&logo=splunk&logoColor=white" alt="Splunk SPL"/>
   <img src="https://img.shields.io/badge/MITRE-ATT%26CK-f59e0b?style=flat-square" alt="MITRE ATT&CK"/>
-  <img src="https://img.shields.io/badge/rules-130%2B-22c55e?style=flat-square" alt="130+ Rules"/>
-  <img src="https://img.shields.io/badge/platforms-Windows%20AD%20%7C%20RHEL%20Linux-3b82f6?style=flat-square" alt="Windows AD | RHEL Linux"/>
+  <img src="https://img.shields.io/badge/rules-170%2B-22c55e?style=flat-square" alt="170+ Rules"/>
+  <img src="https://img.shields.io/badge/platforms-Windows%20AD%20%7C%20RHEL%20%7C%20Apache-3b82f6?style=flat-square" alt="Windows AD | RHEL | Apache"/>
   <img src="https://img.shields.io/badge/license-GPL--3.0-orange?style=flat-square" alt="GPL-3.0 License"/>
 </p>
 
@@ -20,7 +20,7 @@
 
 Security Operation Center (SOC) attack detection and response rules for Splunk SIEM. Each rule includes comprehensive SPL queries, MITRE ATT&CK mapping, false positive tuning guidance, investigation queries, and incident response playbooks.
 
-- **130+ detection rules** across Windows AD, RHEL Linux, and recent threat campaigns
+- **170+ detection rules** across Windows AD, RHEL Linux, Apache Web Server, and recent threat campaigns
 - **MITRE ATT&CK mapped** -- every rule tagged with technique IDs and tactics
 - **Investigation queries** -- ready-to-run SPL for SOC analyst triage
 - **Incident response playbooks** -- step-by-step response procedures per attack type
@@ -46,6 +46,13 @@ Detection-Engineering/
     │   ├── pass_the_hash_detection.yml
     │   ├── password_spraying_detection.yml
     │   └── privileged_group_membership_modification_detection.yml
+    ├── apache_webserver/
+    │   ├── apache_path_traversal_detection.yml
+    │   ├── apache_web_shell_detection.yml
+    │   ├── apache_sqli_xss_detection.yml
+    │   ├── apache_brute_force_dos_detection.yml
+    │   ├── apache_reconnaissance_detection.yml
+    │   └── apache_exploitation_detection.yml
     ├── recent_attacks/
     │   └── cve_2026_21509_apt28_operation_neusploit_detection.yml
     └── rhel_linux/
@@ -639,6 +646,147 @@ All RHEL rules rely on the following Splunk data sources:
 
 ---
 
+## Detection Rules -- Apache Web Server
+
+Detection rules for attacks targeting Apache HTTP Server across 6 attack categories. Covers the full web attack lifecycle from reconnaissance through exploitation, persistence, and denial of service. **37 detection rules + 24 investigation queries + 6 incident response playbooks.**
+
+### Rule Summary
+
+| Rule File | Attack Category | MITRE Techniques | Severity | Detection Vectors |
+|-----------|----------------|-----------------|----------|-------------------|
+| `apache_path_traversal_detection.yml` | Path Traversal, LFI, CVE-2021-41773/42013 | T1190, T1083, T1005 | HIGH--CRITICAL | 5 rules + 5 investigation queries |
+| `apache_web_shell_detection.yml` | Web Shell Upload, Execution, Beaconing | T1505.003, T1059.004, T1071.001 | HIGH--CRITICAL | 7 rules + 5 investigation queries |
+| `apache_sqli_xss_detection.yml` | SQL Injection, XSS, Scanner Detection | T1190, T1059.007 | HIGH--CRITICAL | 6 rules + 4 investigation queries |
+| `apache_brute_force_dos_detection.yml` | HTTP Brute Force, Credential Stuffing, DDoS | T1110, T1498, T1499 | MEDIUM--CRITICAL | 6 rules + 5 investigation queries |
+| `apache_reconnaissance_detection.yml` | Scanner Fingerprinting, Directory Enum, Probing | T1595.002, T1083, T1046 | MEDIUM--HIGH | 6 rules + 4 investigation queries |
+| `apache_exploitation_detection.yml` | Shellshock, Log4Shell, Struts, SSRF, SSTI | T1190, T1059.004, T1210 | HIGH--CRITICAL | 7 rules + 5 investigation queries |
+
+---
+
+### Apache Path Traversal Detection
+
+**File**: `splunk_rules/apache_webserver/apache_path_traversal_detection.yml`
+
+| Rule | Detection Method | CVE | Confidence |
+|------|-----------------|-----|------------|
+| Rule 1 | CVE-2021-41773 Apache 2.4.49 .%2e normalization bypass | CVE-2021-41773 | VERY HIGH |
+| Rule 2 | CVE-2021-42013 Apache 2.4.50 double-encoding bypass (%%32%65) | CVE-2021-42013 | VERY HIGH |
+| Rule 3 | Generic directory traversal (../, %2e%2e, overlong UTF-8, %c0%ae) | -- | HIGH |
+| Rule 4 | Null byte injection (%00) for extension bypass | -- | HIGH |
+| Rule 5 | Local File Inclusion via /proc/self/environ | -- | HIGH |
+
+---
+
+### Apache Web Shell Detection
+
+**File**: `splunk_rules/apache_webserver/apache_web_shell_detection.yml`
+
+| Rule | Detection Method | Shell Coverage | Confidence |
+|------|-----------------|---------------|------------|
+| Rule 1 | File upload via HTTP POST to writable web directory | All | HIGH |
+| Rule 2 | Script file created in web root by Apache process (Sysmon/auditd) | All | VERY HIGH |
+| Rule 3 | Suspicious URI parameters (cmd=, exec=, base64 payloads) | China Chopper, Godzilla, Behinder | HIGH |
+| Rule 4 | Apache process spawning OS commands (server-side) | All | VERY HIGH |
+| Rule 5 | Known web shell file hash matching (SHA256 lookup) | All | VERY HIGH |
+| Rule 6 | Periodic POST beaconing to single script file (C2 pattern) | Godzilla, Behinder, Weevely | MEDIUM-HIGH |
+| Rule 7 | Script access from unusual geographic source | All | MEDIUM |
+
+---
+
+### Apache SQL Injection & XSS Detection
+
+**File**: `splunk_rules/apache_webserver/apache_sqli_xss_detection.yml`
+
+| Rule | Detection Method | Attack Type | Confidence |
+|------|-----------------|-------------|------------|
+| Rule 1 | UNION SELECT, INTO OUTFILE, INFORMATION_SCHEMA | UNION-based SQLi | HIGH |
+| Rule 2 | SLEEP(), BENCHMARK(), WAITFOR, pg_sleep(), boolean-based | Blind/Time-based SQLi | HIGH |
+| Rule 3 | ' OR 1=1--, admin'--, tautology bypasses | Auth Bypass SQLi | HIGH |
+| Rule 4 | `<script>`, javascript:, onerror=, event handlers | Reflected XSS | HIGH |
+| Rule 5 | High-volume diverse payloads from single IP (sqlmap, XSSer) | Automated Scanner | HIGH |
+| Rule 6 | MySQL/PostgreSQL/Oracle/MSSQL error messages in error log | Error-based SQLi | VERY HIGH |
+
+---
+
+### Apache Brute Force & DoS Detection
+
+**File**: `splunk_rules/apache_webserver/apache_brute_force_dos_detection.yml`
+
+| Rule | Detection Method | Attack Type | Confidence |
+|------|-----------------|-------------|------------|
+| Rule 1 | HTTP 401 storm from single IP (20+ in 5 min) | Basic/Digest Auth Brute Force | HIGH |
+| Rule 2 | Rapid POST to login endpoints (15+ in 5 min) | Web Login Brute Force | HIGH |
+| Rule 3 | Many unique IPs, 1-3 attempts each (distributed) | Credential Stuffing | MEDIUM-HIGH |
+| Rule 4 | MaxRequestWorkers exhaustion, scoreboard full | Slowloris / Slow HTTP DoS | HIGH |
+| Rule 5 | 500+ requests/min from single IP | HTTP Flood DDoS | HIGH |
+| Rule 6 | 20+ unique 403 paths from single IP | Access Control Probing | MEDIUM-HIGH |
+
+---
+
+### Apache Reconnaissance Detection
+
+**File**: `splunk_rules/apache_webserver/apache_reconnaissance_detection.yml`
+
+| Rule | Detection Method | Tool Coverage | Confidence |
+|------|-----------------|--------------|------------|
+| Rule 1 | Known scanner User-Agent matching | Nikto, Nmap, Nuclei, WPScan, SQLMap, Burp, ZAP, Acunetix | HIGH |
+| Rule 2 | 50+ unique 404 paths in 5 min (forced browsing) | DirBuster, Gobuster, ffuf, feroxbuster | HIGH |
+| Rule 3 | Probing .git, .env, .htpasswd, phpinfo, backups, server-status | All | HIGH |
+| Rule 4 | OPTIONS, TRACE, DEBUG, PUT, DELETE method probing | All | MEDIUM-HIGH |
+| Rule 5 | Admin panel discovery (/admin, /phpmyadmin, /jenkins, /grafana) | All | HIGH |
+| Rule 6 | WordPress user, plugin, and REST API enumeration | WPScan, custom | HIGH |
+
+---
+
+### Apache Exploitation Detection
+
+**File**: `splunk_rules/apache_webserver/apache_exploitation_detection.yml`
+
+| Rule | Detection Method | CVE / Attack | Confidence |
+|------|-----------------|-------------|------------|
+| Rule 1 | Shellshock () { :; }; in HTTP headers targeting CGI | CVE-2014-6271 | VERY HIGH |
+| Rule 2 | Log4Shell ${jndi:ldap://} and obfuscated variants | CVE-2021-44228 | VERY HIGH |
+| Rule 3 | Apache Struts OGNL injection in Content-Type | CVE-2017-5638 | VERY HIGH |
+| Rule 4 | SSRF targeting cloud metadata, internal IPs, file:// | CVE-2021-40438, generic | HIGH |
+| Rule 5 | HTTP request smuggling (CL.TE / TE.CL desync) | Generic | HIGH |
+| Rule 6 | Server-Side Template Injection (Jinja2, Twig, Freemarker) | Generic SSTI | HIGH |
+| Rule 7 | OS command injection via pipe, semicolon, backtick | Generic | HIGH |
+
+---
+
+### Apache Data Sources
+
+All Apache detection rules rely on the following Splunk data sources:
+
+| Sourcetype | Description | Index |
+|------------|-------------|-------|
+| `access_combined` | Apache Combined Log Format access logs (primary) | `web` |
+| `access_common` | Apache Common Log Format access logs | `web` |
+| `apache:error` | Apache error log (mod_security, SQL errors, connection exhaustion) | `web` |
+| `sysmon_linux` | Sysmon for Linux — process creation, file creation, network connections | `linux` |
+| `linux:audit` | auditd EXECVE, SYSCALL, file watch events | `linux` |
+
+### Apache Prerequisites
+
+1. **Apache Access Logs** -- Forward access logs in Combined Log Format to Splunk (index=web, sourcetype=access_combined)
+2. **Apache Error Logs** -- Forward error logs to Splunk (index=web, sourcetype=apache:error)
+3. **Sysmon for Linux** -- Deploy on web servers for process creation (Event 1), file creation (Event 11), and image load (Event 7) telemetry
+4. **auditd** -- Configure file watches on web root directories: `-w /var/www -p wa -k web_write`
+5. **Lookup Tables**:
+   - `webshell_hashes.csv` -- known web shell SHA256 hashes from threat intel feeds
+   - Scanner/pentest IP allowlists for false positive suppression
+
+### Apache Quick Deploy
+
+1. Deploy **Exploitation** rules first (Shellshock, Log4Shell, Struts) -- zero false positives, immediate critical alerting
+2. Deploy **Path Traversal** rules (CVE-2021-41773/42013) -- near-zero FP, catches active exploitation
+3. Deploy **Web Shell** Rule 4 (Apache spawning OS commands) -- highest-confidence server-side indicator
+4. Deploy **SQLi/XSS** rules -- tune UNION/blind SQLi thresholds during a 7-day baseline
+5. Deploy **Brute Force** rules after baselining normal login failure rates
+6. Deploy **Reconnaissance** rules last -- informational, useful for threat profiling
+
+---
+
 ## Recent Attack Campaign Detection
 
 Detection rules for active threat campaigns and recently disclosed CVEs.
@@ -687,3 +835,10 @@ Detects APT28 (UAC-0001) exploitation of CVE-2026-21509 (Microsoft Office OLE Se
 - SSH/PAM logs forwarded from all RHEL hosts (sourcetype: `linux_secure`)
 - Syslog forwarded from all RHEL hosts (sourcetype: `syslog`)
 - Splunk Universal Forwarder on all RHEL hosts
+
+### Apache Web Server Detection Rules
+- Apache access logs in Combined Log Format (sourcetype: `access_combined`)
+- Apache error logs (sourcetype: `apache:error`)
+- Sysmon for Linux on web servers for process and file creation telemetry (sourcetype: `sysmon_linux`)
+- auditd with file watches on web root directories (sourcetype: `linux:audit`)
+- Splunk Universal Forwarder on all Apache web servers

@@ -1,0 +1,676 @@
+# ==============================================================================
+#  Apache SQL Injection & Cross-Site Scripting (XSS) Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for SQL Injection and XSS attacks
+#                observed in Apache HTTP Server access logs. Covers classic
+#                SQLi (UNION SELECT, SLEEP, BENCHMARK), blind SQLi (boolean
+#                and time-based), error-based SQLi, second-order SQLi staging,
+#                reflected XSS, stored XSS upload, DOM-based indicators,
+#                and polyglot payloads that combine SQLi + XSS.
+#
+#  MITRE ATT&CK: T1190     - Exploit Public-Facing Application
+#                 T1059.007 - Command and Scripting Interpreter: JavaScript
+#  Kill Chain   : Initial Access / Exploitation
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-06
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Apache access logs (Combined Log Format):
+#     index=web sourcetype=access_combined
+#
+#  2. Apache error logs (for SQL error messages):
+#     index=web sourcetype=apache:error
+#
+#  3. Web Application Firewall (WAF) logs if available:
+#     index=web sourcetype=modsecurity
+#
+#  NOTE: Access log-based SQLi/XSS detection sees only GET parameter injection.
+#  POST body injection is invisible in standard access logs. Deploy WAF or
+#  application-level logging for POST body visibility.
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: SQL Injection — UNION-Based Attack Patterns (T1190)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  UNION SELECT is the most common data exfiltration technique in SQLi. The
+#  attacker appends a UNION SELECT statement to extract data from other tables.
+#  Patterns: UNION SELECT, UNION ALL SELECT, ORDER BY (column enumeration),
+#  GROUP BY, HAVING, INTO OUTFILE/DUMPFILE (file write).
+#
+#  Confidence  : HIGH (88)
+#  Severity    : CRITICAL
+
+rule_1_sqli_union_based:
+  name: "SQL Injection — UNION-Based Data Exfiltration (T1190)"
+  description: >
+    Detects UNION-based SQL injection payloads in HTTP request URIs. UNION
+    SELECT allows attackers to append arbitrary queries and exfiltrate data
+    from database tables including credentials, PII, and application secrets.
+    Also detects ORDER BY / GROUP BY column enumeration (SQLi precursor),
+    INTO OUTFILE (writing web shells via SQL), and INFORMATION_SCHEMA
+    reconnaissance queries.
+  mitre:
+    tactic: "Initial Access"
+    technique: T1190
+    technique_name: "Exploit Public-Facing Application"
+    related_techniques:
+      - "T1005: Data from Local System (file read via LOAD_FILE)"
+      - "T1505.003: Web Shell (INTO OUTFILE writes shell to web root)"
+  severity: critical
+  confidence: 88
+  risk_score: 90
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    ``` UNION-based SQLi patterns (URL-decoded and encoded variants) ```
+    | where match(uri_path, "(?i)(union\s+(all\s+)?select|union%20(all%20)?select|union\+select)")
+        OR match(uri_path, "(?i)(order\s+by\s+\d+|order%20by%20\d+|group%20by)")
+        OR match(uri_path, "(?i)(into\s+(out|dump)file|into%20(out|dump)file)")
+        OR match(uri_path, "(?i)(information_schema|table_name|column_name|table_schema)")
+        OR match(uri_path, "(?i)(load_file|hex\(|unhex\(|concat\(|group_concat\()")
+    ``` Classify the injection type ```
+    | eval sqli_type=case(
+        match(uri_path, "(?i)union.*(all\s+)?select"),        "UNION_SELECT",
+        match(uri_path, "(?i)into.*(out|dump)file"),           "FILE_WRITE_VIA_SQL",
+        match(uri_path, "(?i)information_schema"),             "SCHEMA_ENUMERATION",
+        match(uri_path, "(?i)load_file"),                      "FILE_READ_VIA_SQL",
+        match(uri_path, "(?i)order\s*by\s*\d"),               "COLUMN_ENUMERATION",
+        match(uri_path, "(?i)(concat|group_concat)"),          "DATA_EXTRACTION",
+        1==1,                                                   "GENERIC_SQLI"
+      )
+    | eval is_file_operation=if(match(uri_path, "(?i)(outfile|dumpfile|load_file)"), "YES", "NO")
+    | eval mitre_technique="T1190"
+    | eval mitre_tactic="Initial Access"
+    | eval alert_name="SQL Injection — UNION-Based"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as attempt_count,
+        dc(uri_path) as unique_payloads,
+        values(sqli_type) as injection_types,
+        values(status) as http_statuses,
+        max(is_file_operation) as file_operation_attempted,
+        values(uri_path) as sample_payloads
+        by src_ip, http_method
+    | table first_seen, last_seen, src_ip, http_method, attempt_count,
+            unique_payloads, injection_types, http_statuses,
+            file_operation_attempted, sample_payloads,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "SQL Injection (UNION) — $src_ip$ ($attempt_count$ payloads, types: $injection_types$)"
+        severity: critical
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "Web applications that use 'union' or 'select' as URL parameter values — add specific URI paths to exclusion"
+    - "Search functionality that passes SQL-like keywords — review application query patterns"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: SQL Injection — Blind / Time-Based Injection (T1190)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Blind SQLi uses SLEEP(), BENCHMARK(), WAITFOR, pg_sleep(), or IF/CASE
+#  conditional statements to infer database content one bit at a time through
+#  timing differences. Extremely slow but stealthy data exfiltration.
+#
+#  Confidence  : HIGH (85)
+#  Severity    : HIGH
+
+rule_2_sqli_blind_time_based:
+  name: "SQL Injection — Blind Time-Based Injection (T1190)"
+  description: >
+    Detects blind SQL injection payloads that use time-delay functions to
+    extract data through response timing: MySQL SLEEP() and BENCHMARK(),
+    MSSQL WAITFOR DELAY, PostgreSQL pg_sleep(), Oracle DBMS_LOCK.SLEEP.
+    Also detects boolean-based blind SQLi indicators using IF(), CASE WHEN,
+    and conditional error triggers like extractvalue(), updatexml().
+  mitre:
+    tactic: "Initial Access"
+    technique: T1190
+    technique_name: "Exploit Public-Facing Application"
+  severity: high
+  confidence: 85
+  risk_score: 85
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    ``` Time-based blind SQLi patterns ```
+    | where match(uri_path, "(?i)(sleep\s*\(\d|sleep%28\d|benchmark\s*\(\d|benchmark%28)")
+        OR match(uri_path, "(?i)(waitfor\s+delay|waitfor%20delay|pg_sleep|dbms_lock\.sleep)")
+        ``` Boolean-based blind SQLi patterns ```
+        OR match(uri_path, "(?i)(and\s+\d+=\d+|or\s+\d+=\d+|and%20\d+=\d+|or%20\d+=\d+)")
+        OR match(uri_path, "(?i)(extractvalue|updatexml|exp\(~|geometrycollection)")
+        ``` Stacked queries ```
+        OR match(uri_path, "(?i)(;\s*(select|insert|update|delete|drop|exec|declare))")
+    | eval sqli_type=case(
+        match(uri_path, "(?i)sleep"),                      "TIME_BASED_MYSQL",
+        match(uri_path, "(?i)benchmark"),                  "TIME_BASED_BENCHMARK",
+        match(uri_path, "(?i)waitfor"),                    "TIME_BASED_MSSQL",
+        match(uri_path, "(?i)pg_sleep"),                   "TIME_BASED_POSTGRES",
+        match(uri_path, "(?i)(extractvalue|updatexml)"),   "ERROR_BASED",
+        match(uri_path, "(?i)(and|or)\s*\d+=\d+"),        "BOOLEAN_BASED",
+        match(uri_path, "(?i);.*(select|drop|exec)"),      "STACKED_QUERIES",
+        1==1,                                               "BLIND_SQLI"
+      )
+    | eval mitre_technique="T1190"
+    | eval alert_name="SQL Injection — Blind/Time-Based"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as attempt_count,
+        dc(uri_path) as unique_payloads,
+        values(sqli_type) as injection_types,
+        values(status) as http_statuses,
+        values(uri_path) as sample_payloads
+        by src_ip
+    | where attempt_count >= 3
+    | table first_seen, last_seen, src_ip, attempt_count, unique_payloads,
+            injection_types, http_statuses, sample_payloads,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Blind SQL Injection — $src_ip$ ($injection_types$, $attempt_count$ attempts)"
+        severity: high
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 85
+
+  known_false_positives:
+    - "Application testing tools (sqlmap) during authorized pen testing — add tester IPs to allowlist"
+    - "Extremely rare in legitimate traffic — 'sleep(' in a URL is almost always an attack"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: SQL Injection — Authentication Bypass Patterns (T1190)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Classic SQLi authentication bypass: ' OR 1=1--, ' OR ''=', admin'--.
+#  These target login forms via GET parameters. Simpler than UNION but still
+#  extremely effective against vulnerable applications.
+#
+#  Confidence  : HIGH (86)
+#  Severity    : CRITICAL
+
+rule_3_sqli_auth_bypass:
+  name: "SQL Injection — Authentication Bypass Attempt (T1190)"
+  description: >
+    Detects SQL injection payloads designed to bypass login authentication:
+    ' OR 1=1--, ' OR 'a'='a, admin'--, " OR ""=", and similar tautology-based
+    bypasses. These payloads target login forms, search boxes, and any input
+    that constructs SQL WHERE clauses. A successful bypass grants unauthorized
+    access without valid credentials.
+  mitre:
+    tactic: "Initial Access"
+    technique: T1190
+    technique_name: "Exploit Public-Facing Application"
+    related_techniques:
+      - "T1078: Valid Accounts (if bypass grants legitimate session)"
+  severity: critical
+  confidence: 86
+  risk_score: 88
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    ``` Authentication bypass SQLi patterns ```
+    | where match(uri_path, "(?i)('|%27)\s*(or|OR|%6f%72)\s*('|%27|1|true)")
+        OR match(uri_path, "(?i)('|%27)\s*(or|OR)\s*\d+=\d+\s*(--%20|#|%23))")
+        OR match(uri_path, "(?i)(admin|root|administrator)\s*('|%27)\s*(--%20|#|%23)")
+        OR match(uri_path, "(?i)('|%27)\s*;?\s*(drop|alter|truncate|delete)\s+(table|database)")
+        OR match(uri_path, "(?i)(\"|%22)\s*(or|OR)\s*(\"|%22)\s*=\s*(\"|%22)")
+        ``` Comment-based termination patterns ```
+        OR match(uri_path, "(?i)(--%20|%23|/\*)")
+    ``` Target login-related endpoints ```
+    | eval targets_login=if(match(uri_path, "(?i)(login|auth|signin|session|account|user|admin|wp-login)"), "YES", "NO")
+    | eval sqli_type=case(
+        match(uri_path, "(?i)or.*1=1"),            "TAUTOLOGY_1_EQ_1",
+        match(uri_path, "(?i)or.*'.*'='"),         "TAUTOLOGY_STRING_EQ",
+        match(uri_path, "(?i)admin.*'.*--"),        "ADMIN_COMMENT_BYPASS",
+        match(uri_path, "(?i)(drop|alter|truncate)"),"DESTRUCTIVE_PAYLOAD",
+        1==1,                                       "AUTH_BYPASS_GENERIC"
+      )
+    | eval mitre_technique="T1190"
+    | eval alert_name="SQL Injection — Authentication Bypass"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as attempt_count,
+        dc(uri_path) as unique_payloads,
+        values(sqli_type) as bypass_types,
+        values(status) as http_statuses,
+        max(targets_login) as targets_login_page,
+        values(uri_path) as sample_payloads
+        by src_ip
+    | table first_seen, last_seen, src_ip, attempt_count, unique_payloads,
+            bypass_types, http_statuses, targets_login_page, sample_payloads,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "SQLi Auth Bypass — $src_ip$ targeting login ($bypass_types$)"
+        severity: critical
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 88
+
+  known_false_positives:
+    - "URLs that legitimately contain apostrophes or special characters in product names — add specific paths to exclusion"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Cross-Site Scripting — Reflected XSS in URI (T1059.007)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Reflected XSS payloads injected into URI parameters are echoed back in
+#  the server response. Detects <script>, javascript:, onerror=, onload=,
+#  event handler injection, and various encoding bypass attempts.
+#
+#  Confidence  : HIGH (84)
+#  Severity    : HIGH
+
+rule_4_reflected_xss:
+  name: "XSS — Reflected Cross-Site Scripting in URI Parameters (T1059.007)"
+  description: >
+    Detects reflected XSS payloads in HTTP request URIs: <script> tags,
+    javascript: protocol handlers, HTML event handlers (onerror, onload,
+    onmouseover, onfocus), <img src=x onerror=>, <svg/onload=>, data: URIs,
+    and encoded variants (%3Cscript, &#x3C;script). Reflected XSS allows
+    attackers to execute JavaScript in victim browsers for session hijacking,
+    credential theft, and defacement.
+  mitre:
+    tactic: "Initial Access"
+    technique: T1059.007
+    technique_name: "Command and Scripting Interpreter: JavaScript"
+    related_techniques:
+      - "T1557: Adversary-in-the-Middle (session hijacking via XSS)"
+  severity: high
+  confidence: 84
+  risk_score: 78
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    ``` XSS payload patterns in URI ```
+    | where match(uri_path, "(?i)(<script|%3cscript|%3c%73%63%72%69%70%74|&#x3c;script)")
+        OR match(uri_path, "(?i)(javascript:|vbscript:|data:text/html)")
+        OR match(uri_path, "(?i)(on(error|load|mouseover|focus|click|mouseout|submit|change|input)\s*=)")
+        OR match(uri_path, "(?i)(<img[^>]+onerror|<svg[^>]+onload|<body[^>]+onload)")
+        OR match(uri_path, "(?i)(<iframe|<embed|<object|<applet|<form[^>]+action)")
+        OR match(uri_path, "(?i)(document\.(cookie|domain|write|location)|window\.location)")
+        OR match(uri_path, "(?i)(alert\s*\(|confirm\s*\(|prompt\s*\(|eval\s*\()")
+        OR match(uri_path, "(?i)(String\.fromCharCode|atob\(|btoa\()")
+    ``` Classify the XSS vector ```
+    | eval xss_type=case(
+        match(uri_path, "(?i)<script"),                  "SCRIPT_TAG",
+        match(uri_path, "(?i)javascript:"),              "JAVASCRIPT_PROTO",
+        match(uri_path, "(?i)on(error|load|mouse)"),     "EVENT_HANDLER",
+        match(uri_path, "(?i)<(iframe|embed|object)"),   "HTML_INJECTION",
+        match(uri_path, "(?i)document\.(cookie|write)"), "DOM_ACCESS",
+        match(uri_path, "(?i)(alert|confirm|prompt)"),   "DIALOG_POC",
+        match(uri_path, "(?i)data:text/html"),           "DATA_URI",
+        1==1,                                             "XSS_GENERIC"
+      )
+    | eval steals_cookies=if(match(uri_path, "(?i)document\.cookie"), "YES", "NO")
+    | eval mitre_technique="T1059.007"
+    | eval mitre_tactic="Initial Access"
+    | eval alert_name="Reflected XSS Attack"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as attempt_count,
+        dc(uri_path) as unique_payloads,
+        values(xss_type) as xss_vectors,
+        values(status) as http_statuses,
+        max(steals_cookies) as cookie_theft_attempted,
+        values(uri_path) as sample_payloads
+        by src_ip
+    | where attempt_count >= 2
+    | table first_seen, last_seen, src_ip, attempt_count, unique_payloads,
+            xss_vectors, http_statuses, cookie_theft_attempted,
+            sample_payloads, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Reflected XSS — $src_ip$ ($xss_vectors$, cookie theft: $cookie_theft_attempted$)"
+        severity: high
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 78
+
+  known_false_positives:
+    - "Security scanning tools (Burp Suite, OWASP ZAP) during pen testing — add tester IPs to allowlist"
+    - "Forum or CMS search queries containing HTML tags — add /search or /wp-admin paths to exclusion"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: SQLi/XSS Volume Anomaly — Automated Scanner Detection (T1190)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects automated SQLi/XSS scanning tools (sqlmap, XSSer, Havij, jSQL)
+#  by identifying high-volume injection attempts from a single source IP
+#  with diverse payload patterns.
+#
+#  Confidence  : HIGH (90)
+#  Severity    : HIGH
+
+rule_5_sqli_xss_scanner_volume:
+  name: "SQLi/XSS — Automated Scanner Volume Anomaly (T1190)"
+  description: >
+    Detects automated SQL injection and XSS scanning tools by correlating
+    high request volume with diverse injection payloads from a single source
+    IP. Tools like sqlmap generate hundreds of payloads per minute with
+    systematic variation. A single IP sending 50+ requests containing SQL/XSS
+    keywords within 10 minutes is nearly always an automated attack tool.
+  mitre:
+    tactic: "Initial Access"
+    technique: T1190
+    technique_name: "Exploit Public-Facing Application"
+    related_techniques:
+      - "T1595.002: Active Scanning: Vulnerability Scanning"
+  severity: high
+  confidence: 90
+  risk_score: 82
+  kill_chain_phase: "Reconnaissance / Exploitation"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    | rex field=_raw "\"(?<user_agent>[^\"]+)\"\s*$"
+    ``` Any SQLi or XSS keyword in URI ```
+    | where match(uri_path, "(?i)(union|select|insert|update|delete|drop|alter|exec|benchmark|sleep|waitfor|extractvalue)")
+        OR match(uri_path, "(?i)('|%27|%22|--|%23|/\*)")
+        OR match(uri_path, "(?i)(<script|%3cscript|javascript:|onerror=|onload=|<img|<svg|alert\()")
+    | bin _time span=10m
+    | stats
+        count as injection_attempts,
+        dc(uri_path) as unique_payloads,
+        dc(status) as unique_statuses,
+        values(user_agent) as user_agents,
+        values(status) as statuses
+        by src_ip, _time
+    ``` High volume = automated scanner ```
+    | where injection_attempts >= 50 AND unique_payloads >= 10
+    | eval scanner_indicators=case(
+        match(mvjoin(user_agents, " "), "(?i)(sqlmap|havij|jsql|xsser|nikto|acunetix|nessus|burp|owasp.zap)"), "KNOWN_TOOL_UA",
+        unique_payloads >= 50,     "VERY_HIGH_DIVERSITY",
+        unique_payloads >= 20,     "HIGH_DIVERSITY",
+        1==1,                      "MODERATE_DIVERSITY"
+      )
+    | eval mitre_technique="T1190"
+    | eval alert_name="Automated SQLi/XSS Scanner Detected"
+    | table _time, src_ip, injection_attempts, unique_payloads,
+            scanner_indicators, user_agents, statuses,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "2h"
+  actions:
+    - notable_event:
+        rule_title: "SQLi/XSS Scanner — $src_ip$ ($injection_attempts$ attempts, $unique_payloads$ unique payloads)"
+        severity: high
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 82
+
+  known_false_positives:
+    - "Authorized vulnerability scanners (Nessus, Qualys, Rapid7) — add scanner IPs to allowlist"
+    - "Authorized penetration testers — add engagement IPs to time-scoped allowlist"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: SQL Injection — Database Error Messages in Apache Error Log (T1190)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  When SQLi payloads trigger database errors, Apache's error log captures
+#  the stack trace. Detecting SQL error messages confirms the application
+#  is vulnerable AND being actively exploited.
+#
+#  Confidence  : VERY HIGH (92)
+#  Severity    : CRITICAL
+
+rule_6_sqli_error_messages:
+  name: "SQL Injection — Database Error Messages in Apache Error Log (T1190)"
+  description: >
+    Detects SQL database error messages in Apache error logs indicating that
+    injected SQL payloads are reaching the database engine. Error messages
+    from MySQL, PostgreSQL, MSSQL, Oracle, and SQLite confirm the application
+    is vulnerable to SQL injection. This is a high-confidence indicator
+    because database errors only appear when malformed SQL reaches the DBMS.
+  mitre:
+    tactic: "Initial Access"
+    technique: T1190
+    technique_name: "Exploit Public-Facing Application"
+  severity: critical
+  confidence: 92
+  risk_score: 90
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Apache Error Log (sourcetype=apache:error)"
+
+  search: |
+    index=web sourcetype=apache:error
+    ``` Database-specific SQL error patterns ```
+    | where match(_raw, "(?i)(you have an error in your sql syntax|mysql_fetch|mysql_query|mysqli_)")
+        OR match(_raw, "(?i)(pg_query|pg_exec|PG::SyntaxError|ERROR:\s+syntax error at)")
+        OR match(_raw, "(?i)(ORA-\d{4,5}|oracle.*error|TNS:)")
+        OR match(_raw, "(?i)(Microsoft.*ODBC|SQL Server.*Error|Unclosed quotation mark|mssql_query)")
+        OR match(_raw, "(?i)(sqlite3\.OperationalError|SQLite.*error|SQLITE_ERROR)")
+        OR match(_raw, "(?i)(SQLSTATE\[|PDOException|java\.sql\.SQLException)")
+    | rex "client\s+(?<src_ip>\d+\.\d+\.\d+\.\d+)"
+    | eval db_type=case(
+        match(_raw, "(?i)(mysql|mysqli)"),     "MySQL",
+        match(_raw, "(?i)(pg_|postgres)"),     "PostgreSQL",
+        match(_raw, "(?i)(ORA-|oracle|TNS)"),  "Oracle",
+        match(_raw, "(?i)(ODBC|SQL Server)"),  "MSSQL",
+        match(_raw, "(?i)sqlite"),             "SQLite",
+        match(_raw, "(?i)PDOException"),       "PDO_Generic",
+        1==1,                                   "Unknown_DBMS"
+      )
+    | eval mitre_technique="T1190"
+    | eval alert_name="SQL Error — Database Errors Triggered by Injection"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as error_count,
+        values(db_type) as database_types,
+        values(src_ip) as source_ips
+        by host
+    | where error_count >= 3
+    | table first_seen, last_seen, host, error_count, database_types,
+            source_ips, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "host"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "SQL Errors on $host$ — $db_type$ triggered $error_count$ times from $source_ips$"
+        severity: critical
+    - risk:
+        risk_object: "host"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "Application bugs causing SQL syntax errors during normal operation — baseline error rates before enabling"
+    - "Database migration scripts that temporarily cause errors — correlate with maintenance windows"
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  - name: "IQ-1: All requests with SQL keywords from attacker IP"
+    description: "Full injection attempt history from suspected attacker"
+    search: |
+      index=web sourcetype=access_combined src_ip="$ATTACKER_IP$" earliest=-24h latest=now
+        (uri_path="*select*" OR uri_path="*union*" OR uri_path="*insert*"
+         OR uri_path="*update*" OR uri_path="*delete*" OR uri_path="*drop*"
+         OR uri_path="*sleep*" OR uri_path="*benchmark*" OR uri_path="*'*"
+         OR uri_path="*%27*" OR uri_path="*script*" OR uri_path="*alert*"
+         OR uri_path="*onerror*" OR uri_path="*onload*")
+      | rex field=_raw "\"(?<http_method>\S+)\s+(?<uri_path>\S+).*\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+      | table _time, http_method, uri_path, status, bytes
+      | sort _time
+
+  - name: "IQ-2: Successful SQLi exploitation (HTTP 200 + large response)"
+    description: "Identify injection attempts that returned data"
+    search: |
+      index=web sourcetype=access_combined status=200 earliest=-24h latest=now
+        (uri_path="*union*select*" OR uri_path="*information_schema*"
+         OR uri_path="*concat*" OR uri_path="*group_concat*")
+      | rex field=_raw "^(?<src_ip>\S+).*\"(?<http_method>\S+)\s+(?<uri_path>\S+).*\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+      | eval bytes_num=tonumber(bytes)
+      | where bytes_num > 500
+      | table _time, src_ip, http_method, uri_path, status, bytes_num
+      | sort -bytes_num
+
+  - name: "IQ-3: XSS payloads that returned HTTP 200 (reflected successfully)"
+    description: "Find XSS payloads echoed back by the application"
+    search: |
+      index=web sourcetype=access_combined status=200 earliest=-24h latest=now
+        (uri_path="*<script*" OR uri_path="*%3cscript*" OR uri_path="*javascript:*"
+         OR uri_path="*onerror=*" OR uri_path="*alert(*")
+      | rex field=_raw "^(?<src_ip>\S+).*\"(?<http_method>\S+)\s+(?<uri_path>\S+).*\"\s+(?<status>\d+)"
+      | table _time, src_ip, http_method, uri_path, status
+      | sort _time
+
+  - name: "IQ-4: Top targeted endpoints for injection attacks"
+    description: "Identify which application endpoints receive the most injection attempts"
+    search: |
+      index=web sourcetype=access_combined earliest=-7d latest=now
+        (uri_path="*select*" OR uri_path="*union*" OR uri_path="*'*"
+         OR uri_path="*%27*" OR uri_path="*<script*" OR uri_path="*onerror*")
+      | rex field=_raw "\"(?<http_method>\S+)\s+(?<uri_path>\S+)"
+      | rex field=uri_path "^(?<base_endpoint>[^?]+)"
+      | stats count as attacks, dc(src_ip) as unique_attackers by base_endpoint
+      | sort -attacks
+      | head 20
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+response_playbook:
+  name: "Apache SQL Injection & XSS Incident Response"
+  steps:
+    - step: 1
+      action: "Determine Exploitation Success"
+      details: >
+        Run IQ-2 (SQLi) and IQ-3 (XSS) to identify requests that returned
+        HTTP 200 with substantial response bodies. Compare response sizes with
+        normal responses to the same endpoint — unusually large responses from
+        UNION SELECT queries indicate data exfiltration.
+
+    - step: 2
+      action: "Identify Vulnerable Endpoints"
+      details: >
+        Run IQ-4 to find the most-targeted endpoints. Cross-reference with
+        Rule 6 (SQL error messages) to confirm which endpoints are actually
+        vulnerable vs. those that are targeted but properly protected.
+
+    - step: 3
+      action: "Assess Data Impact"
+      details: >
+        If UNION SELECT or INFORMATION_SCHEMA access succeeded, determine what
+        database tables and columns were queried. Check for access to: user
+        credentials, PII, payment card data, API keys, session tokens.
+
+    - step: 4
+      action: "Check for Lateral Exploitation"
+      details: >
+        If INTO OUTFILE or LOAD_FILE was detected, check for web shells written
+        to the web root. If XSS payloads with document.cookie succeeded, check
+        for hijacked sessions. Look for new admin accounts created.
+
+    - step: 5
+      action: "Deploy Immediate Mitigations"
+      details: >
+        Deploy WAF rules (mod_security OWASP CRS) to block SQLi and XSS
+        patterns. Apply parameterized queries / prepared statements to the
+        vulnerable endpoints. Implement output encoding for XSS prevention.
+        Block attacker IPs at the network edge.
+
+    - step: 6
+      action: "Post-Incident Hardening"
+      details: >
+        Conduct a full code review of the vulnerable application endpoints.
+        Implement Content Security Policy (CSP) headers to mitigate XSS.
+        Enable database query logging to detect future injection attempts
+        at the database layer. Deploy RASP or application-level WAF.

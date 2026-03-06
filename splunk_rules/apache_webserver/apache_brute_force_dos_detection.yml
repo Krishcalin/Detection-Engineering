@@ -1,0 +1,637 @@
+# ==============================================================================
+#  Apache HTTP Brute Force & Denial of Service Detection
+#  Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for brute force authentication attacks
+#                and denial-of-service patterns targeting Apache HTTP Server.
+#                Covers HTTP Basic/Digest auth brute force, web application
+#                login form brute force, credential stuffing, Slowloris slow
+#                HTTP attacks, HTTP flood DDoS, and resource exhaustion via
+#                large payloads or regex-based ReDoS.
+#
+#  MITRE ATT&CK: T1110.001 - Brute Force: Password Guessing
+#                 T1110.003 - Brute Force: Password Spraying
+#                 T1110.004 - Brute Force: Credential Stuffing
+#                 T1498.001 - Network Denial of Service: Direct Network Flood
+#                 T1499.002 - Endpoint Denial of Service: Service Exhaustion
+#  Kill Chain   : Initial Access / Impact
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-06
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Apache access logs (Combined Log Format):
+#     index=web sourcetype=access_combined
+#
+#  2. Apache error logs:
+#     index=web sourcetype=apache:error
+#
+#  3. Apache server-status or mod_status metrics (optional):
+#     index=web sourcetype=apache:status
+#
+#  4. For Slowloris detection, Apache connection-level logging or
+#     network flow data (index=network sourcetype=netflow) is recommended.
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: HTTP Basic/Digest Auth Brute Force — 401 Storm (T1110.001)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects brute force attacks against Apache HTTP Basic/Digest authentication
+#  by correlating excessive HTTP 401 responses from a single source IP.
+#  Threshold: >=20 401 responses in 5 minutes from one IP.
+#
+#  Confidence  : HIGH (88)
+#  Severity    : HIGH
+
+rule_1_http_auth_brute_force:
+  name: "Brute Force — HTTP Basic/Digest Auth 401 Storm (T1110.001)"
+  description: >
+    Detects brute force attacks against Apache HTTP Basic or Digest
+    authentication by counting excessive HTTP 401 (Unauthorized) responses
+    from a single source IP. Apache returns 401 when credentials are invalid.
+    20+ failed attempts in 5 minutes from one IP indicates automated password
+    guessing. Correlates follow-up HTTP 200 to detect successful compromise.
+  mitre:
+    tactic: "Credential Access"
+    technique: T1110.001
+    technique_name: "Brute Force: Password Guessing"
+  severity: high
+  confidence: 88
+  risk_score: 82
+  kill_chain_phase: "Initial Access"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+(?<auth_user>\S+)\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    | rex field=_raw "\"(?<user_agent>[^\"]+)\"\s*$"
+    ``` Focus on authentication endpoints and 401/200 responses ```
+    | where status IN ("401", "200", "403")
+    | bin _time span=5m
+    | stats
+        count(eval(status="401")) as failed_401,
+        count(eval(status="200")) as success_200,
+        count(eval(status="403")) as forbidden_403,
+        dc(auth_user) as unique_users_tried,
+        dc(uri_path) as unique_endpoints,
+        values(auth_user) as users_attempted,
+        values(uri_path) as targeted_paths,
+        values(user_agent) as user_agents,
+        earliest(_time) as first_attempt,
+        latest(_time) as last_attempt
+        by src_ip, _time
+    ``` Brute force threshold: 20+ failures in 5 minutes ```
+    | where failed_401 >= 20
+    ``` Check if any succeeded after failures ```
+    | eval compromise_likely=if(success_200 > 0 AND failed_401 > 10, "YES", "NO")
+    | eval attack_type=case(
+        unique_users_tried > 5 AND unique_users_tried >= (failed_401 * 0.5),  "PASSWORD_SPRAYING",
+        unique_users_tried <= 3,                                                "SINGLE_ACCOUNT_BRUTE_FORCE",
+        1==1,                                                                   "CREDENTIAL_STUFFING"
+      )
+    | eval mitre_technique=case(
+        attack_type=="PASSWORD_SPRAYING",  "T1110.003",
+        attack_type=="CREDENTIAL_STUFFING","T1110.004",
+        1==1,                              "T1110.001"
+      )
+    | eval alert_name="HTTP Auth Brute Force — ".attack_type
+    | table first_attempt, last_attempt, src_ip, failed_401, success_200,
+            forbidden_403, unique_users_tried, attack_type, compromise_likely,
+            users_attempted, targeted_paths, user_agents,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "HTTP Brute Force — $src_ip$ ($attack_type$, $failed_401$ failures, compromised: $compromise_likely$)"
+        severity: high
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 82
+
+  known_false_positives:
+    - "Misconfigured applications sending repeated auth requests — check user-agent for application names"
+    - "Monitoring tools with expired/wrong credentials — add known monitoring IPs to allowlist"
+    - "Users with expired browser cached credentials — typically single user, low volume"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Web Application Login Brute Force — POST Storm (T1110.001)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects brute force against web application login forms by counting rapid
+#  POST requests to login endpoints followed by redirects (302) or error
+#  responses. Web apps typically return 302 redirect on failed login.
+#
+#  Confidence  : HIGH (85)
+#  Severity    : HIGH
+
+rule_2_web_login_brute_force:
+  name: "Brute Force — Web Application Login POST Storm (T1110.001)"
+  description: >
+    Detects brute force attacks against web application login forms by
+    counting rapid HTTP POST requests to known login endpoints (/login,
+    /signin, /auth, /wp-login.php, /admin, /user/login, /api/auth). Web
+    applications typically respond with HTTP 302 (redirect to login page)
+    or 200 with error message on failed login. 15+ rapid POSTs to a login
+    endpoint from one IP indicates automated credential guessing.
+  mitre:
+    tactic: "Credential Access"
+    technique: T1110.001
+    technique_name: "Brute Force: Password Guessing"
+  severity: high
+  confidence: 85
+  risk_score: 80
+  kill_chain_phase: "Initial Access"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    | rex field=_raw "\"(?<user_agent>[^\"]+)\"\s*$"
+    ``` POST to login-related endpoints ```
+    | where http_method="POST"
+        AND match(uri_path, "(?i)(login|signin|sign-in|auth|authenticate|session|wp-login|admin.*login|user.*login|api.*auth|oauth.*token|j_security_check)")
+    | bin _time span=5m
+    | stats
+        count as post_count,
+        count(eval(status="302" OR status="301")) as redirect_count,
+        count(eval(status="200")) as ok_200_count,
+        count(eval(status="401" OR status="403")) as denied_count,
+        dc(status) as unique_statuses,
+        values(uri_path) as login_endpoints,
+        values(user_agent) as user_agents,
+        earliest(_time) as first_post,
+        latest(_time) as last_post
+        by src_ip, _time
+    ``` Brute force: 15+ POSTs in 5 minutes ```
+    | where post_count >= 15
+    ``` Mostly failures (redirects or denials) ```
+    | eval failure_rate=round(((redirect_count + denied_count) / post_count) * 100, 1)
+    | eval possible_success=if(ok_200_count > 0 AND (redirect_count + denied_count) > 10, "YES", "NO")
+    | eval mitre_technique="T1110.001"
+    | eval alert_name="Web Login Brute Force"
+    | table first_post, last_post, src_ip, post_count, redirect_count,
+            denied_count, ok_200_count, failure_rate, possible_success,
+            login_endpoints, user_agents, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Login Brute Force — $src_ip$ ($post_count$ POSTs, $failure_rate$% failures)"
+        severity: high
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "Load testing tools (JMeter, k6) hitting login endpoints — correlate with test schedule"
+    - "Single sign-on (SSO) redirect loops causing rapid POSTs — check for consistent user-agent and low dc(src_ip)"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Credential Stuffing — Distributed Low-Rate Attack (T1110.004)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Credential stuffing uses stolen username/password pairs from database
+#  breaches. Unlike brute force, each IP tries only 1-3 credentials. Detected
+#  by correlating many unique source IPs hitting the same login endpoint with
+#  similar timing patterns.
+#
+#  Confidence  : MEDIUM-HIGH (78)
+#  Severity    : HIGH
+
+rule_3_credential_stuffing:
+  name: "Brute Force — Distributed Credential Stuffing (T1110.004)"
+  description: >
+    Detects distributed credential stuffing attacks where many unique source
+    IPs each attempt 1-3 login requests in a short period. Attackers use
+    botnets or proxy rotation to distribute attempts below per-IP rate limits.
+    Detected by counting unique IPs hitting login endpoints in a 15-minute
+    window where individual IP attempt counts are low but aggregate volume
+    is anomalously high.
+  mitre:
+    tactic: "Credential Access"
+    technique: T1110.004
+    technique_name: "Brute Force: Credential Stuffing"
+  severity: high
+  confidence: 78
+  risk_score: 80
+  kill_chain_phase: "Initial Access"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    ``` POST to login endpoints ```
+    | where http_method="POST"
+        AND match(uri_path, "(?i)(login|signin|auth|wp-login|session|api.*auth)")
+    | bin _time span=15m
+    ``` Per-endpoint aggregation ```
+    | rex field=uri_path "^(?<login_endpoint>[^?]+)"
+    | stats
+        count as total_attempts,
+        dc(src_ip) as unique_source_ips,
+        count(eval(status="302" OR status="401" OR status="403")) as failures,
+        count(eval(status="200")) as successes,
+        avg(eval(1)) as avg_per_ip
+        by login_endpoint, _time
+    ``` Credential stuffing pattern: many IPs, few attempts each ```
+    | eval avg_attempts_per_ip=round(total_attempts / unique_source_ips, 1)
+    | where unique_source_ips >= 20
+        AND avg_attempts_per_ip <= 5
+        AND total_attempts >= 50
+    | eval success_rate=round((successes / total_attempts) * 100, 1)
+    | eval mitre_technique="T1110.004"
+    | eval alert_name="Credential Stuffing — Distributed Attack"
+    | table _time, login_endpoint, total_attempts, unique_source_ips,
+            avg_attempts_per_ip, failures, successes, success_rate,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/15 * * * *"
+    earliest: "-20m"
+    latest: "now"
+  throttle:
+    field: "login_endpoint"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Credential Stuffing — $login_endpoint$ ($unique_source_ips$ IPs, $total_attempts$ attempts)"
+        severity: high
+    - risk:
+        risk_object: "login_endpoint"
+        risk_object_type: "other"
+        risk_score: 80
+
+  known_false_positives:
+    - "Legitimate high-traffic login pages during peak hours — baseline normal unique IP counts per 15-min window"
+    - "API endpoints accessed by mobile apps from many unique cellular IPs — adjust threshold based on normal traffic patterns"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Slowloris / Slow HTTP DoS Attack (T1499.002)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Slowloris holds Apache connections open by sending partial HTTP requests
+#  very slowly, exhausting the MaxRequestWorkers limit. Detected via Apache
+#  error logs ("server reached MaxRequestWorkers") and access logs showing
+#  abnormally long request durations from single sources.
+#
+#  Confidence  : HIGH (86)
+#  Severity    : CRITICAL
+
+rule_4_slowloris_dos:
+  name: "DoS — Slowloris / Slow HTTP Attack (T1499.002)"
+  description: >
+    Detects Slowloris-style slow HTTP denial-of-service attacks that exhaust
+    Apache's connection pool by holding connections open with incomplete
+    requests. Indicators: (1) Apache error log "server reached MaxRequestWorkers
+    setting" or "scoreboard is full", (2) many concurrent connections from a
+    single IP with abnormally long durations, (3) high ratio of incomplete
+    requests. Slowloris can take down an Apache server with a single machine.
+  mitre:
+    tactic: "Impact"
+    technique: T1499.002
+    technique_name: "Endpoint Denial of Service: Service Exhaustion Flood"
+  severity: critical
+  confidence: 86
+  risk_score: 88
+  kill_chain_phase: "Actions on Objectives"
+  data_sources:
+    - "Apache Error Log (sourcetype=apache:error)"
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    ``` Phase 1: Check Apache error logs for connection exhaustion ```
+    index=web sourcetype=apache:error
+    | where match(_raw, "(?i)(MaxRequestWorkers|MaxClients|scoreboard is full|server reached|no idle workers)")
+        OR match(_raw, "(?i)(server is busy|too many open connections)")
+    | eval error_type=case(
+        match(_raw, "(?i)MaxRequestWorkers"),     "CONNECTION_POOL_EXHAUSTED",
+        match(_raw, "(?i)scoreboard is full"),     "SCOREBOARD_FULL",
+        match(_raw, "(?i)no idle workers"),        "NO_IDLE_WORKERS",
+        1==1,                                       "SERVER_OVERLOAD"
+      )
+    | eval mitre_technique="T1499.002"
+    | eval alert_name="Slowloris / Slow HTTP DoS — Connection Exhaustion"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as error_count,
+        values(error_type) as error_types
+        by host
+    | where error_count >= 3
+    | table first_seen, last_seen, host, error_count, error_types,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Slow HTTP DoS — $host$ connection pool exhausted ($error_count$ errors)"
+        severity: critical
+    - risk:
+        risk_object: "host"
+        risk_object_type: "system"
+        risk_score: 88
+
+  known_false_positives:
+    - "Legitimate traffic spikes during peak hours — correlate with traffic volume and response time metrics"
+    - "Misconfigured MaxRequestWorkers set too low — check Apache configuration"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: HTTP Flood DDoS — Request Volume Anomaly (T1498.001)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects volumetric HTTP flood attacks by identifying source IPs sending
+#  an abnormally high number of requests per minute. Threshold: >=500 requests
+#  in 1 minute from a single IP, or >=200 requests per minute to a single
+#  URI path from one IP.
+#
+#  Confidence  : HIGH (84)
+#  Severity    : HIGH
+
+rule_5_http_flood:
+  name: "DoS — HTTP Flood Volume Anomaly (T1498.001)"
+  description: >
+    Detects HTTP flood denial-of-service attacks by identifying source IPs
+    sending abnormally high request volumes: 500+ requests per minute (total)
+    or 200+ requests per minute to a single endpoint. HTTP floods consume
+    server resources (CPU, memory, backend database connections) even when
+    each individual request is valid. Common tools: LOIC, HOIC, GoldenEye,
+    Slowhttptest, hping3 with HTTP mode.
+  mitre:
+    tactic: "Impact"
+    technique: T1498.001
+    technique_name: "Network Denial of Service: Direct Network Flood"
+  severity: high
+  confidence: 84
+  risk_score: 80
+  kill_chain_phase: "Actions on Objectives"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    | rex field=_raw "\"(?<user_agent>[^\"]+)\"\s*$"
+    | bin _time span=1m
+    | stats
+        count as requests_per_minute,
+        dc(uri_path) as unique_uris,
+        dc(http_method) as unique_methods,
+        count(eval(status>="500")) as server_errors,
+        values(user_agent) as user_agents
+        by src_ip, _time
+    ``` Volume threshold: 500+ req/min total or very low URI diversity (hammering one endpoint) ```
+    | where requests_per_minute >= 500
+        OR (requests_per_minute >= 200 AND unique_uris <= 3)
+    | eval flood_type=case(
+        unique_uris <= 1,                          "SINGLE_ENDPOINT_FLOOD",
+        unique_uris <= 3,                          "TARGETED_FLOOD",
+        requests_per_minute >= 1000,               "VOLUMETRIC_FLOOD",
+        1==1,                                       "DISTRIBUTED_FLOOD"
+      )
+    | eval causing_errors=if(server_errors > 0, "YES", "NO")
+    | eval mitre_technique="T1498.001"
+    | eval alert_name="HTTP Flood DDoS"
+    | table _time, src_ip, requests_per_minute, unique_uris, flood_type,
+            server_errors, causing_errors, user_agents,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/2 * * * *"
+    earliest: "-5m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "HTTP Flood — $src_ip$ ($requests_per_minute$ req/min, $flood_type$)"
+        severity: high
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "Legitimate web crawlers (Googlebot, Bingbot) — verify via reverse DNS and add to allowlist"
+    - "CDN or load balancer health check probes — add probe source IPs to exclusion"
+    - "API clients with high-throughput integrations — add known API consumer IPs to allowlist"
+  tuning_guidance: |
+    1. Adjust the 500 req/min threshold based on your normal peak traffic per IP
+    2. For API servers, the threshold may need to be higher (1000+)
+    3. Correlate with server error rates (5xx) to prioritize floods causing actual impact
+    4. Use Splunk's timechart to visualize normal vs anomalous request volumes
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: HTTP 403 Forbidden Storm — Access Control Probing (T1110.001)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Excessive HTTP 403 responses from a single IP indicate systematic probing
+#  of restricted paths: admin panels, configuration files, backup files,
+#  version control directories (.git), and API endpoints.
+#
+#  Confidence  : MEDIUM-HIGH (80)
+#  Severity    : MEDIUM
+
+rule_6_http_403_storm:
+  name: "Access Probing — HTTP 403 Forbidden Storm (T1110.001)"
+  description: >
+    Detects systematic probing of restricted resources by counting excessive
+    HTTP 403 (Forbidden) responses to a single source IP. Attackers enumerate
+    protected paths including admin panels, configuration files, backup
+    archives, .git directories, and API endpoints. 20+ unique 403 paths
+    from one IP in 10 minutes indicates automated directory probing.
+  mitre:
+    tactic: "Credential Access"
+    technique: T1110.001
+    technique_name: "Brute Force: Password Guessing"
+    related_techniques:
+      - "T1083: File and Directory Discovery"
+  severity: medium
+  confidence: 80
+  risk_score: 65
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common status=403
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)"
+    | bin _time span=10m
+    | stats
+        count as forbidden_count,
+        dc(uri_path) as unique_paths,
+        values(uri_path) as probed_paths,
+        values(http_method) as methods_used
+        by src_ip, _time
+    | where forbidden_count >= 20 AND unique_paths >= 10
+    | eval mitre_technique="T1110.001"
+    | eval alert_name="HTTP 403 Access Probing Storm"
+    | table _time, src_ip, forbidden_count, unique_paths, probed_paths,
+            methods_used, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "2h"
+  actions:
+    - notable_event:
+        rule_title: "403 Storm — $src_ip$ probing $unique_paths$ restricted paths"
+        severity: medium
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 65
+
+  known_false_positives:
+    - "Web crawlers hitting robots.txt-disallowed paths — verify user-agent"
+    - "Broken internal links causing 403 cascades from legitimate users — check referrer header"
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  - name: "IQ-1: Brute force success confirmation — 401s followed by 200 from same IP"
+    description: "Determine if a brute force attacker eventually guessed correct credentials"
+    search: |
+      index=web sourcetype=access_combined src_ip="$ATTACKER_IP$" earliest=-24h latest=now
+      | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+(?<auth_user>\S+).*\"\s+(?<status>\d+)"
+      | where status IN ("401", "200", "302")
+      | eval result=case(status="401", "FAILED", status="200", "SUCCESS", status="302", "REDIRECT")
+      | table _time, auth_user, status, result
+      | sort _time
+
+  - name: "IQ-2: Top brute force sources over 7 days"
+    description: "Identify persistent brute force attackers"
+    search: |
+      index=web sourcetype=access_combined status=401 earliest=-7d latest=now
+      | rex field=_raw "^(?<src_ip>\S+)"
+      | stats count as failed_attempts, dc(date_mday) as active_days by src_ip
+      | where failed_attempts >= 100
+      | iplocation src_ip
+      | sort -failed_attempts
+      | table src_ip, Country, City, failed_attempts, active_days
+
+  - name: "IQ-3: Apache connection exhaustion timeline"
+    description: "Timeline of MaxRequestWorkers errors for Slowloris investigation"
+    search: |
+      index=web sourcetype=apache:error earliest=-24h latest=now
+        ("MaxRequestWorkers" OR "MaxClients" OR "scoreboard" OR "no idle workers")
+      | timechart span=5m count as exhaustion_events
+
+  - name: "IQ-4: Top source IPs by request volume (flood analysis)"
+    description: "Identify the highest-volume source IPs"
+    search: |
+      index=web sourcetype=access_combined earliest=-1h latest=now
+      | rex field=_raw "^(?<src_ip>\S+)"
+      | stats count as total_requests by src_ip
+      | sort -total_requests
+      | head 20
+      | iplocation src_ip
+      | table src_ip, Country, total_requests
+
+  - name: "IQ-5: Login endpoint abuse frequency per source IP"
+    description: "Profile login endpoint usage patterns across all IPs"
+    search: |
+      index=web sourcetype=access_combined http_method=POST earliest=-24h latest=now
+        (uri_path="*login*" OR uri_path="*signin*" OR uri_path="*auth*")
+      | rex field=_raw "^(?<src_ip>\S+).*\"POST\s+(?<uri_path>\S+).*\"\s+(?<status>\d+)"
+      | stats count as attempts, dc(status) as status_diversity, values(status) as statuses by src_ip
+      | where attempts >= 5
+      | sort -attempts
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+response_playbook:
+  name: "Apache Brute Force & DoS Incident Response"
+  steps:
+    - step: 1
+      action: "Classify Attack Type"
+      details: >
+        Determine if the attack is: (a) single-IP brute force (Rule 1/2),
+        (b) distributed credential stuffing (Rule 3), (c) Slowloris/slow
+        HTTP (Rule 4), or (d) volumetric HTTP flood (Rule 5). Each requires
+        a different response strategy.
+
+    - step: 2
+      action: "Check for Successful Compromise"
+      details: >
+        For brute force: Run IQ-1 to check if any 401 storm was followed by
+        HTTP 200 from the same IP. If YES, the attacker has valid credentials.
+        Immediately reset the compromised account password, revoke sessions,
+        and audit recent activity under that account.
+
+    - step: 3
+      action: "Block Attacking Sources"
+      details: >
+        For single-IP attacks: block at iptables or firewall level. For
+        distributed attacks: deploy rate limiting at the WAF/CDN layer
+        (Cloudflare, AWS WAF, mod_evasive). For Slowloris: deploy
+        mod_reqtimeout or mod_evasive with aggressive timeout settings.
+
+    - step: 4
+      action: "Harden Apache Configuration"
+      details: >
+        Deploy mod_evasive for rate limiting. Configure mod_reqtimeout:
+        RequestReadTimeout header=20-40,MinRate=500 body=20,MinRate=500.
+        Set MaxRequestWorkers appropriately. Enable mod_security with
+        brute force detection rules. Consider fail2ban for automated IP banning.
+
+    - step: 5
+      action: "Application-Level Protections"
+      details: >
+        Implement account lockout after N failed attempts. Deploy CAPTCHA on
+        login forms after 3 failures. Add rate limiting per username (not just
+        per IP). Enable MFA for all user accounts. Monitor for credential
+        dumps on dark web that may fuel future stuffing attacks.
+
+    - step: 6
+      action: "Post-Incident Monitoring"
+      details: >
+        Enable all 6 detection rules. Monitor for the same attacker returning
+        from different IPs. Set up Splunk alerts for sudden spikes in 401
+        response rates. Review Apache access patterns weekly for anomalies.

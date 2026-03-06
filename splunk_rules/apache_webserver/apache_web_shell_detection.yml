@@ -1,0 +1,805 @@
+# ==============================================================================
+#  Apache Web Shell Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for web shell upload, deployment, and
+#                execution on Apache HTTP Server. Covers PHP/JSP/ASP web shells,
+#                China Chopper, WSO, b374k, c99, r57, Weevely, Godzilla, and
+#                Behinder. Detects both the upload phase (via access logs and
+#                file creation events) and the execution phase (command
+#                execution patterns in access logs and process creation).
+#
+#  MITRE ATT&CK: T1505.003 - Server Software Component: Web Shell
+#                 T1059.004 - Command and Scripting Interpreter: Unix Shell
+#                 T1071.001 - Application Layer Protocol: Web Protocols
+#  Kill Chain   : Persistence / Execution / Command and Control
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-06
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Apache access logs (Combined Log Format):
+#     index=web sourcetype=access_combined
+#
+#  2. Sysmon for Linux (process creation, file creation):
+#     index=linux sourcetype=sysmon_linux
+#
+#  3. auditd with EXECVE and file watch rules:
+#     index=linux sourcetype=linux:audit
+#     -w /var/www -p wa -k web_write
+#     -w /srv/http -p wa -k web_write
+#
+#  4. Apache mod_security logs (optional, high-value):
+#     index=web sourcetype=modsecurity
+#
+# ==============================================================================
+#
+#  KNOWN WEB SHELL SIGNATURES:
+#
+#  Shell Name   | Language | Indicator
+#  ------------ | -------- | -------------------------------------------------
+#  China Chopper | PHP/ASP | 1-line eval($_POST), "caidao" parameter
+#  WSO          | PHP      | "WSO" title, FilesMan, "wso_" functions
+#  b374k        | PHP      | "b374k" string, password-protected panel
+#  c99          | PHP      | "c99shell", uname -a, safe_mode_exec_dir
+#  r57          | PHP      | "r57shell", "safe_mode", "phpinfo"
+#  Weevely      | PHP      | Obfuscated, session-based, small stager
+#  Godzilla     | JSP/PHP  | AES-encrypted payloads, "pass=" parameter
+#  Behinder     | JSP/PHP  | AES+Base64, "rebeyond" default key
+#  p0wny-shell  | PHP      | "p0wny", terminal-style interface
+#  PHPSpy       | PHP      | "phpspy", multi-function panel
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: Web Shell Upload via HTTP POST to Writable Directory (T1505.003)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects HTTP POST/PUT requests that upload executable script files to
+#  web-accessible directories. Fires when the server responds with HTTP 200/201
+#  (upload succeeded) for files with dangerous extensions.
+#
+#  Confidence  : HIGH (88)
+#  Severity    : CRITICAL
+
+rule_1_webshell_upload:
+  name: "Web Shell — File Upload to Web Directory (T1505.003)"
+  description: >
+    Detects HTTP POST or PUT requests that upload script files (.php, .phtml,
+    .pht, .php5, .jsp, .jspx, .asp, .aspx, .cfm, .cgi, .pl, .py) to
+    Apache-served directories. A successful upload (HTTP 200/201/204) of an
+    executable script to a web directory is a strong indicator of web shell
+    deployment. Correlate with Rule 2 (file creation on disk) to confirm.
+  mitre:
+    tactic: "Persistence"
+    technique: T1505.003
+    technique_name: "Server Software Component: Web Shell"
+  severity: critical
+  confidence: 88
+  risk_score: 90
+  kill_chain_phase: "Installation"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    | rex field=_raw "\"(?<user_agent>[^\"]+)\"\s*$"
+    ``` POST/PUT of executable script files ```
+    | where http_method IN ("POST", "PUT")
+        AND match(uri_path, "(?i)\.(php[345s]?|phtml?|pht|jsp[xf]?|asp[x]?|cfm|cgi|pl|py|sh|shtml)\b")
+    ``` Successful upload responses ```
+    | where status IN ("200", "201", "204")
+    ``` Exclude known upload endpoints (customize for your apps) ```
+    | where NOT match(uri_path, "(?i)/(api|admin|wp-admin|upload_handler)/")
+    ``` Extract the uploaded filename ```
+    | rex field=uri_path "(?<filename>[^/]+\.(php[345s]?|phtml?|pht|jsp[xf]?|asp[x]?|cfm|cgi|pl|py|sh))\b"
+    | eval file_extension=lower(replace(filename, ".*\.", ""))
+    | eval shell_risk=case(
+        match(filename, "(?i)(cmd|shell|backdoor|hack|c99|r57|wso|b374k|webshell|spy|pwn|evil)"), "KNOWN_SHELL_NAME",
+        match(filename, "(?i)^[a-f0-9]{6,}\.php"),   "RANDOM_HEX_NAME",
+        match(filename, "(?i)^\d+\.php"),              "NUMERIC_NAME",
+        len(filename) <= 5,                            "VERY_SHORT_NAME",
+        1==1,                                          "UNKNOWN"
+      )
+    | eval mitre_technique="T1505.003"
+    | eval mitre_tactic="Persistence"
+    | eval alert_name="Web Shell Upload Detected"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as upload_count,
+        values(uri_path) as uploaded_paths,
+        values(filename) as filenames,
+        values(file_extension) as extensions,
+        values(shell_risk) as risk_indicators,
+        values(user_agent) as user_agents
+        by src_ip, status
+    | table first_seen, last_seen, src_ip, upload_count, uploaded_paths,
+            filenames, extensions, risk_indicators, user_agents, status,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Web Shell Upload — $src_ip$ uploaded $filenames$ ($upload_count$ files)"
+        severity: critical
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "CMS file managers (WordPress, Joomla) used by admins to upload plugins — add admin IPs to allowlist"
+    - "CI/CD deployment tools uploading PHP/JSP files — add deployment source IPs to exclusion"
+    - "Web-based IDE or file editing tools — add known tool URIs to exclusion regex"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Script File Created in Web Root (Sysmon/auditd) (T1505.003)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Correlates with Rule 1 by detecting file creation events on the server
+#  filesystem. Fires when a new .php/.jsp/.cgi file appears in the web root
+#  created by the Apache process (www-data, apache, httpd, nobody).
+#
+#  Confidence  : VERY HIGH (92)
+#  Severity    : CRITICAL
+
+rule_2_webshell_file_creation:
+  name: "Web Shell — Script File Created in Web Root by Apache Process (T1505.003)"
+  description: >
+    Detects creation of executable script files (.php, .jsp, .cgi, .pl, .py)
+    in web-accessible directories (/var/www, /srv/http, /opt/lampp/htdocs,
+    /usr/share/nginx) by the Apache/httpd process or web server user
+    (www-data, apache, httpd, nobody). This confirms that an HTTP request
+    successfully wrote a file to disk — the defining indicator of web shell
+    deployment.
+  mitre:
+    tactic: "Persistence"
+    technique: T1505.003
+    technique_name: "Server Software Component: Web Shell"
+  severity: critical
+  confidence: 92
+  risk_score: 92
+  kill_chain_phase: "Installation"
+  data_sources:
+    - "Sysmon for Linux — Event 11 (FileCreate)"
+    - "Linux Audit Log — file watch (key=web_write)"
+
+  search: |
+    (index=linux sourcetype=sysmon_linux EventCode=11)
+    OR (index=linux sourcetype=linux:audit type=SYSCALL key=web_write)
+    ``` File created in web-accessible directories ```
+    | eval target_file=coalesce(TargetFilename, name)
+    | where match(target_file, "(?i)(/var/www|/srv/http|/opt/lampp|/usr/share/nginx|/home/.*/public_html)")
+        AND match(target_file, "(?i)\.(php[345s]?|phtml?|pht|jsp[xf]?|asp[x]?|cfm|cgi|pl|py|sh|shtml)$")
+    ``` Created by web server process or user ```
+    | eval process=coalesce(Image, exe, comm)
+    | eval user=coalesce(User, auid, uid)
+    | where match(process, "(?i)(apache2|httpd|nginx|php-fpm|php-cgi|tomcat)")
+        OR match(user, "(?i)(www-data|apache|httpd|nobody|tomcat)")
+    ``` Extract filename and check for suspicious names ```
+    | rex field=target_file "(?<shell_filename>[^/]+)$"
+    | eval suspicious_name=if(match(shell_filename, "(?i)(cmd|shell|backdoor|hack|c99|r57|wso|b374k|webshell|spy|pwn|eval|exec|upload|config_bak|\.php\.)"), "YES", "NO")
+    | eval mitre_technique="T1505.003"
+    | eval alert_name="Web Shell File Created in Web Root"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as files_created,
+        values(target_file) as created_files,
+        values(shell_filename) as filenames,
+        values(process) as creating_process,
+        values(user) as creating_user,
+        max(suspicious_name) as has_suspicious_name
+        by host
+    | table first_seen, last_seen, host, files_created, created_files,
+            filenames, creating_process, creating_user, has_suspicious_name,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Web Shell Created — $filenames$ on $host$ by $creating_process$"
+        severity: critical
+    - risk:
+        risk_object: "host"
+        risk_object_type: "system"
+        risk_score: 92
+
+  known_false_positives:
+    - "CMS auto-updates creating plugin/theme PHP files — correlate with CMS admin sessions"
+    - "Composer or npm post-install scripts generating PHP stubs — check for package manager parent process"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Web Shell Execution — Suspicious URI Parameters (T1505.003)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects HTTP requests to PHP/JSP files that pass OS command parameters
+#  commonly used by web shells: cmd=, exec=, command=, shell=, act=,
+#  action=upload, and base64-encoded payloads.
+#
+#  Confidence  : HIGH (87)
+#  Severity    : CRITICAL
+
+rule_3_webshell_command_parameters:
+  name: "Web Shell — Suspicious Command Parameters in HTTP Request (T1505.003)"
+  description: >
+    Detects HTTP GET/POST requests to script files (.php, .jsp) containing
+    query string parameters commonly used by web shells to receive OS commands:
+    cmd=, exec=, command=, c=, e=, shell=, action=, do=, act=. Also detects
+    base64-encoded payloads in parameters (used by China Chopper, Godzilla,
+    Behinder) and known web shell parameter patterns like "caidao", "z0",
+    "pass=", and "rebeyond".
+  mitre:
+    tactic: "Execution"
+    technique: T1505.003
+    technique_name: "Server Software Component: Web Shell"
+    related_techniques:
+      - "T1059.004: Command and Scripting Interpreter: Unix Shell"
+      - "T1132.001: Data Encoding: Standard Encoding (base64 payloads)"
+  severity: critical
+  confidence: 87
+  risk_score: 88
+  kill_chain_phase: "Actions on Objectives"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    | rex field=_raw "\"(?<user_agent>[^\"]+)\"\s*$"
+    ``` Request to a script file with suspicious parameters ```
+    | where match(uri_path, "(?i)\.(php[345s]?|phtml?|jsp[x]?|asp[x]?)\?")
+        AND (
+            ``` Classic command parameter names ```
+            match(uri_path, "(?i)[?&](cmd|exec|command|shell|c|e|do|act|action|run)=")
+            ``` OS commands in parameter values ```
+            OR match(uri_path, "(?i)=(whoami|id|uname|cat%20|ls%20|pwd|ifconfig|ipconfig|net%20user|dir%20)")
+            ``` Base64-encoded payloads (long base64 strings) ```
+            OR match(uri_path, "(?i)[?&][a-z]=[A-Za-z0-9+/=]{40,}")
+            ``` Known web shell parameters ```
+            OR match(uri_path, "(?i)(caidao|z0=|z1=|z2=|pass=|rebeyond|godzilla|behinder)")
+            ``` PHP code execution patterns in parameters ```
+            OR match(uri_path, "(?i)(eval|assert|system|passthru|exec|shell_exec|popen|proc_open|base64_decode)\(")
+        )
+    | eval shell_indicator=case(
+        match(uri_path, "(?i)caidao"),                                     "CHINA_CHOPPER",
+        match(uri_path, "(?i)(rebeyond|behinder)"),                        "BEHINDER",
+        match(uri_path, "(?i)godzilla"),                                   "GODZILLA",
+        match(uri_path, "(?i)[?&][a-z]=[A-Za-z0-9+/=]{100,}"),           "ENCRYPTED_SHELL",
+        match(uri_path, "(?i)(eval|assert|system|passthru|exec)\("),       "CODE_EXEC_PARAM",
+        match(uri_path, "(?i)[?&](cmd|exec|command|shell)="),             "COMMAND_PARAM",
+        match(uri_path, "(?i)=(whoami|id|uname|cat%20|ls%20|pwd)"),       "OS_COMMAND_VALUE",
+        1==1,                                                              "SUSPICIOUS_PARAM"
+      )
+    | eval mitre_technique="T1505.003"
+    | eval mitre_tactic="Execution"
+    | eval alert_name="Web Shell Command Execution"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as request_count,
+        dc(uri_path) as unique_commands,
+        values(uri_path) as command_uris,
+        values(shell_indicator) as shell_types,
+        values(status) as http_statuses,
+        values(user_agent) as user_agents
+        by src_ip, http_method
+    | table first_seen, last_seen, src_ip, http_method, request_count,
+            unique_commands, command_uris, shell_types, http_statuses,
+            user_agents, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Web Shell Execution — $src_ip$ via $shell_types$ ($request_count$ commands)"
+        severity: critical
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 88
+
+  known_false_positives:
+    - "Legitimate admin panels that use 'action=' or 'cmd=' parameters — add specific URI paths to exclusion"
+    - "WordPress admin-ajax.php requests with action= parameter — exclude /wp-admin/admin-ajax.php"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Apache Process Spawning OS Commands (T1059.004)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Server-side detection: when the Apache/httpd parent process spawns shell
+#  commands (sh, bash, whoami, id, uname, cat, wget, curl), it indicates
+#  successful web shell execution or command injection.
+#
+#  Confidence  : VERY HIGH (93)
+#  Severity    : CRITICAL
+
+rule_4_apache_spawning_commands:
+  name: "Web Shell — Apache Process Spawning OS Commands (T1059.004)"
+  description: >
+    Detects the Apache HTTP Server process (httpd, apache2, php-fpm, php-cgi)
+    spawning child processes that are OS commands: sh, bash, whoami, id, uname,
+    cat, wget, curl, nc, python, perl, ruby. This is the highest-confidence
+    indicator of active web shell exploitation because the web server process
+    should never execute arbitrary system commands in production.
+  mitre:
+    tactic: "Execution"
+    technique: T1059.004
+    technique_name: "Command and Scripting Interpreter: Unix Shell"
+    related_techniques:
+      - "T1505.003: Server Software Component: Web Shell"
+  severity: critical
+  confidence: 93
+  risk_score: 95
+  kill_chain_phase: "Actions on Objectives"
+  data_sources:
+    - "Sysmon for Linux — Event 1 (Process Creation)"
+    - "Linux Audit Log — EXECVE syscall"
+
+  search: |
+    (index=linux sourcetype=sysmon_linux EventCode=1)
+    OR (index=linux sourcetype=linux:audit type=EXECVE)
+    ``` Parent process is the web server ```
+    | eval parent=coalesce(ParentImage, ppid_exe, "")
+    | eval child=coalesce(Image, exe, a0, "")
+    | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,"")." ".coalesce(a3,"")." ".coalesce(a4,""))
+    | eval user=coalesce(User, auid, "unknown")
+    | where match(parent, "(?i)(apache2|httpd|php-fpm|php-cgi|php[0-9]|tomcat|java.*catalina|nginx)")
+        OR match(user, "(?i)(www-data|apache|httpd|nobody|tomcat)")
+    ``` Child process is a suspicious command ```
+    | where match(child, "(?i)/(sh|bash|dash|zsh|csh|ksh|tcsh|fish)$")
+        OR match(child, "(?i)/(whoami|id|uname|hostname|ifconfig|ip|cat|head|tail|less|more)$")
+        OR match(child, "(?i)/(wget|curl|fetch|lwp-download|nc|ncat|netcat|socat)$")
+        OR match(child, "(?i)/(python[23]?|perl|ruby|node|php)$")
+        OR match(child, "(?i)/(gcc|cc|make|chmod|chown|chgrp|useradd|groupadd)$")
+        OR match(child, "(?i)/(base64|xxd|openssl|gpg|tar|zip|gzip)$")
+        OR match(child, "(?i)/(nmap|masscan|ping|traceroute|dig|nslookup)$")
+    ``` Classify the command type ```
+    | eval cmd_category=case(
+        match(child, "(?i)/(sh|bash|dash|zsh|csh)$"),                       "SHELL_SPAWN",
+        match(child, "(?i)/(whoami|id|uname|hostname|ifconfig|ip)$"),       "RECONNAISSANCE",
+        match(child, "(?i)/(wget|curl|fetch|lwp-download)$"),               "DOWNLOAD_TOOL",
+        match(child, "(?i)/(nc|ncat|netcat|socat)$"),                       "REVERSE_SHELL_TOOL",
+        match(child, "(?i)/(python[23]?|perl|ruby)$"),                      "SCRIPT_INTERPRETER",
+        match(child, "(?i)/(gcc|cc|make)$"),                                "COMPILER",
+        match(child, "(?i)/(nmap|masscan)$"),                               "NETWORK_SCANNER",
+        match(child, "(?i)/(cat|head|tail|less|more)$"),                    "FILE_READ",
+        match(child, "(?i)/(chmod|chown|useradd)$"),                        "PRIVILEGE_CHANGE",
+        match(child, "(?i)/(base64|xxd|openssl)$"),                         "ENCODING_TOOL",
+        1==1,                                                                "OTHER_SUSPICIOUS"
+      )
+    | eval mitre_technique="T1059.004"
+    | eval mitre_tactic="Execution"
+    | eval alert_name="Apache Spawning OS Commands — Web Shell Active"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as command_count,
+        dc(child) as unique_commands,
+        values(child) as commands_executed,
+        values(cmd_category) as command_categories,
+        values(cmdline) as full_commandlines,
+        values(parent) as parent_process,
+        values(user) as user
+        by host
+    | eval severity=case(
+        match(mvjoin(command_categories, ","), "REVERSE_SHELL_TOOL"), "CRITICAL",
+        match(mvjoin(command_categories, ","), "COMPILER"),           "CRITICAL",
+        command_count >= 5,                                           "CRITICAL",
+        1==1,                                                         "HIGH"
+      )
+    | table first_seen, last_seen, host, command_count, unique_commands,
+            commands_executed, command_categories, full_commandlines,
+            parent_process, user, severity, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Web Shell Active — Apache on $host$ spawned $commands_executed$"
+        severity: critical
+    - risk:
+        risk_object: "host"
+        risk_object_type: "system"
+        risk_score: 95
+
+  known_false_positives:
+    - "CGI scripts that legitimately execute system commands (e.g., monitoring dashboards) — add specific CGI paths to exclusion"
+    - "PHP exec() calls in legitimate applications (e.g., image processing with ImageMagick) — add specific parent+child combinations to allowlist"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Known Web Shell File Hash Detection (T1505.003)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Matches file hashes (SHA256) of known web shells against files created or
+#  modified in web directories. Uses a Splunk lookup table populated from
+#  threat intel feeds.
+#
+#  Confidence  : VERY HIGH (96)
+#  Severity    : CRITICAL
+
+rule_5_webshell_hash_matching:
+  name: "Web Shell — Known Web Shell File Hash Detected (T1505.003)"
+  description: >
+    Matches file hashes of newly created or modified files in web directories
+    against a lookup table of known web shell SHA256 hashes. Sources for the
+    hash list include: MITRE Cyber Analytics Repository, CISA web shell IOCs,
+    NSA/CISA web shell analysis reports, and public web shell repositories.
+    A hash match is a definitive indicator — zero false positive rate.
+  mitre:
+    tactic: "Persistence"
+    technique: T1505.003
+    technique_name: "Server Software Component: Web Shell"
+  severity: critical
+  confidence: 96
+  risk_score: 98
+  kill_chain_phase: "Installation"
+  data_sources:
+    - "Sysmon for Linux — Event 11 (FileCreate) with hash logging"
+
+  # --- Lookup Table Setup ---
+  # Create: webshell_hashes.csv
+  # Fields: sha256, shell_name, shell_family, source
+  # Example:
+  #   sha256,shell_name,shell_family,source
+  #   b374k...abc,b374k.php,b374k,CISA_AA21-200A
+  #   c99sh...def,c99.php,c99,NSA_U_OO_117856_20
+  #
+  # Upload to Splunk: Settings > Lookups > Lookup table files
+  # Schedule automated updates from threat intel feeds
+
+  search: |
+    index=linux sourcetype=sysmon_linux EventCode=11
+    | where match(TargetFilename, "(?i)(/var/www|/srv/http|/opt/lampp|/usr/share/nginx|public_html)")
+        AND match(TargetFilename, "(?i)\.(php[345s]?|phtml?|jsp[xf]?|asp[x]?|cgi|pl)$")
+    | eval file_sha256=lower(coalesce(Hashes, FileHash))
+    | rex field=file_sha256 "SHA256=(?<sha256>[a-fA-F0-9]{64})"
+    | where isnotnull(sha256)
+    ``` Match against known web shell hash lookup ```
+    | lookup webshell_hashes.csv sha256 as sha256 OUTPUT shell_name, shell_family, source as intel_source
+    | where isnotnull(shell_name)
+    | eval mitre_technique="T1505.003"
+    | eval alert_name="Known Web Shell Hash Match — ".shell_name
+    | table _time, host, TargetFilename, sha256, shell_name, shell_family,
+            intel_source, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "sha256"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Known Web Shell — $shell_name$ ($shell_family$) on $host$"
+        severity: critical
+    - risk:
+        risk_object: "host"
+        risk_object_type: "system"
+        risk_score: 98
+
+  known_false_positives:
+    - "None — hash matches against known web shells have a zero false positive rate"
+    - "Ensure the lookup table is kept current and does not contain test/benign file hashes"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Web Shell Beaconing — Periodic POST Requests to Single File
+#          (T1071.001)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Encrypted web shells (Godzilla, Behinder) communicate via periodic POST
+#  requests to a single PHP/JSP file with consistent request sizes. This
+#  rule detects the C2 beaconing pattern.
+#
+#  Confidence  : MEDIUM-HIGH (78)
+#  Severity    : HIGH
+
+rule_6_webshell_beaconing:
+  name: "Web Shell — Periodic POST Beaconing to Script File (T1071.001)"
+  description: >
+    Detects C2 beaconing patterns characteristic of encrypted web shells
+    (Godzilla, Behinder, Weevely). These shells communicate via periodic HTTP
+    POST requests to a single PHP/JSP file with consistent intervals and
+    similar request sizes. A single source IP making 10+ POST requests to the
+    same script file within 30 minutes, with no corresponding GET requests,
+    is a strong indicator of web shell C2 communication.
+  mitre:
+    tactic: "Command and Control"
+    technique: T1071.001
+    technique_name: "Application Layer Protocol: Web Protocols"
+    related_techniques:
+      - "T1505.003: Server Software Component: Web Shell"
+      - "T1573.001: Encrypted Channel: Symmetric Cryptography"
+  severity: high
+  confidence: 78
+  risk_score: 80
+  kill_chain_phase: "Command and Control"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    ``` POST requests to script files only ```
+    | where http_method="POST"
+        AND match(uri_path, "(?i)\.(php[345s]?|phtml?|jsp[xf]?|asp[x]?)(\?|$)")
+    ``` Strip query string to group by base path ```
+    | rex field=uri_path "(?<base_path>[^?]+)"
+    ``` Aggregate per source IP + target file over 30 minutes ```
+    | bin _time span=30m
+    | stats
+        count as post_count,
+        dc(bytes) as unique_response_sizes,
+        avg(bytes) as avg_response_bytes,
+        stdev(bytes) as stdev_response_bytes,
+        earliest(_time) as first_post,
+        latest(_time) as last_post
+        by src_ip, base_path, _time
+    ``` Beaconing indicators: many POSTs to same file, consistent sizes ```
+    | where post_count >= 10
+    ``` Calculate time span and average interval ```
+    | eval span_seconds=last_post - first_post
+    | eval avg_interval=if(post_count>1, span_seconds/(post_count-1), 0)
+    | eval beaconing_score=case(
+        avg_interval > 0 AND avg_interval < 120 AND unique_response_sizes <= 5,   "HIGH",
+        post_count >= 20,                                                           "HIGH",
+        post_count >= 10 AND unique_response_sizes <= 3,                           "MEDIUM",
+        1==1,                                                                       "LOW"
+      )
+    | where beaconing_score IN ("HIGH", "MEDIUM")
+    | eval mitre_technique="T1071.001"
+    | eval alert_name="Web Shell Beaconing"
+    | table first_post, last_post, src_ip, base_path, post_count,
+            avg_interval, unique_response_sizes, beaconing_score,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/15 * * * *"
+    earliest: "-35m"
+    latest: "now"
+  throttle:
+    field: "src_ip,base_path"
+    period: "2h"
+  actions:
+    - notable_event:
+        rule_title: "Web Shell Beaconing — $src_ip$ to $base_path$ ($post_count$ POSTs)"
+        severity: high
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "AJAX-heavy applications with periodic polling — add known polling endpoints to exclusion"
+    - "Health check endpoints probed by monitoring tools — exclude /health, /status, /ping paths"
+    - "API endpoints receiving frequent POST requests — add API prefixes to exclusion"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: Web Shell Access from Unusual Geographic Source (T1505.003)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  If a web shell is accessed from a country that differs from normal admin
+#  traffic, it is a strong contextual indicator. This rule uses Splunk's
+#  iplocation command to geolocate source IPs and flag anomalous countries.
+#
+#  Confidence  : MEDIUM (72)
+#  Severity    : HIGH
+
+rule_7_webshell_geo_anomaly:
+  name: "Web Shell — Script Accessed from Unusual Country (T1505.003)"
+  description: >
+    Detects access to script files (.php, .jsp) from IP addresses in countries
+    that are unusual for the organization's admin traffic. Uses Splunk's
+    built-in iplocation command for geolocation. Effective as a contextual
+    enrichment — combine with other web shell indicators for high-confidence
+    alerting.
+  mitre:
+    tactic: "Persistence"
+    technique: T1505.003
+    technique_name: "Server Software Component: Web Shell"
+  severity: high
+  confidence: 72
+  risk_score: 70
+  kill_chain_phase: "Actions on Objectives"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    ``` POST to script files (typical web shell access) ```
+    | where http_method="POST"
+        AND match(uri_path, "(?i)\.(php[345s]?|phtml?|jsp[xf]?|asp[x]?)(\?|$)")
+        AND status="200"
+    | iplocation src_ip
+    ``` Flag countries NOT in expected admin locations ```
+    ``` Customize this list for your organization's admin locations ```
+    | where NOT Country IN ("United States", "United Kingdom", "Germany", "India", "Canada", "Australia")
+        AND isnotnull(Country)
+    | eval mitre_technique="T1505.003"
+    | eval alert_name="Web Shell Access from ".Country
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as request_count,
+        values(uri_path) as accessed_scripts,
+        values(Country) as source_country,
+        values(City) as source_city
+        by src_ip
+    | where request_count >= 3
+    | table first_seen, last_seen, src_ip, source_country, source_city,
+            request_count, accessed_scripts, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "4h"
+  actions:
+    - notable_event:
+        rule_title: "Web Shell from $source_country$ — $src_ip$ accessing $accessed_scripts$"
+        severity: high
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 70
+
+  known_false_positives:
+    - "Remote administrators connecting from travel locations — verify with admin schedule"
+    - "VPN exit nodes in unexpected countries — add known VPN ranges to allowlist"
+  tuning_guidance: |
+    1. Customize the Country IN (...) list with your organization's legitimate admin countries
+    2. This rule works best as a secondary enrichment — pair with Rules 1-4 for high confidence
+    3. Consider using Splunk ES threat intel framework for IP reputation instead of pure geolocation
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  - name: "IQ-1: All POST requests to script files in last 24 hours"
+    description: "Baseline script file POST activity to identify anomalous patterns"
+    search: |
+      index=web sourcetype=access_combined earliest=-24h latest=now
+      | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+      | where http_method="POST" AND match(uri_path, "(?i)\.(php|jsp|asp)")
+      | stats count as requests, dc(src_ip) as unique_sources, values(src_ip) as source_ips by uri_path
+      | sort -requests
+
+  - name: "IQ-2: New script files created in web root (last 7 days)"
+    description: "Find all new PHP/JSP files created in web directories"
+    search: |
+      index=linux sourcetype=sysmon_linux EventCode=11 earliest=-7d latest=now
+      | where match(TargetFilename, "(?i)(/var/www|/srv/http)")
+          AND match(TargetFilename, "(?i)\.(php|jsp|cgi|pl|py|asp)$")
+      | table _time, host, TargetFilename, User, Image
+      | sort _time
+
+  - name: "IQ-3: Apache child processes spawned in last 24 hours"
+    description: "Audit all commands spawned by the web server process"
+    search: |
+      index=linux (sourcetype=sysmon_linux EventCode=1) OR (sourcetype=linux:audit type=EXECVE)
+      | eval parent=coalesce(ParentImage, ppid_exe)
+      | eval child=coalesce(Image, exe, a0)
+      | eval cmdline=coalesce(CommandLine, a0." ".coalesce(a1,"")." ".coalesce(a2,""))
+      | where match(parent, "(?i)(apache2|httpd|php-fpm|php-cgi)")
+      | table _time, host, parent, child, cmdline, User
+      | sort _time
+
+  - name: "IQ-4: Web shell keyword search in access logs"
+    description: "Search for known web shell names and parameters in URI paths"
+    search: |
+      index=web sourcetype=access_combined earliest=-7d latest=now
+        (uri_path="*c99*" OR uri_path="*r57*" OR uri_path="*wso*" OR uri_path="*b374k*"
+         OR uri_path="*webshell*" OR uri_path="*cmd=*" OR uri_path="*shell=*"
+         OR uri_path="*backdoor*" OR uri_path="*caidao*" OR uri_path="*godzilla*"
+         OR uri_path="*behinder*" OR uri_path="*p0wny*" OR uri_path="*phpspy*")
+      | rex field=_raw "^(?<src_ip>\S+).*\"(?<http_method>\S+)\s+(?<uri_path>\S+).*\"\s+(?<status>\d+)"
+      | table _time, src_ip, http_method, uri_path, status
+
+  - name: "IQ-5: PHP/JSP files with suspiciously small size (stager shells)"
+    description: "Find tiny script files that may be one-line web shell stagers"
+    search: |
+      index=linux sourcetype=sysmon_linux EventCode=11 earliest=-7d latest=now
+      | where match(TargetFilename, "(?i)(/var/www|/srv/http).*\.(php|jsp)$")
+      | where FileSize < 500
+      | table _time, host, TargetFilename, FileSize, User, Image
+      | sort FileSize
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+response_playbook:
+  name: "Apache Web Shell Incident Response"
+  steps:
+    - step: 1
+      action: "Confirm Active Web Shell"
+      details: >
+        Run Rule 4 (Apache spawning OS commands) to confirm active exploitation.
+        If the web server process is spawning shells, the server IS compromised.
+        Run IQ-3 to see all commands the attacker has executed.
+
+    - step: 2
+      action: "Identify the Web Shell File"
+      details: >
+        Run IQ-2 to find recently created script files. Check file contents for
+        eval(), system(), exec(), base64_decode(), or obfuscated code. Calculate
+        SHA256 hash and search threat intel platforms (VirusTotal, CISA).
+
+    - step: 3
+      action: "Determine Initial Access Vector"
+      details: >
+        Run IQ-1 to trace the attacker's full request history. Look for: file
+        upload forms exploited, vulnerable plugin endpoints, path traversal
+        leading to file write, SQL injection writing to disk via INTO OUTFILE.
+
+    - step: 4
+      action: "Scope the Compromise"
+      details: >
+        Check for: additional web shells (attackers often plant multiple), new
+        user accounts created, SSH keys added, cron jobs installed, outbound
+        connections to C2 infrastructure, lateral movement to other servers.
+
+    - step: 5
+      action: "Contain and Eradicate"
+      details: >
+        Remove ALL identified web shell files. Kill any attacker processes.
+        Revoke compromised credentials. Block attacker IPs at WAF and firewall.
+        Patch the vulnerability that allowed initial access. Restart Apache
+        to clear any in-memory modifications.
+
+    - step: 6
+      action: "Harden Apache Configuration"
+      details: >
+        Disable dangerous PHP functions: disable_functions = exec, system,
+        passthru, shell_exec, popen, proc_open. Set open_basedir to restrict
+        file access. Ensure upload directories have "php_flag engine off".
+        Deploy mod_security with OWASP Core Rule Set.
+
+    - step: 7
+      action: "Monitor for Re-compromise"
+      details: >
+        Enable all 7 detection rules. Monitor for new file creation in web
+        directories. Watch for outbound connections from the web server.
+        Conduct a follow-up review after 48 hours to confirm eradication.

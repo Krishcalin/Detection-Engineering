@@ -1,0 +1,680 @@
+# ==============================================================================
+#  Apache Reconnaissance & Scanner Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for reconnaissance and automated
+#                vulnerability scanning against Apache HTTP Server. Covers
+#                web scanner fingerprinting (Nikto, Nmap HTTP scripts, DirBuster,
+#                Gobuster, Nuclei, WPScan, SQLMap), sensitive file probing,
+#                .git / .svn exposure, backup file discovery, admin panel
+#                enumeration, HTTP method probing, and server header harvesting.
+#
+#  MITRE ATT&CK: T1595.002 - Active Scanning: Vulnerability Scanning
+#                 T1592.004 - Gather Victim Host Information: Client Configurations
+#                 T1083     - File and Directory Discovery
+#                 T1046     - Network Service Discovery
+#  Kill Chain   : Reconnaissance
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-06
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Apache access logs (Combined Log Format):
+#     index=web sourcetype=access_combined
+#
+#  2. Apache error logs:
+#     index=web sourcetype=apache:error
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: Known Vulnerability Scanner User-Agent Detection (T1595.002)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects HTTP requests from known vulnerability scanning tools by matching
+#  their User-Agent strings. Most scanners identify themselves (or use known
+#  default UAs). Covers Nikto, Nmap, DirBuster, Gobuster, ffuf, feroxbuster,
+#  Nuclei, WPScan, SQLMap, Acunetix, Nessus, OpenVAS, w3af, Arachni, ZAP,
+#  Burp Suite, and Masscan HTTP probes.
+#
+#  Confidence  : HIGH (90)
+#  Severity    : MEDIUM
+
+rule_1_scanner_user_agent:
+  name: "Reconnaissance — Known Vulnerability Scanner User-Agent (T1595.002)"
+  description: >
+    Detects HTTP requests from known vulnerability scanning tools identified
+    by their User-Agent strings. While User-Agent is trivially spoofable,
+    most automated scanners use default values. This rule catches bulk
+    scanning at the reconnaissance phase, providing early warning before
+    exploitation attempts begin.
+  mitre:
+    tactic: "Reconnaissance"
+    technique: T1595.002
+    technique_name: "Active Scanning: Vulnerability Scanning"
+  severity: medium
+  confidence: 90
+  risk_score: 60
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    | rex field=_raw "\"(?<user_agent>[^\"]+)\"\s*$"
+    ``` Known scanner User-Agent patterns ```
+    | where match(user_agent, "(?i)(nikto|nmap|dirbuster|gobuster|ffuf|feroxbuster|wfuzz)")
+        OR match(user_agent, "(?i)(nuclei|wpscan|sqlmap|joomscan|droopescan|cmsmap)")
+        OR match(user_agent, "(?i)(acunetix|nessus|openvas|qualys|rapid7|tenable)")
+        OR match(user_agent, "(?i)(w3af|arachni|skipfish|whatweb|httprint|wafw00f)")
+        OR match(user_agent, "(?i)(burp|owasp.zap|zaproxy|paros|vega)")
+        OR match(user_agent, "(?i)(masscan|zgrab|censys|shodan|internetmeasurement)")
+        OR match(user_agent, "(?i)(python-requests|go-http-client|libwww-perl|curl/|wget/)")
+        OR match(user_agent, "(?i)(hydra|medusa|patator|thc-)")
+    ``` Classify the scanner type ```
+    | eval scanner_type=case(
+        match(user_agent, "(?i)(nikto|nmap|nuclei|acunetix|nessus|openvas|qualys|rapid7)"),   "VULN_SCANNER",
+        match(user_agent, "(?i)(dirbuster|gobuster|ffuf|feroxbuster|wfuzz|dirb)"),            "DIR_BRUTEFORCE",
+        match(user_agent, "(?i)(wpscan|joomscan|droopescan|cmsmap)"),                         "CMS_SCANNER",
+        match(user_agent, "(?i)(sqlmap)"),                                                     "SQLI_TOOL",
+        match(user_agent, "(?i)(burp|owasp.zap|zaproxy|paros)"),                              "PROXY_SCANNER",
+        match(user_agent, "(?i)(masscan|zgrab|censys|shodan)"),                                "INTERNET_SCANNER",
+        match(user_agent, "(?i)(hydra|medusa|patator)"),                                       "BRUTE_FORCE_TOOL",
+        match(user_agent, "(?i)(python-requests|go-http-client|libwww-perl)"),                 "SCRIPTED_CLIENT",
+        1==1,                                                                                   "OTHER_SCANNER"
+      )
+    | eval mitre_technique="T1595.002"
+    | eval mitre_tactic="Reconnaissance"
+    | eval alert_name="Scanner Detected — ".scanner_type
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as request_count,
+        dc(uri_path) as unique_uris,
+        dc(status) as unique_statuses,
+        values(scanner_type) as scanner_types,
+        values(user_agent) as user_agents,
+        values(status) as http_statuses
+        by src_ip
+    | where request_count >= 5
+    | table first_seen, last_seen, src_ip, request_count, unique_uris,
+            scanner_types, user_agents, http_statuses,
+            mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "4h"
+  actions:
+    - notable_event:
+        rule_title: "Scanner — $src_ip$ using $scanner_types$ ($request_count$ requests)"
+        severity: medium
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 60
+
+  known_false_positives:
+    - "Authorized vulnerability scanners (Nessus, Qualys) — add scanner IPs to allowlist"
+    - "Legitimate Shodan/Censys internet-wide scans — low risk, informational"
+    - "Internal security team scanning — add internal scanner subnet to exclusion"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Directory Enumeration / Forced Browsing — 404 Storm (T1083)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects directory brute-forcing tools by counting excessive HTTP 404
+#  (Not Found) responses to diverse URI paths from a single IP.
+#  DirBuster/Gobuster/ffuf generate hundreds of 404s per second.
+#
+#  Confidence  : HIGH (86)
+#  Severity    : MEDIUM
+
+rule_2_directory_enumeration_404:
+  name: "Reconnaissance — Directory Enumeration / Forced Browsing 404 Storm (T1083)"
+  description: >
+    Detects automated directory enumeration by counting excessive HTTP 404
+    responses to diverse URI paths from a single source IP. Tools like
+    DirBuster, Gobuster, ffuf, feroxbuster, and wfuzz request thousands of
+    common directory/file names to discover hidden content. 50+ unique 404
+    paths from one IP in 5 minutes indicates automated forced browsing.
+  mitre:
+    tactic: "Discovery"
+    technique: T1083
+    technique_name: "File and Directory Discovery"
+  severity: medium
+  confidence: 86
+  risk_score: 65
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common status=404
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)"
+    | bin _time span=5m
+    | stats
+        count as total_404s,
+        dc(uri_path) as unique_paths,
+        earliest(_time) as first_request,
+        latest(_time) as last_request
+        by src_ip, _time
+    ``` High volume of unique 404 paths = directory enumeration ```
+    | where total_404s >= 50 AND unique_paths >= 30
+    | eval requests_per_second=round(total_404s / 300, 1)
+    | eval enumeration_intensity=case(
+        unique_paths >= 500,    "AGGRESSIVE",
+        unique_paths >= 100,    "MODERATE",
+        1==1,                   "LOW"
+      )
+    | eval mitre_technique="T1083"
+    | eval alert_name="Directory Enumeration"
+    | table first_request, last_request, src_ip, total_404s, unique_paths,
+            requests_per_second, enumeration_intensity,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "2h"
+  actions:
+    - notable_event:
+        rule_title: "Dir Enum — $src_ip$ ($unique_paths$ unique 404 paths, $enumeration_intensity$)"
+        severity: medium
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 65
+
+  known_false_positives:
+    - "Broken website with many dead links causing 404 cascades from legitimate crawlers"
+    - "Site migration with changed URL structure causing 404s from search engine bots"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Sensitive File & Version Control Probing (T1083)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects probing for sensitive files commonly left exposed on web servers:
+#  .git/, .svn/, .env, .htpasswd, wp-config.php, phpinfo.php, backup files,
+#  database dumps, SSH keys, server-status, and configuration files.
+#
+#  Confidence  : HIGH (88)
+#  Severity    : HIGH
+
+rule_3_sensitive_file_probing:
+  name: "Reconnaissance — Sensitive File & Version Control Probing (T1083)"
+  description: >
+    Detects probing for sensitive files and directories commonly exposed on
+    Apache web servers: version control (.git/HEAD, .svn/entries), environment
+    files (.env), password files (.htpasswd, .htaccess), PHP info pages
+    (phpinfo.php), backup files (.bak, .old, .sql.gz, .tar.gz), database
+    dumps, configuration files (web.config, wp-config.php), server diagnostics
+    (/server-status, /server-info), and cloud metadata endpoints.
+  mitre:
+    tactic: "Discovery"
+    technique: T1083
+    technique_name: "File and Directory Discovery"
+    related_techniques:
+      - "T1552.001: Unsecured Credentials: Credentials In Files"
+      - "T1592.004: Gather Victim Host Information"
+  severity: high
+  confidence: 88
+  risk_score: 78
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+    ``` Sensitive file and directory patterns ```
+    | where match(uri_path, "(?i)(\.git/(HEAD|config|objects|refs|index|logs)|\.gitignore)")
+        OR match(uri_path, "(?i)(\.svn/(entries|wc\.db)|\.hg/|\.bzr/)")
+        OR match(uri_path, "(?i)(\.env|\.env\.(local|prod|dev|staging|backup))")
+        OR match(uri_path, "(?i)(\.htpasswd|\.htaccess|\.htdigest)")
+        OR match(uri_path, "(?i)(phpinfo\.php|php_info\.php|info\.php|test\.php|i\.php)")
+        OR match(uri_path, "(?i)(wp-config\.php|configuration\.php|config\.php|settings\.php|local\.xml)")
+        OR match(uri_path, "(?i)(web\.config|appsettings\.json|application\.yml|application\.properties)")
+        OR match(uri_path, "(?i)\.(bak|old|orig|save|swp|swo|sql|sql\.gz|tar\.gz|zip|rar|7z|dump)$")
+        OR match(uri_path, "(?i)(server-status|server-info|balancer-manager)")
+        OR match(uri_path, "(?i)(id_rsa|id_dsa|id_ecdsa|authorized_keys|known_hosts)")
+        OR match(uri_path, "(?i)(database\.(sql|dump|bak)|db\.(sql|dump)|backup\.sql)")
+        OR match(uri_path, "(?i)(/debug|/trace|/actuator|/jolokia|/console)")
+    ``` Classify what was probed ```
+    | eval probe_category=case(
+        match(uri_path, "(?i)\.git"),                           "VERSION_CONTROL_GIT",
+        match(uri_path, "(?i)(\.svn|\.hg|\.bzr)"),             "VERSION_CONTROL_OTHER",
+        match(uri_path, "(?i)\.env"),                           "ENVIRONMENT_FILE",
+        match(uri_path, "(?i)\.ht(passwd|access|digest)"),     "APACHE_AUTH_FILE",
+        match(uri_path, "(?i)phpinfo"),                         "PHP_INFO_PAGE",
+        match(uri_path, "(?i)(wp-config|config\.php|settings)"),"APP_CONFIG_FILE",
+        match(uri_path, "(?i)\.(bak|old|orig|save|swp)"),     "BACKUP_FILE",
+        match(uri_path, "(?i)\.(sql|dump|tar\.gz|zip)"),       "DATABASE_DUMP",
+        match(uri_path, "(?i)server-(status|info)"),            "APACHE_DIAGNOSTICS",
+        match(uri_path, "(?i)(id_rsa|id_dsa|authorized_keys)"),"SSH_KEYS",
+        match(uri_path, "(?i)(actuator|jolokia|console)"),     "DEBUG_ENDPOINT",
+        1==1,                                                    "OTHER_SENSITIVE"
+      )
+    | eval is_exposed=if(status="200", "YES_EXPOSED", "NO_BLOCKED")
+    | eval mitre_technique="T1083"
+    | eval alert_name="Sensitive File Probing"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as probe_count,
+        dc(uri_path) as unique_files_probed,
+        values(probe_category) as categories,
+        values(uri_path) as probed_paths,
+        values(status) as http_statuses,
+        count(eval(status="200")) as exposed_count
+        by src_ip
+    | where probe_count >= 3
+    | eval severity=if(exposed_count > 0, "CRITICAL", "HIGH")
+    | table first_seen, last_seen, src_ip, probe_count, unique_files_probed,
+            categories, probed_paths, http_statuses, exposed_count, severity,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "2h"
+  actions:
+    - notable_event:
+        rule_title: "Sensitive File Probe — $src_ip$ ($categories$, $exposed_count$ exposed)"
+        severity: high
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 78
+
+  known_false_positives:
+    - "Search engine bots crawling exposed .git directories — check if the files are actually exposed (HTTP 200)"
+    - "Internal monitoring tools checking server-status — add monitoring IPs to exclusion"
+  tuning_guidance: |
+    1. HTTP 200 responses to sensitive files = IMMEDIATE ACTION REQUIRED (file is actually exposed)
+    2. HTTP 403/404 responses still indicate hostile reconnaissance — track source IP for escalation
+    3. .git/HEAD returning 200 means the entire source code repository is downloadable
+    4. .env returning 200 means API keys, DB credentials, and secrets are exposed
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: HTTP Method Probing — OPTIONS / TRACE / DEBUG (T1046)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects probing of unusual HTTP methods: OPTIONS (server capability
+#  enumeration), TRACE (Cross-Site Tracing / XST), DELETE, PUT (WebDAV),
+#  CONNECT (proxy abuse), and DEBUG (ASP.NET). These methods are part of
+#  standard web server reconnaissance.
+#
+#  Confidence  : MEDIUM-HIGH (80)
+#  Severity    : MEDIUM
+
+rule_4_http_method_probing:
+  name: "Reconnaissance — Unusual HTTP Method Probing (T1046)"
+  description: >
+    Detects HTTP requests using unusual methods that are part of web server
+    reconnaissance: OPTIONS (enumerate allowed methods), TRACE (Cross-Site
+    Tracing for cookie theft), PUT/DELETE (WebDAV file manipulation), CONNECT
+    (open proxy detection), PROPFIND (WebDAV enumeration), and DEBUG (ASP.NET
+    debugging). Multiple unusual method requests from one IP indicate
+    systematic server capability probing.
+  mitre:
+    tactic: "Discovery"
+    technique: T1046
+    technique_name: "Network Service Discovery"
+  severity: medium
+  confidence: 80
+  risk_score: 55
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)"
+    ``` Unusual HTTP methods ```
+    | where http_method IN ("OPTIONS", "TRACE", "TRACK", "DEBUG", "CONNECT", "PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "PATCH", "PURGE")
+        OR (http_method IN ("PUT", "DELETE") AND NOT match(uri_path, "(?i)(/api/|/rest/|/graphql)"))
+    | eval method_risk=case(
+        http_method="TRACE" OR http_method="TRACK",   "HIGH_XST_RISK",
+        http_method="DEBUG",                            "HIGH_DEBUG_RISK",
+        http_method="CONNECT",                          "HIGH_PROXY_ABUSE",
+        http_method="PUT" OR http_method="DELETE",      "MEDIUM_WEBDAV",
+        http_method IN ("PROPFIND", "PROPPATCH"),       "MEDIUM_WEBDAV_ENUM",
+        http_method="OPTIONS",                          "LOW_ENUMERATION",
+        1==1,                                            "LOW"
+      )
+    | eval mitre_technique="T1046"
+    | eval alert_name="HTTP Method Probing"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as probe_count,
+        dc(http_method) as unique_methods,
+        values(http_method) as methods_used,
+        values(method_risk) as risk_levels,
+        values(uri_path) as targeted_paths,
+        values(status) as http_statuses
+        by src_ip
+    | where probe_count >= 3 OR match(mvjoin(methods_used, ","), "(TRACE|DEBUG|CONNECT)")
+    | table first_seen, last_seen, src_ip, probe_count, unique_methods,
+            methods_used, risk_levels, targeted_paths, http_statuses,
+            mitre_technique, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "4h"
+  actions:
+    - notable_event:
+        rule_title: "HTTP Method Probe — $src_ip$ using $methods_used$"
+        severity: medium
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 55
+
+  known_false_positives:
+    - "CORS preflight requests using OPTIONS method — legitimate and common in modern web apps"
+    - "RESTful APIs using PUT/DELETE — excluded by default for /api/ paths, add others if needed"
+    - "WebDAV clients (Finder, Windows Explorer) — add known WebDAV client IPs to exclusion"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Admin Panel Discovery Probing (T1083)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Detects systematic probing for web application admin panels, management
+#  consoles, and CMS login pages. Attackers enumerate these for brute force
+#  or default credential attacks.
+#
+#  Confidence  : HIGH (84)
+#  Severity    : MEDIUM
+
+rule_5_admin_panel_probing:
+  name: "Reconnaissance — Admin Panel Discovery Probing (T1083)"
+  description: >
+    Detects systematic probing for web application admin panels and management
+    consoles: /admin, /administrator, /wp-admin, /manager, /phpmyadmin,
+    /cpanel, /webmail, /jenkins, /grafana, /kibana, /solr, /console,
+    /dashboard. An IP requesting 5+ different admin paths indicates systematic
+    enumeration of management interfaces for subsequent brute force or
+    default credential attacks.
+  mitre:
+    tactic: "Discovery"
+    technique: T1083
+    technique_name: "File and Directory Discovery"
+    related_techniques:
+      - "T1078.001: Valid Accounts: Default Accounts"
+  severity: medium
+  confidence: 84
+  risk_score: 68
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)"
+    ``` Admin panel and management console paths ```
+    | where match(uri_path, "(?i)^/(admin|administrator|wp-admin|wp-login|manager|phpmyadmin|pma|myadmin|adminer)")
+        OR match(uri_path, "(?i)^/(cpanel|webmail|roundcube|squirrelmail|horde)")
+        OR match(uri_path, "(?i)^/(jenkins|hudson|bamboo|teamcity|gitlab|gitea)")
+        OR match(uri_path, "(?i)^/(grafana|kibana|prometheus|nagios|cacti|zabbix|munin)")
+        OR match(uri_path, "(?i)^/(solr|elasticsearch|_cluster|_cat|_nodes)")
+        OR match(uri_path, "(?i)^/(console|jmx-console|web-console|invoker)")
+        OR match(uri_path, "(?i)^/(dashboard|control|panel|manage|backend|cms)")
+        OR match(uri_path, "(?i)^/(tomcat|axis2|struts|spring-boot)")
+    | eval panel_type=case(
+        match(uri_path, "(?i)(wp-admin|wp-login)"),                "WORDPRESS",
+        match(uri_path, "(?i)(phpmyadmin|pma|adminer)"),           "DATABASE_ADMIN",
+        match(uri_path, "(?i)(jenkins|hudson|bamboo|teamcity)"),   "CI_CD",
+        match(uri_path, "(?i)(grafana|kibana|prometheus|nagios)"), "MONITORING",
+        match(uri_path, "(?i)(solr|elasticsearch)"),               "SEARCH_ENGINE",
+        match(uri_path, "(?i)(jmx|web-console|invoker)"),         "JAVA_MANAGEMENT",
+        match(uri_path, "(?i)(tomcat|manager)"),                   "TOMCAT_MANAGER",
+        1==1,                                                       "GENERIC_ADMIN"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as probe_count,
+        dc(uri_path) as unique_admin_paths,
+        values(panel_type) as panel_types,
+        values(uri_path) as probed_paths,
+        values(status) as http_statuses,
+        count(eval(status="200")) as accessible_count
+        by src_ip
+    | where unique_admin_paths >= 5 OR accessible_count > 0
+    | eval severity=if(accessible_count > 0, "HIGH", "MEDIUM")
+    | eval mitre_technique="T1083"
+    | eval alert_name="Admin Panel Discovery"
+    | table first_seen, last_seen, src_ip, probe_count, unique_admin_paths,
+            panel_types, probed_paths, http_statuses, accessible_count,
+            severity, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "4h"
+  actions:
+    - notable_event:
+        rule_title: "Admin Panel Probing — $src_ip$ ($unique_admin_paths$ paths, $accessible_count$ accessible)"
+        severity: medium
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 68
+
+  known_false_positives:
+    - "Legitimate admin users accessing multiple management interfaces — correlate with known admin IPs"
+    - "Search engine bots discovering linked admin pages — check user-agent for legitimate crawlers"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: WordPress-Specific Enumeration (T1595.002)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  WordPress powers 40%+ of the web. WPScan and similar tools enumerate
+#  users via ?author=N, plugins via /wp-content/plugins/, themes, and
+#  WordPress REST API for user listing.
+#
+#  Confidence  : HIGH (86)
+#  Severity    : MEDIUM
+
+rule_6_wordpress_enumeration:
+  name: "Reconnaissance — WordPress User & Plugin Enumeration (T1595.002)"
+  description: >
+    Detects WordPress-specific enumeration techniques: author ID brute force
+    (?author=1, ?author=2...), plugin enumeration via /wp-content/plugins/,
+    theme enumeration, REST API user listing (/wp-json/wp/v2/users),
+    xmlrpc.php abuse, and wp-cron.php probing. WPScan is the most common
+    tool but this rule catches any tool performing these patterns.
+  mitre:
+    tactic: "Reconnaissance"
+    technique: T1595.002
+    technique_name: "Active Scanning: Vulnerability Scanning"
+  severity: medium
+  confidence: 86
+  risk_score: 62
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Apache Access Log (sourcetype=access_combined)"
+
+  search: |
+    index=web sourcetype=access_combined OR sourcetype=access_common
+    | rex field=_raw "^(?<src_ip>\S+)\s+\S+\s+\S+\s+\[(?<req_time>[^\]]+)\]\s+\"(?<http_method>\S+)\s+(?<uri_path>\S+)\s+\S+\"\s+(?<status>\d+)"
+    ``` WordPress enumeration patterns ```
+    | where match(uri_path, "(?i)\?author=\d")
+        OR match(uri_path, "(?i)/wp-json/wp/v2/users")
+        OR match(uri_path, "(?i)/wp-content/plugins/[^/]+/readme\.txt")
+        OR match(uri_path, "(?i)/wp-content/plugins/[^/]+/(changelog|license)")
+        OR match(uri_path, "(?i)/xmlrpc\.php")
+        OR match(uri_path, "(?i)/wp-cron\.php")
+        OR match(uri_path, "(?i)/wp-config\.php\.(bak|old|save|orig|txt)")
+        OR match(uri_path, "(?i)/wp-includes/(version|wlwmanifest)")
+    | eval enum_type=case(
+        match(uri_path, "(?i)\?author="),              "USER_ENUMERATION",
+        match(uri_path, "(?i)wp-json.*users"),         "REST_API_USER_ENUM",
+        match(uri_path, "(?i)plugins.*readme"),        "PLUGIN_ENUMERATION",
+        match(uri_path, "(?i)xmlrpc"),                 "XMLRPC_PROBE",
+        match(uri_path, "(?i)wp-config.*(bak|old)"),   "CONFIG_BACKUP_PROBE",
+        1==1,                                           "WP_ENUMERATION"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as enum_count,
+        dc(uri_path) as unique_paths,
+        values(enum_type) as enumeration_types,
+        values(status) as http_statuses
+        by src_ip
+    | where enum_count >= 5
+    | eval mitre_technique="T1595.002"
+    | eval alert_name="WordPress Enumeration"
+    | table first_seen, last_seen, src_ip, enum_count, unique_paths,
+            enumeration_types, http_statuses, mitre_technique, alert_name
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+  throttle:
+    field: "src_ip"
+    period: "4h"
+  actions:
+    - notable_event:
+        rule_title: "WP Enumeration — $src_ip$ ($enumeration_types$, $enum_count$ requests)"
+        severity: medium
+    - risk:
+        risk_object: "src_ip"
+        risk_object_type: "system"
+        risk_score: 62
+
+  known_false_positives:
+    - "Legitimate WordPress REST API consumers — exclude known API clients"
+    - "WPScan used by site administrators for self-assessment — add admin IPs to exclusion"
+    - "XML-RPC used by mobile apps and Jetpack — may generate high volume from legitimate sources"
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  - name: "IQ-1: Full attack chain from scanner IP"
+    description: "Trace all requests from a scanner to see what they found and what they tried to exploit"
+    search: |
+      index=web sourcetype=access_combined src_ip="$SCANNER_IP$" earliest=-24h latest=now
+      | rex field=_raw "\"(?<http_method>\S+)\s+(?<uri_path>\S+).*\"\s+(?<status>\d+)\s+(?<bytes>\S+)"
+      | eval phase=case(
+          match(uri_path, "(?i)(\.git|\.env|phpinfo|server-status|admin|backup)"), "RECON",
+          match(uri_path, "(?i)(union|select|sleep|<script|%27|%3c)"),             "EXPLOITATION",
+          match(uri_path, "(?i)(\.php\?cmd=|shell|upload)"),                        "POST_EXPLOIT",
+          1==1,                                                                     "NORMAL"
+        )
+      | table _time, http_method, uri_path, status, bytes, phase
+      | sort _time
+
+  - name: "IQ-2: Exposed sensitive files (HTTP 200 to sensitive paths)"
+    description: "Find sensitive files that are actually accessible — immediate remediation required"
+    search: |
+      index=web sourcetype=access_combined status=200 earliest=-7d latest=now
+        (uri_path="*.git/*" OR uri_path="*.env*" OR uri_path="*phpinfo*"
+         OR uri_path="*server-status*" OR uri_path="*.htpasswd*"
+         OR uri_path="*wp-config*" OR uri_path="*.bak" OR uri_path="*.sql*")
+      | rex field=_raw "^(?<src_ip>\S+).*\"(?<http_method>\S+)\s+(?<uri_path>\S+).*\"\s+\d+\s+(?<bytes>\S+)"
+      | stats count, dc(src_ip) as unique_accessors, values(src_ip) as accessor_ips by uri_path
+      | sort -count
+
+  - name: "IQ-3: Top scanners by volume over 30 days"
+    description: "Identify the most persistent scanners targeting your infrastructure"
+    search: |
+      index=web sourcetype=access_combined earliest=-30d latest=now
+      | rex field=_raw "^(?<src_ip>\S+).*\"[^\"]*\"\s*$"
+      | rex field=_raw "\"(?<user_agent>[^\"]+)\"\s*$"
+      | where match(user_agent, "(?i)(nikto|nmap|gobuster|ffuf|nuclei|wpscan|sqlmap|acunetix|burp|zap)")
+      | stats count as total_requests, dc(date_mday) as active_days, values(user_agent) as tools by src_ip
+      | iplocation src_ip
+      | sort -total_requests
+      | table src_ip, Country, total_requests, active_days, tools
+
+  - name: "IQ-4: WordPress exposed users via author enumeration or REST API"
+    description: "Check if WordPress user enumeration actually exposed usernames"
+    search: |
+      index=web sourcetype=access_combined status=200 earliest=-7d latest=now
+        (uri_path="*?author=*" OR uri_path="*wp-json/wp/v2/users*")
+      | rex field=_raw "^(?<src_ip>\S+).*\"(?<http_method>\S+)\s+(?<uri_path>\S+).*\"\s+(?<status>\d+)"
+      | stats count, dc(src_ip) as unique_sources by uri_path
+      | sort -count
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+response_playbook:
+  name: "Apache Reconnaissance Incident Response"
+  steps:
+    - step: 1
+      action: "Assess What Was Discovered"
+      details: >
+        Run IQ-2 to identify which sensitive files are actually exposed (HTTP
+        200). Prioritize: .git/HEAD (source code), .env (secrets), .htpasswd
+        (credentials), phpinfo.php (server details), backup files (data).
+        Any exposure = immediate remediation.
+
+    - step: 2
+      action: "Remove Exposed Sensitive Files"
+      details: >
+        Immediately restrict access to discovered sensitive files. Add Apache
+        directives: RedirectMatch 404 /\.git, RedirectMatch 404 /\.env.
+        Remove phpinfo.php, backup files, and database dumps. Disable
+        server-status and server-info if not needed internally.
+
+    - step: 3
+      action: "Determine if Exploitation Followed"
+      details: >
+        Run IQ-1 to trace the scanner IP's full request chain. Look for the
+        RECON -> EXPLOITATION -> POST_EXPLOIT progression. If exploitation
+        attempts followed reconnaissance, escalate to the appropriate
+        incident response playbook (SQLi, XSS, web shell, etc.).
+
+    - step: 4
+      action: "Harden Apache Against Reconnaissance"
+      details: >
+        Suppress Apache version in Server header: ServerTokens Prod.
+        Disable directory listing: Options -Indexes. Block common scanner
+        User-Agents with mod_security. Restrict HTTP methods to GET/POST/HEAD.
+        Disable TRACE method: TraceEnable Off.
+
+    - step: 5
+      action: "Deploy Proactive Monitoring"
+      details: >
+        Enable all 6 reconnaissance rules. Consider deploying a honeypot
+        directory (e.g., /admin-backup/) that alerts on any access as a
+        canary for active scanning. Block persistent scanner IPs at the
+        network edge or CDN.
