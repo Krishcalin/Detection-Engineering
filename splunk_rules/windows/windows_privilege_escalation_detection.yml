@@ -1,0 +1,945 @@
+# ==============================================================================
+#  Windows Privilege Escalation Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detection rules for Windows privilege escalation techniques
+#                including UAC bypass, token manipulation, process injection,
+#                DLL side-loading, potato exploits, accessibility features
+#                backdoors, and privilege abuse.
+#  MITRE ATT&CK: T1548.002, T1134.001, T1055.001, T1055.012, T1068,
+#                T1574.002, T1546.008, T1078.002
+#  Kill Chain   : Exploitation / Privilege Escalation
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-09
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Sysmon deployed with comprehensive configuration:
+#       - Event 1:  Process Creation
+#       - Event 7:  Image Loaded (DLL monitoring)
+#       - Event 8:  CreateRemoteThread
+#       - Event 10: Process Access (PROCESS_VM_WRITE, PROCESS_VM_READ)
+#       - Event 11: File Create
+#       - Event 13: Registry Value Set
+#
+#  2. Windows Security Audit Policy:
+#       - Audit Process Creation → Success (Event 4688 + command line)
+#       - Audit Special Logon → Success (Event 4672)
+#       - Audit Security Group Management (Events 4728, 4732)
+#       - Audit Logon → Success/Failure (Events 4624, 4625)
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1548.002 — UAC Bypass via Trusted Binaries
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_uac_bypass_trusted_binaries:
+  name: "UAC Bypass — Registry Hijack via Trusted Auto-Elevate Binaries"
+  description: >
+    Detects UAC bypass techniques that abuse trusted auto-elevating Windows
+    binaries (fodhelper.exe, eventvwr.exe, sdclt.exe, computerdefaults.exe,
+    cmstp.exe). Attackers modify HKCU registry keys (ms-settings, mscfile)
+    to redirect execution when these binaries run with elevated privileges
+    without triggering a UAC prompt. This is the most common privilege
+    escalation technique in modern malware and red team toolkits.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1548.002"
+    technique_name: "Abuse Elevation Control Mechanism: Bypass User Account Control"
+    related_techniques:
+      - "T1112: Modify Registry"
+      - "T1059.001: PowerShell"
+  severity: critical
+  confidence: 90
+  risk_score: 95
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Sysmon Event 13 (Registry Value Set)"
+    - "Sysmon Event 1 (Process Creation)"
+  prerequisites:
+    - "Sysmon installed with Registry Value Set and Process Creation logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    (
+        ```Stage 1: Registry key hijack for UAC bypass```
+        (EventCode=13 AND
+            (match(TargetObject, "(?i)\\\\ms-settings\\\\shell\\\\open\\\\command")
+             OR match(TargetObject, "(?i)\\\\mscfile\\\\shell\\\\open\\\\command")
+             OR match(TargetObject, "(?i)\\\\exefile\\\\shell\\\\open\\\\command")))
+        OR
+        ```Stage 2: Auto-elevate binary spawning unexpected children```
+        (EventCode=1 AND
+            match(ParentImage, "(?i)(fodhelper|eventvwr|sdclt|computerdefaults|cmstp)\.exe") AND
+            NOT match(Image, "(?i)(mmc\.exe|eventvwr\.msc|control\.exe)"))
+    )
+    | eval uac_stage=case(
+        EventCode==13, "Registry Hijack (Setup)",
+        EventCode==1, "Elevated Execution (Trigger)"
+      )
+    | eval bypass_method=case(
+        match(TargetObject, "(?i)ms-settings"), "fodhelper/computerdefaults UAC bypass",
+        match(TargetObject, "(?i)mscfile"), "eventvwr UAC bypass",
+        match(ParentImage, "(?i)fodhelper"), "fodhelper.exe auto-elevate",
+        match(ParentImage, "(?i)eventvwr"), "eventvwr.exe auto-elevate",
+        match(ParentImage, "(?i)sdclt"), "sdclt.exe auto-elevate",
+        match(ParentImage, "(?i)cmstp"), "cmstp.exe auto-elevate",
+        1==1, "UAC bypass variant"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(uac_stage) as stages_observed,
+        values(bypass_method) as methods,
+        values(CommandLine) as command_lines,
+        values(Details) as registry_values,
+        values(Image) as child_processes,
+        values(User) as users
+        by ComputerName
+    | eval mitre_technique="T1548.002"
+    | table first_seen, last_seen, ComputerName, methods, stages_observed,
+            child_processes, command_lines, registry_values, users,
+            event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "UAC Bypass — $methods$ on $ComputerName$"
+        rule_description: >
+          UAC bypass detected on $ComputerName$ via $methods$. Stages
+          observed: $stages_observed$. The attacker is escalating from
+          standard user to admin without triggering UAC. Immediate response.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog ComputerName="$ComputerName$"
+          ((EventCode=13 AND match(TargetObject, "(?i)(ms-settings|mscfile)"))
+           OR (EventCode=1 AND match(ParentImage, "(?i)(fodhelper|eventvwr|sdclt)")))
+          | sort -_time | table _time, EventCode, Image, CommandLine, TargetObject, Details
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 95
+
+  known_false_positives:
+    - "None expected — these registry paths should never be modified legitimately"
+
+  tuning_guidance: |
+    1. This rule has near-zero false positives — no tuning typically needed
+    2. ms-settings registry modification is a definitive UAC bypass indicator
+    3. Auto-elevate binaries spawning cmd/PowerShell is always malicious
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1134.001 — Access Token Manipulation / Token Impersonation
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_token_impersonation:
+  name: "Token Impersonation — Suspicious Privilege Assignment"
+  description: >
+    Detects potential token impersonation by monitoring for Event 4672
+    (Special Privileges Assigned to New Logon) from unexpected accounts
+    or processes. Adversaries steal or duplicate access tokens from
+    privileged processes to escalate privileges. Tools like Incognito,
+    Mimikatz, and Cobalt Strike use token manipulation extensively.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1134.001"
+    technique_name: "Access Token Manipulation: Token Impersonation/Theft"
+    related_techniques:
+      - "T1134.002: Create Process with Token"
+  severity: high
+  confidence: 75
+  risk_score: 80
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Windows Security Event Log (Event ID 4672)"
+    - "Windows Security Event Log (Event ID 4624)"
+  prerequisites:
+    - "Audit Special Logon → Success enabled"
+    - "Audit Logon → Success enabled"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4672
+    ```Focus on SeImpersonatePrivilege and SeAssignPrimaryTokenPrivilege```
+    | where match(Privileges, "(?i)(SeImpersonatePrivilege|SeAssignPrimaryTokenPrivilege|SeDebugPrivilege)")
+    ```Exclude expected SYSTEM and service accounts```
+    | where NOT match(Security_ID, "^S-1-5-(18|19|20)$")
+        AND NOT match(Account_Name, "(?i)^(SYSTEM|LOCAL SERVICE|NETWORK SERVICE|DWM-|UMFD-)"))
+    ```Correlate with logon events for context```
+    | join type=left Logon_ID
+        [search index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4624
+         | fields Logon_ID, Source_Network_Address, Logon_Type, Logon_Process]
+    | eval privilege_risk=case(
+        match(Privileges, "SeDebugPrivilege"), "CRITICAL — Debug Privilege",
+        match(Privileges, "SeImpersonatePrivilege") AND Logon_Type!="5", "HIGH — Impersonate from non-service",
+        1==1, "MEDIUM"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(Privileges) as privileges_assigned,
+        values(Logon_Type) as logon_types,
+        values(Source_Network_Address) as source_ips
+        by ComputerName, Account_Name, Account_Domain, privilege_risk
+    | eval mitre_technique="T1134.001"
+    | table first_seen, last_seen, ComputerName, Account_Name, Account_Domain,
+            privilege_risk, privileges_assigned, logon_types, source_ips,
+            event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "Account_Name"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Token Impersonation — $privilege_risk$ by $Account_Name$ on $ComputerName$"
+        rule_description: >
+          Suspicious privilege assignment to $Account_Name$ on $ComputerName$.
+          Privileges: $privileges_assigned$. This may indicate token theft
+          or impersonation attack.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode IN (4672, 4624) ComputerName="$ComputerName$"
+          Account_Name="$Account_Name$"
+          | sort -_time | table _time, EventCode, Account_Name, Privileges, Logon_Type
+    - risk:
+        risk_object: "Account_Name"
+        risk_object_type: "user"
+        risk_score: 80
+
+  known_false_positives:
+    - "Scheduled tasks running as specific service accounts"
+    - "IIS application pool identities with SeImpersonatePrivilege"
+
+  tuning_guidance: |
+    1. SeDebugPrivilege for non-admin accounts is always critical
+    2. SeImpersonatePrivilege is normal for service accounts (Logon_Type 5)
+    3. Build an allowlist of accounts with expected SeImpersonate usage
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1055.001 — DLL Injection via CreateRemoteThread
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_dll_injection_remote_thread:
+  name: "DLL Injection — CreateRemoteThread into High-Value Process"
+  description: >
+    Detects classic DLL injection via CreateRemoteThread targeting high-value
+    processes (lsass.exe, services.exe, winlogon.exe, csrss.exe, svchost.exe).
+    Sysmon Event 8 captures CreateRemoteThread events. This technique is
+    used by credential dumpers, rootkits, and process injection frameworks.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1055.001"
+    technique_name: "Process Injection: Dynamic-link Library Injection"
+    related_techniques:
+      - "T1055.003: Thread Execution Hijacking"
+      - "T1003.001: LSASS Memory"
+  severity: critical
+  confidence: 85
+  risk_score: 90
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Sysmon Event 8 (CreateRemoteThread)"
+    - "Sysmon Event 10 (Process Access)"
+  prerequisites:
+    - "Sysmon installed with CreateRemoteThread (Event 8) and ProcessAccess (Event 10) logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=8
+    ```Remote thread created in high-value targets```
+    | where match(TargetImage, "(?i)(lsass|services|winlogon|csrss|svchost|spoolsv|wininit|smss)\.exe")
+    ```Exclude known legitimate sources```
+    | where NOT match(SourceImage, "(?i)(csrss|lsass|services|svchost|wininit|smss|MsMpEng|NisSrv)\.exe")
+        AND NOT match(SourceImage, "(?i)\\\\Program Files.*\\\\(CrowdStrike|SentinelOne|Carbon Black|Defender)")
+    | eval target_criticality=case(
+        match(TargetImage, "(?i)lsass\.exe"), "CRITICAL — Credential Store",
+        match(TargetImage, "(?i)winlogon\.exe"), "CRITICAL — Logon Process",
+        match(TargetImage, "(?i)services\.exe"), "HIGH — Service Control Manager",
+        match(TargetImage, "(?i)csrss\.exe"), "HIGH — Client/Server Runtime",
+        1==1, "MEDIUM — System Process"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as injection_count,
+        values(StartFunction) as start_functions,
+        values(User) as users
+        by ComputerName, SourceImage, TargetImage, target_criticality
+    | eval mitre_technique="T1055.001"
+    | table first_seen, last_seen, ComputerName, SourceImage, TargetImage,
+            target_criticality, start_functions, users, injection_count,
+            mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "30m"
+
+  actions:
+    - notable_event:
+        rule_title: "DLL Injection — $SourceImage$ → $TargetImage$ on $ComputerName$"
+        rule_description: >
+          CreateRemoteThread detected from $SourceImage$ targeting
+          $TargetImage$ ($target_criticality$) on $ComputerName$.
+          This is a strong indicator of process injection. Immediate response.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog EventCode IN (8, 10) ComputerName="$ComputerName$"
+          (SourceImage="$SourceImage$" OR TargetImage="$TargetImage$")
+          | sort -_time | table _time, EventCode, SourceImage, TargetImage, StartFunction
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "EDR/AV agents injecting into processes for monitoring"
+    - "Application compatibility shims"
+
+  tuning_guidance: |
+    1. Exclude your EDR vendor's processes from SourceImage
+    2. Injection into lsass.exe is always critical — credential theft
+    3. Any non-security tool injecting into system processes is suspicious
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1055.012 — Process Hollowing Detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_process_hollowing:
+  name: "Process Hollowing — Suspicious Memory Access to Spawned Process"
+  description: >
+    Detects process hollowing by identifying processes that access other
+    processes with write permissions (PROCESS_VM_WRITE + PROCESS_VM_OPERATION)
+    shortly after creation. Process hollowing creates a legitimate process in
+    suspended state, hollows out its memory, and replaces it with malicious code.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1055.012"
+    technique_name: "Process Injection: Process Hollowing"
+    related_techniques:
+      - "T1055.001: DLL Injection"
+      - "T1036.005: Masquerading"
+  severity: critical
+  confidence: 80
+  risk_score: 90
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Sysmon Event 10 (Process Access)"
+    - "Sysmon Event 1 (Process Creation)"
+  prerequisites:
+    - "Sysmon installed with ProcessAccess (Event 10) logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=10
+    ```Detect PROCESS_VM_WRITE access to other processes```
+    | where match(GrantedAccess, "(?i)(0x1FFFFF|0x1F0FFF|0x0820|0x0800|0x20)")
+    ```Source process writing to target process memory```
+    | where SourceImage!=TargetImage
+    ```Exclude known legitimate callers```
+    | where NOT match(SourceImage, "(?i)(MsMpEng|csrss|lsass|services|svchost|taskhostw|RuntimeBroker)")
+        AND NOT match(SourceImage, "(?i)\\\\Program Files.*\\\\(CrowdStrike|SentinelOne|Carbon Black)")
+    ```Focus on writes to system-looking processes (hollowing targets)```
+    | where match(TargetImage, "(?i)(svchost|explorer|RuntimeBroker|dllhost|conhost|notepad|calc)\.exe")
+    | eval hollowing_confidence=case(
+        match(GrantedAccess, "0x1FFFFF"), "HIGH — Full Access (PROCESS_ALL_ACCESS)",
+        match(GrantedAccess, "0x1F0FFF"), "HIGH — Legacy Full Access",
+        1==1, "MEDIUM — Partial Write Access"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as access_count,
+        values(GrantedAccess) as access_masks,
+        values(User) as users
+        by ComputerName, SourceImage, TargetImage, hollowing_confidence
+    | eval mitre_technique="T1055.012"
+    | table first_seen, last_seen, ComputerName, SourceImage, TargetImage,
+            hollowing_confidence, access_masks, users, access_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Process Hollowing — $SourceImage$ → $TargetImage$ on $ComputerName$"
+        rule_description: >
+          Suspicious memory write access from $SourceImage$ to $TargetImage$
+          on $ComputerName$. Confidence: $hollowing_confidence$. This pattern
+          indicates process hollowing. The target process may be executing
+          attacker code while appearing as a legitimate process.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog EventCode IN (1, 10) ComputerName="$ComputerName$"
+          (SourceImage="$SourceImage$" OR Image="$SourceImage$")
+          | sort -_time | table _time, EventCode, SourceImage, TargetImage, GrantedAccess, CommandLine
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "EDR/AV scanning process memory"
+    - "Debugging tools (Visual Studio, WinDbg)"
+
+  tuning_guidance: |
+    1. Exclude EDR vendor SourceImage processes
+    2. PROCESS_ALL_ACCESS (0x1FFFFF) to svchost.exe is very suspicious
+    3. Correlate with Event 1 to check if target was created suspended
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1068 — Potato Exploits (SeImpersonate Abuse)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_potato_exploits:
+  name: "Potato Exploit — SeImpersonatePrivilege Abuse for SYSTEM"
+  description: >
+    Detects known potato exploit variants (JuicyPotato, PrintSpoofer,
+    GodPotato, SweetPotato, RottenPotato, RoguePotato) that abuse
+    SeImpersonatePrivilege from service accounts to escalate to SYSTEM.
+    These exploits are the most common local privilege escalation method
+    on Windows servers.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1068"
+    technique_name: "Exploitation for Privilege Escalation"
+    related_techniques:
+      - "T1134.001: Token Impersonation"
+  severity: critical
+  confidence: 85
+  risk_score: 95
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Windows Security Event Log (Event ID 4688)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+    - "Command-line auditing enabled"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    | where
+        ```Known potato exploit binary names```
+        match(Image, "(?i)(JuicyPotato|PrintSpoofer|GodPotato|SweetPotato|RottenPotato|RoguePotato|SharpEfsPotato|GenericPotato)")
+        OR match(CommandLine, "(?i)(JuicyPotato|PrintSpoofer|GodPotato|SweetPotato|RottenPotato|RoguePotato)")
+        OR
+        ```Potato exploit command-line patterns```
+        (match(CommandLine, "(?i)\-l\s+\d+.*\-p\s+") AND match(CommandLine, "(?i)\-t\s+\*"))
+        OR
+        ```PrintSpoofer pattern```
+        (match(CommandLine, "(?i)printspoofer") AND match(CommandLine, "(?i)\-[ic]"))
+        OR
+        ```Service account spawning cmd/PowerShell as SYSTEM after token manipulation```
+        (match(ParentImage, "(?i)(w3wp|sqlservr|vmtoolsd|tomcat|java|iis)\.exe")
+         AND (Image="*\\cmd.exe" OR Image="*\\powershell.exe")
+         AND User=="SYSTEM"
+         AND match(IntegrityLevel, "(?i)System"))
+    | eval exploit_type=case(
+        match(Image, "(?i)JuicyPotato"), "JuicyPotato",
+        match(Image, "(?i)PrintSpoofer"), "PrintSpoofer",
+        match(Image, "(?i)GodPotato"), "GodPotato",
+        match(Image, "(?i)SweetPotato"), "SweetPotato",
+        match(CommandLine, "(?i)\-t\s+\*"), "Potato variant (CLSID abuse)",
+        1==1, "Service-to-SYSTEM escalation"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(CommandLine) as command_lines,
+        values(ParentImage) as parent_processes,
+        values(User) as users
+        by ComputerName, Image, exploit_type
+    | eval mitre_technique="T1068"
+    | table first_seen, last_seen, ComputerName, exploit_type, Image,
+            parent_processes, command_lines, users, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "30m"
+
+  actions:
+    - notable_event:
+        rule_title: "Potato Exploit — $exploit_type$ on $ComputerName$"
+        rule_description: >
+          Potato-family privilege escalation ($exploit_type$) detected on
+          $ComputerName$. Parent: $parent_processes$. The attacker has
+          escalated from service account to SYSTEM. Critical response required.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          earliest="-1h" latest="now"
+          | sort -_time | table _time, Image, CommandLine, ParentImage, User, IntegrityLevel
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 95
+
+  known_false_positives:
+    - "None expected — potato exploit names are specific to attack tools"
+
+  tuning_guidance: |
+    1. No false positives expected — all potato tool names are malicious
+    2. Service-to-SYSTEM escalation from web servers requires investigation
+    3. Monitor for the IIS/SQL/Tomcat → cmd/PowerShell as SYSTEM pattern
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1574.002 — DLL Side-Loading
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_dll_side_loading:
+  name: "DLL Side-Loading — Unsigned DLL Loaded by Signed Binary"
+  description: >
+    Detects legitimate signed executables loading unsigned or unexpected
+    DLLs, indicating DLL side-loading. Adversaries place malicious DLLs
+    alongside legitimate applications that load them via their import table.
+    Common targets include vmtoolsd.exe, teams.exe, and other applications
+    with known side-loadable DLLs.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1574.002"
+    technique_name: "Hijack Execution Flow: DLL Side-Loading"
+    related_techniques:
+      - "T1574.001: DLL Search Order Hijacking"
+  severity: high
+  confidence: 75
+  risk_score: 80
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Sysmon Event 7 (Image Loaded)"
+  prerequisites:
+    - "Sysmon installed with Image Loaded (Event 7) logging with signature verification"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=7
+        Signed="false"
+    ```Focus on DLLs loaded by signed system/app binaries```
+    | where NOT match(ImageLoaded, "(?i)\\\\Windows\\\\(System32|SysWOW64|WinSxS)")
+        AND NOT match(ImageLoaded, "(?i)\\\\Program Files")
+    ```Loading process should be a signed legitimate binary```
+    | where match(Image, "(?i)\\\\Program Files") OR match(Image, "(?i)\\\\Windows\\\\")
+    | eval loading_app=replace(Image, ".*\\\\", "")
+    | eval loaded_dll=replace(ImageLoaded, ".*\\\\", "")
+    | eval load_directory=replace(ImageLoaded, "\\\\[^\\\\]+$", "")
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as load_count,
+        values(load_directory) as dll_locations,
+        values(User) as users
+        by ComputerName, Image, loading_app, loaded_dll, ImageLoaded
+    | eval mitre_technique="T1574.002"
+    | table first_seen, last_seen, ComputerName, loading_app, loaded_dll,
+            ImageLoaded, dll_locations, users, load_count, mitre_technique
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+
+  throttle:
+    field: "ComputerName"
+    period: "2h"
+
+  actions:
+    - notable_event:
+        rule_title: "DLL Side-Load — $loading_app$ loaded unsigned $loaded_dll$ on $ComputerName$"
+        rule_description: >
+          Signed binary $loading_app$ loaded unsigned DLL $loaded_dll$ from
+          $dll_locations$ on $ComputerName$. This may indicate DLL side-loading.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=7 ComputerName="$ComputerName$"
+          Image="$Image$"
+          | sort -_time | table _time, Image, ImageLoaded, Signed, Signature
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "Applications loading their own unsigned plugin DLLs"
+    - "Development tools with unsigned extension modules"
+
+  tuning_guidance: |
+    1. Build baseline of unsigned DLLs loaded by each application
+    2. Focus on DLLs loaded from Temp/AppData/Downloads directories
+    3. Cross-reference DLL hash with threat intelligence
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1546.008 — Accessibility Features Backdoor (Sticky Keys)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_accessibility_features_backdoor:
+  name: "Accessibility Features Backdoor — Sticky Keys / Utilman Replacement"
+  description: >
+    Detects replacement or debugger registration for Windows accessibility
+    binaries (sethc.exe, utilman.exe, osk.exe, narrator.exe, magnify.exe).
+    Attackers replace these binaries or register Image File Execution Options
+    debuggers so pressing Shift 5x at the logon screen launches cmd.exe
+    with SYSTEM privileges — without authentication.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1546.008"
+    technique_name: "Event Triggered Execution: Accessibility Features"
+    related_techniques:
+      - "T1112: Modify Registry"
+  severity: critical
+  confidence: 95
+  risk_score: 95
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Sysmon Event 13 (Registry Value Set)"
+    - "Sysmon Event 11 (File Create)"
+    - "Windows Security Event Log (Event ID 4688)"
+  prerequisites:
+    - "Sysmon installed with Registry and File Create event logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    (
+        ```IFEO debugger registration for accessibility binaries```
+        (EventCode=13 AND
+            match(TargetObject, "(?i)Image File Execution Options\\\\(sethc|utilman|osk|narrator|magnify|DisplaySwitch|AtBroker)\.exe\\\\Debugger"))
+        OR
+        ```File replacement of accessibility binaries```
+        (EventCode=11 AND
+            match(TargetFilename, "(?i)\\\\Windows\\\\System32\\\\(sethc|utilman|osk|narrator|magnify)\.exe"))
+        OR
+        ```Accessibility binary spawning cmd/PowerShell (exploitation)```
+        (EventCode=1 AND
+            match(ParentImage, "(?i)(sethc|utilman|osk|narrator|magnify)\.exe") AND
+            (Image="*\\cmd.exe" OR Image="*\\powershell.exe"))
+    )
+    | eval backdoor_type=case(
+        EventCode==13, "IFEO Debugger Registration",
+        EventCode==11, "Binary Replacement",
+        EventCode==1, "Backdoor Execution (Active Exploitation)"
+      )
+    | eval target_binary=case(
+        match(TargetObject, "(?i)sethc") OR match(TargetFilename, "(?i)sethc") OR match(ParentImage, "(?i)sethc"), "sethc.exe (Sticky Keys)",
+        match(TargetObject, "(?i)utilman") OR match(TargetFilename, "(?i)utilman") OR match(ParentImage, "(?i)utilman"), "utilman.exe (Utility Manager)",
+        match(TargetObject, "(?i)osk") OR match(TargetFilename, "(?i)osk") OR match(ParentImage, "(?i)osk"), "osk.exe (On-Screen Keyboard)",
+        match(TargetObject, "(?i)narrator") OR match(TargetFilename, "(?i)narrator") OR match(ParentImage, "(?i)narrator"), "narrator.exe",
+        1==1, "Accessibility Binary"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(backdoor_type) as backdoor_types,
+        values(Details) as debugger_values,
+        values(Image) as child_processes,
+        values(User) as users
+        by ComputerName, target_binary
+    | eval mitre_technique="T1546.008"
+    | table first_seen, last_seen, ComputerName, target_binary, backdoor_types,
+            debugger_values, child_processes, users, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Accessibility Backdoor — $target_binary$ on $ComputerName$"
+        rule_description: >
+          Accessibility features backdoor detected on $ComputerName$.
+          Target: $target_binary$, Type: $backdoor_types$. This provides
+          unauthenticated SYSTEM access at the logon screen. CRITICAL.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog ComputerName="$ComputerName$"
+          (match(TargetObject, "(?i)(sethc|utilman|osk|narrator|magnify)")
+           OR match(TargetFilename, "(?i)(sethc|utilman|osk|narrator|magnify)")
+           OR match(ParentImage, "(?i)(sethc|utilman|osk|narrator|magnify)"))
+          | sort -_time | table _time, EventCode, TargetObject, TargetFilename, Details, Image
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 95
+
+  known_false_positives:
+    - "None — IFEO debugger on accessibility binaries is never legitimate"
+
+  tuning_guidance: |
+    1. Zero false positives expected — this is always an attack
+    2. IFEO debugger on sethc.exe = Sticky Keys backdoor (classic RDP persistence)
+    3. If backdoor execution is detected, the attacker has physical/RDP access
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1078.002 — Privilege Abuse via Newly Granted Admin Rights
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_privilege_abuse_new_admin:
+  name: "Privilege Abuse — New Admin Group Member Followed by Suspicious Activity"
+  description: >
+    Detects when a user is added to a privileged group (Domain Admins,
+    Administrators, Backup Operators, etc.) via Events 4728/4732 and then
+    performs suspicious activity (RDP logon, special privilege assignment)
+    within a short time window. This catches insider threats and compromised
+    account escalation.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1078.002"
+    technique_name: "Valid Accounts: Domain Accounts"
+    related_techniques:
+      - "T1098: Account Manipulation"
+  severity: high
+  confidence: 80
+  risk_score: 85
+  kill_chain_phase: "Exploitation"
+  data_sources:
+    - "Windows Security Event Log (Events 4728, 4732, 4624, 4672)"
+  prerequisites:
+    - "Audit Security Group Management enabled"
+    - "Audit Logon and Special Logon enabled"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode IN (4728, 4732)
+    ```User added to privileged local or domain group```
+    | where match(Group_Name, "(?i)(Administrators|Domain Admins|Enterprise Admins|Schema Admins|Backup Operators|Account Operators|Server Operators)")
+    | rename Member_Name as escalated_user, Subject_Account_Name as added_by
+    | eval group_scope=if(EventCode==4728, "Domain Group", "Local Group")
+    ```Join with subsequent logon/privilege events within 2 hours```
+    | join type=left escalated_user
+        [search index=wineventlog sourcetype="XmlWinEventLog:Security"
+             EventCode IN (4624, 4672)
+             earliest="-2h" latest="now"
+         | rename Target_User_Name as escalated_user
+         | stats count as post_escalation_events,
+                 values(Logon_Type) as logon_types,
+                 values(Source_Network_Address) as source_ips,
+                 dc(ComputerName) as hosts_accessed
+                 by escalated_user]
+    | where post_escalation_events > 0
+    | eval abuse_risk=case(
+        hosts_accessed > 3, "HIGH — Lateral movement detected",
+        match(logon_types, "10"), "HIGH — RDP access after escalation",
+        post_escalation_events > 10, "MEDIUM — Active use of new privileges",
+        1==1, "MEDIUM — Privilege use detected"
+      )
+    | stats
+        min(_time) as group_add_time,
+        values(Group_Name) as groups,
+        values(added_by) as added_by_users,
+        values(logon_types) as logon_types,
+        values(source_ips) as source_ips,
+        values(abuse_risk) as risk_indicators
+        by escalated_user, ComputerName, group_scope
+    | eval mitre_technique="T1078.002"
+    | table group_add_time, ComputerName, escalated_user, groups, group_scope,
+            added_by_users, logon_types, source_ips, risk_indicators, mitre_technique
+
+  schedule:
+    cron: "*/15 * * * *"
+    earliest: "-2h"
+    latest: "now"
+    window: "15m"
+
+  throttle:
+    field: "escalated_user"
+    period: "4h"
+
+  actions:
+    - notable_event:
+        rule_title: "Privilege Abuse — $escalated_user$ added to $groups$ and active"
+        rule_description: >
+          $escalated_user$ was added to $groups$ by $added_by_users$ and
+          subsequently accessed $source_ips$ systems. Risk: $risk_indicators$.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode IN (4728, 4732, 4624, 4672)
+          (Member_Name="$escalated_user$" OR Target_User_Name="$escalated_user$")
+          | sort -_time | table _time, EventCode, ComputerName, Logon_Type, Source_Network_Address
+    - risk:
+        risk_object: "escalated_user"
+        risk_object_type: "user"
+        risk_score: 85
+
+  known_false_positives:
+    - "Planned admin privilege grants with immediate use (change management)"
+    - "New employee onboarding with admin access"
+
+  tuning_guidance: |
+    1. Correlate with change management tickets for planned privilege grants
+    2. Focus on unplanned group additions followed by RDP/remote access
+    3. Domain Admins additions should always trigger investigation
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  query_1_uac_registry_timeline:
+    name: "UAC bypass registry modifications timeline"
+    description: >
+      Track all registry modifications related to UAC bypass techniques.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=13 ComputerName="<INSERT_HOST>"
+          earliest="-24h" latest="now"
+      | where match(TargetObject, "(?i)(ms-settings|mscfile|exefile)\\\\shell\\\\open")
+      | sort _time
+      | table _time, Image, TargetObject, Details, User
+
+  query_2_process_injection_targets:
+    name: "All process injection events targeting system processes"
+    description: >
+      Identify all CreateRemoteThread and suspicious ProcessAccess events.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode IN (8, 10) ComputerName="<INSERT_HOST>"
+          earliest="-24h" latest="now"
+      | where match(TargetImage, "(?i)(lsass|services|winlogon|csrss|svchost)")
+      | stats count by SourceImage, TargetImage, EventCode, GrantedAccess
+      | sort -count
+      | table SourceImage, TargetImage, EventCode, GrantedAccess, count
+
+  query_3_privilege_escalation_chain:
+    name: "Full escalation chain for a user"
+    description: >
+      Trace privilege escalation from initial logon to admin activity.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode IN (4624, 4672, 4728, 4732, 4688)
+          (Target_User_Name="<INSERT_USER>" OR Member_Name="<INSERT_USER>"
+           OR Account_Name="<INSERT_USER>")
+          earliest="-48h" latest="now"
+      | sort _time
+      | table _time, EventCode, ComputerName, Account_Name, Privileges,
+              Group_Name, Logon_Type, Source_Network_Address
+
+  query_4_ifeo_debugger_audit:
+    name: "Audit all Image File Execution Options debuggers"
+    description: >
+      Fleet-wide check for IFEO debugger registrations.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=13 earliest="-30d" latest="now"
+      | where match(TargetObject, "(?i)Image File Execution Options.*Debugger")
+      | stats count, dc(ComputerName) as host_count, values(ComputerName) as hosts
+              by TargetObject, Details
+      | sort -count
+      | table TargetObject, Details, host_count, count, hosts
+
+  query_5_service_account_system_shells:
+    name: "Service accounts spawning SYSTEM shells"
+    description: >
+      Detect service-to-SYSTEM escalation patterns (potato exploits).
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=1 User="NT AUTHORITY\\SYSTEM"
+          earliest="-7d" latest="now"
+      | where match(ParentImage, "(?i)(w3wp|sqlservr|tomcat|java|vmtoolsd)")
+      | stats count, values(CommandLine) as commands
+              by ComputerName, ParentImage, Image
+      | sort -count
+      | table ComputerName, ParentImage, Image, commands, count
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+response_playbook:
+  name: "Windows Privilege Escalation — Incident Response Procedure"
+  description: >
+    Response procedure for confirmed privilege escalation on a Windows endpoint.
+
+  immediate_actions:
+    - step: 1
+      action: "Contain the affected host"
+      detail: >
+        Network-isolate the host via EDR. The attacker now has elevated
+        privileges and can move laterally. Speed is critical.
+
+    - step: 2
+      action: "Identify the escalation method"
+      detail: >
+        Determine if escalation was via UAC bypass, token manipulation,
+        process injection, potato exploit, or accessibility backdoor.
+        Each method implies different attacker capability and access level.
+
+    - step: 3
+      action: "Revoke escalated privileges"
+      detail: >
+        If group membership was modified: Remove the account from
+        privileged groups immediately. If token-based: Kill all
+        processes running under the stolen token.
+
+    - step: 4
+      action: "Check for persistence"
+      detail: >
+        After escalation, attackers typically install persistence.
+        Check all persistence mechanisms: Run keys, services, tasks,
+        WMI subscriptions, accessibility backdoors, IFEO debuggers.
+
+    - step: 5
+      action: "Assess lateral movement"
+      detail: >
+        Check 4624 type 3/10 events from the compromised host.
+        The attacker may have used elevated privileges to access
+        other systems, especially Domain Controllers.
+
+  forensic_actions:
+    - "Collect memory dump — may contain injected code"
+    - "Check for credential dumping (lsass access events)"
+    - "Analyze all processes spawned after escalation timestamp"
+    - "Review network connections from host post-escalation"
+    - "Check if Domain Admin or Enterprise Admin was obtained"
+    - "Determine if Active Directory was compromised"

@@ -1,0 +1,751 @@
+# ==============================================================================
+#  Windows Lateral Movement Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for Windows lateral movement techniques
+#                used by adversaries to move through a network after initial
+#                compromise. Covers PsExec/SMB tools, RDP, WinRM, DCOM,
+#                remote service/task creation, tool transfer, WMI remote
+#                execution, and Pass-the-Ticket attacks.
+#  MITRE ATT&CK: T1021.002, T1021.001, T1021.006, T1021.003, T1570,
+#                T1047, T1550.002, T1550.003
+#  Kill Chain   : Lateral Movement
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-09
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES (must be configured BEFORE these rules will generate detections):
+#
+#  1. Sysmon deployed on all Windows endpoints with a comprehensive config
+#     (e.g., SwiftOnSecurity or Olaf Hartong sysmon-modular):
+#       - Event 1:  Process Creation (Image, CommandLine, ParentImage)
+#       - Event 3:  Network Connection (DestinationIp, DestinationPort)
+#       - Event 7:  Image Loaded (ImageLoaded, Signed, Signature)
+#       - Event 11: File Create (TargetFilename)
+#       - Event 17/18: Pipe Created/Connected (PipeName)
+#
+#  2. Windows Security Audit Policy:
+#       - Audit Process Creation → Success (Event 4688)
+#       - Audit Logon Events → Success/Failure (Event 4624, 4625)
+#       - Audit Object Access → Success (Event 5140, 5145)
+#       - Audit Kerberos → Success (Event 4768, 4769)
+#       - Audit Service Install → (Event 7045)
+#
+#  3. Log forwarding to Splunk via Universal Forwarder:
+#       sourcetype=XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+#       sourcetype=XmlWinEventLog:Security
+#       sourcetype=WinEventLog:System
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1021.002 — PsExec / SMB Remote Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_psexec_smb_remote_execution:
+  name: "PsExec / SMB-based Remote Execution"
+  description: >
+    Detects PsExec and similar SMB-based remote execution tools by correlating
+    named pipe creation (Sysmon 17/18) with the distinctive PSEXESVC service
+    installation (System 7045) and network SMB connections on port 445. Covers
+    Sysinternals PsExec, Impacket smbexec/psexec, PAExec, and CSExec variants.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: "T1021.002"
+    technique_name: "Remote Services: SMB/Windows Admin Shares"
+  severity: HIGH
+  confidence: 85
+  risk_score: 78
+  search: |
+    (index=sysmon EventCode=17 PipeName IN ("\\PSEXESVC*", "\\RemCom*", "\\PAExec*", "\\csexec*", "\\svcctl"))
+    OR
+    (index=wineventlog source="WinEventLog:System" EventCode=7045
+     (ServiceName IN ("PSEXESVC", "RemComSvc", "PAExec*", "csexec*")
+      OR ImagePath="*ADMIN$*" OR ImagePath="*\\cmd.exe*"))
+    OR
+    (index=sysmon EventCode=1
+     (Image="*\\PsExec.exe" OR Image="*\\PsExec64.exe"
+      OR Image="*\\PAExec.exe" OR Image="*\\csexec.exe"
+      OR (Image="*\\cmd.exe" ParentImage="*\\services.exe")))
+    | eval activity=case(
+        EventCode==17, "named_pipe_created",
+        EventCode==7045, "service_installed",
+        EventCode==1, "process_execution")
+    | stats
+        min(_time)       as first_seen,
+        max(_time)       as last_seen,
+        dc(activity)     as activity_types,
+        values(activity) as activities,
+        values(PipeName) as pipes,
+        values(ServiceName) as services,
+        values(Image)    as processes,
+        values(User)     as users
+        by Computer
+    | where activity_types >= 2
+    | eval risk=if(activity_types>=3, "CRITICAL", "HIGH")
+    | table Computer, first_seen, last_seen, risk, activities, pipes, services, processes, users
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "PsExec/SMB Remote Execution — $Computer$"
+        severity: high
+        drilldown_search: 'index=sysmon OR index=wineventlog Computer="$Computer$" (PipeName="*PSEXE*" OR ServiceName="PSEXESVC" OR Image="*PsExec*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 78
+  known_false_positives:
+    - "Legitimate PsExec usage by IT administrators for remote maintenance"
+    - "Deployment tools that use SMB admin shares (SCCM, PDQ Deploy)"
+  tuning_guidance: >
+    Maintain a lookup of authorized admin tools and workstations. Filter by
+    creating an allowlist lookup: | lookup authorized_remote_admin tool, src_host
+    OUTPUT allowed | where NOT allowed="true"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1021.001 — Suspicious RDP Activity
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_suspicious_rdp_activity:
+  name: "Suspicious RDP Lateral Movement"
+  description: >
+    Detects anomalous RDP activity indicative of lateral movement by identifying
+    Type 10 (RemoteInteractive) logons from internal hosts, RDP connections from
+    non-standard source hosts, and RDP sessions followed by immediate process
+    execution. Correlates Security 4624 with Sysmon network connections.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: "T1021.001"
+    technique_name: "Remote Services: Remote Desktop Protocol"
+  severity: MEDIUM
+  confidence: 70
+  risk_score: 55
+  search: |
+    index=wineventlog source="WinEventLog:Security" EventCode=4624 Logon_Type=10
+    | eval src_ip=Source_Network_Address
+    | where NOT cidrmatch("127.0.0.0/8", src_ip)
+    | stats
+        count                as rdp_sessions,
+        dc(src_ip)           as unique_sources,
+        values(src_ip)       as source_ips,
+        earliest(_time)      as first_logon,
+        latest(_time)        as last_logon,
+        values(Account_Name) as accounts
+        by Computer
+    | where rdp_sessions > 3 OR unique_sources > 2
+    | eval time_window=last_logon - first_logon
+    | where time_window < 3600
+    | eval risk=case(
+        rdp_sessions > 10 AND unique_sources > 3, "HIGH",
+        rdp_sessions > 5, "MEDIUM",
+        1==1, "LOW")
+    | table Computer, rdp_sessions, unique_sources, source_ips, accounts, first_logon, last_logon, risk
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-12m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Suspicious RDP Lateral Movement — $Computer$"
+        severity: medium
+        drilldown_search: 'index=wineventlog EventCode=4624 Logon_Type=10 Computer="$Computer$"'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 55
+  known_false_positives:
+    - "IT helpdesk staff using RDP for legitimate remote support"
+    - "Jump servers with high RDP session counts"
+  tuning_guidance: >
+    Exclude known jump servers and IT admin workstations via lookup.
+    Adjust rdp_sessions and unique_sources thresholds for your environment.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1021.006 — WinRM Remote Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_winrm_remote_execution:
+  name: "WinRM / PowerShell Remoting Lateral Movement"
+  description: >
+    Detects WinRM-based lateral movement by identifying wsmprovhost.exe child
+    processes (PowerShell remoting host), Enter-PSSession/Invoke-Command usage,
+    and WinRM network connections on ports 5985 (HTTP) and 5986 (HTTPS).
+    WinRM is commonly abused by frameworks like CrackMapExec and Evil-WinRM.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: "T1021.006"
+    technique_name: "Remote Services: Windows Remote Management"
+  severity: HIGH
+  confidence: 80
+  risk_score: 72
+  search: |
+    (index=sysmon EventCode=1
+     (ParentImage="*\\wsmprovhost.exe"
+      OR (Image="*\\wsmprovhost.exe")
+      OR (Image="*\\powershell.exe" CommandLine="*Enter-PSSession*")
+      OR (Image="*\\powershell.exe" CommandLine="*Invoke-Command*-ComputerName*")
+      OR (Image="*\\powershell.exe" CommandLine="*New-PSSession*")))
+    OR
+    (index=sysmon EventCode=3
+     Image="*\\wsmprovhost.exe"
+     DestinationPort IN (5985, 5986))
+    | eval activity=case(
+        EventCode==1 AND Image="*\\wsmprovhost.exe", "winrm_host_started",
+        EventCode==1 AND ParentImage="*\\wsmprovhost.exe", "remote_child_process",
+        EventCode==1, "ps_remoting_command",
+        EventCode==3, "winrm_network_conn")
+    | stats
+        min(_time)       as first_seen,
+        max(_time)       as last_seen,
+        dc(activity)     as activity_types,
+        values(activity) as activities,
+        values(Image)    as child_processes,
+        values(CommandLine) as commands,
+        values(User)     as users,
+        values(DestinationIp) as dest_ips
+        by Computer
+    | table Computer, first_seen, last_seen, activities, child_processes, commands, users, dest_ips
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "WinRM Remote Execution — $Computer$"
+        severity: high
+        drilldown_search: 'index=sysmon Computer="$Computer$" (Image="*wsmprovhost*" OR ParentImage="*wsmprovhost*" OR CommandLine="*PSSession*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 72
+  known_false_positives:
+    - "PowerShell DSC (Desired State Configuration) push deployments"
+    - "Ansible WinRM-based configuration management"
+    - "SCCM remote script execution via WinRM"
+  tuning_guidance: >
+    Filter by source workstation using a lookup of authorized management
+    hosts. Alert only when wsmprovhost spawns suspicious children like
+    cmd.exe, powershell.exe with encoded commands, or LOLBins.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1021.003 — DCOM Remote Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_dcom_remote_execution:
+  name: "DCOM-based Lateral Movement"
+  description: >
+    Detects lateral movement via Distributed COM (DCOM) objects. Adversaries
+    abuse COM objects like MMC20.Application, ShellWindows, ShellBrowserWindow,
+    and Excel.Application to spawn processes on remote hosts. Detection focuses
+    on mmc.exe, excel.exe, or explorer.exe spawning children via DllHost.exe
+    or directly through DCOM activation.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: "T1021.003"
+    technique_name: "Remote Services: Distributed Component Object Model"
+  severity: HIGH
+  confidence: 75
+  risk_score: 70
+  search: |
+    index=sysmon EventCode=1
+    (
+      (ParentImage="*\\mmc.exe" Image!="*\\mmc.exe"
+       Image IN ("*\\cmd.exe", "*\\powershell.exe", "*\\pwsh.exe",
+                  "*\\wscript.exe", "*\\cscript.exe", "*\\rundll32.exe",
+                  "*\\regsvr32.exe", "*\\mshta.exe"))
+      OR
+      (ParentImage="*\\excel.exe"
+       Image IN ("*\\cmd.exe", "*\\powershell.exe", "*\\pwsh.exe"))
+      OR
+      (ParentImage="*\\svchost.exe" ParentCommandLine="*DcomLaunch*"
+       Image IN ("*\\cmd.exe", "*\\powershell.exe", "*\\pwsh.exe",
+                  "*\\mshta.exe", "*\\rundll32.exe", "*\\scrcons.exe"))
+      OR
+      (ParentImage="*\\DllHost.exe"
+       Image IN ("*\\cmd.exe", "*\\powershell.exe", "*\\pwsh.exe",
+                  "*\\wscript.exe", "*\\cscript.exe"))
+    )
+    | eval technique=case(
+        ParentImage="*\\mmc.exe", "MMC20.Application",
+        ParentImage="*\\excel.exe", "Excel.Application",
+        ParentImage="*\\svchost.exe", "DCOM_Service_Activation",
+        ParentImage="*\\DllHost.exe", "DllHost_COM_Surrogate")
+    | stats
+        count            as events,
+        values(technique) as dcom_method,
+        values(Image)    as spawned_processes,
+        values(CommandLine) as commands,
+        values(User)     as users
+        by Computer, ParentImage
+    | table Computer, dcom_method, ParentImage, spawned_processes, commands, users, events
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "DCOM Lateral Movement — $Computer$ via $dcom_method$"
+        severity: high
+        drilldown_search: 'index=sysmon EventCode=1 Computer="$Computer$" ParentImage="$ParentImage$"'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 70
+  known_false_positives:
+    - "MMC snap-ins launching child processes for legitimate admin tasks"
+    - "Excel automation via COM add-ins"
+  tuning_guidance: >
+    Focus on non-interactive sessions where mmc.exe or excel.exe spawn
+    shell processes without user GUI interaction. Cross-reference with
+    DCOM network traffic on port 135 (RPC Endpoint Mapper).
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Remote Service / Scheduled Task Creation
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_remote_service_task_creation:
+  name: "Remote Service Installation or Scheduled Task Creation"
+  description: >
+    Detects lateral movement via remote service creation (sc.exe \\\\remote) or
+    scheduled task creation (schtasks /create /s remote). Adversaries use these
+    built-in Windows tools to execute payloads on remote systems without needing
+    specialized tooling.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: "T1021.002"
+    technique_name: "Remote Services: SMB/Windows Admin Shares"
+    sub_techniques:
+      - "T1543.003 — Create or Modify System Process: Windows Service"
+      - "T1053.005 — Scheduled Task/Job: Scheduled Task"
+  severity: HIGH
+  confidence: 80
+  risk_score: 75
+  search: |
+    index=sysmon EventCode=1
+    (
+      (Image="*\\sc.exe" CommandLine="*\\\\*" CommandLine="*create*")
+      OR
+      (Image="*\\schtasks.exe" CommandLine="*/create*" CommandLine="*/s *")
+      OR
+      (Image="*\\schtasks.exe" CommandLine="*/create*" CommandLine="*/tn*"
+       CommandLine="*\\\\*")
+      OR
+      (Image="*\\at.exe" CommandLine="*\\\\*")
+    )
+    | rex field=CommandLine "\\\\\\\\(?<target_host>[^\s\\\\]+)"
+    | rex field=CommandLine "(?:binpath|/tr)\s*[=:]\s*\"?(?<payload>[^\"]+)"
+    | stats
+        count            as events,
+        values(Image)    as tool,
+        values(CommandLine) as commands,
+        values(target_host) as targets,
+        values(payload)  as payloads,
+        values(User)     as users
+        by Computer
+    | table Computer, tool, targets, payloads, commands, users, events
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Remote Service/Task Creation from $Computer$ → $targets$"
+        severity: high
+        drilldown_search: 'index=sysmon EventCode=1 Computer="$Computer$" Image IN ("*sc.exe","*schtasks.exe") CommandLine="*\\\\*"'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 75
+  known_false_positives:
+    - "SCCM/MECM client push installation"
+    - "IT automation creating scheduled tasks for patch deployment"
+  tuning_guidance: >
+    Build a lookup of authorized deployment servers. Filter known
+    management subnets. Alert when remote service/task creation originates
+    from workstations rather than known management servers.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1570 — Lateral Tool Transfer via SMB
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_lateral_tool_transfer:
+  name: "Lateral Tool Transfer via Admin Shares"
+  description: >
+    Detects file writes to remote admin shares (C$, ADMIN$, IPC$) that indicate
+    adversaries staging tools on remote systems prior to execution. Correlates
+    Sysmon file creation events with SMB share access audit logs to identify
+    suspicious binary or script transfers.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: "T1570"
+    technique_name: "Lateral Tool Transfer"
+  severity: MEDIUM
+  confidence: 70
+  risk_score: 60
+  search: |
+    (index=sysmon EventCode=11
+     TargetFilename IN ("*\\ADMIN$\\*", "*\\C$\\*", "*\\IPC$\\*")
+     TargetFilename IN ("*.exe", "*.dll", "*.ps1", "*.bat", "*.vbs",
+                         "*.js", "*.hta", "*.scr", "*.cpl"))
+    OR
+    (index=wineventlog source="WinEventLog:Security" EventCode=5145
+     Share_Name IN ("\\\\*\\ADMIN$", "\\\\*\\C$")
+     Access_Mask="0x2"
+     Relative_Target_Name IN ("*.exe", "*.dll", "*.ps1", "*.bat",
+                               "*.vbs", "*.js", "*.hta", "*.scr"))
+    | eval activity=case(
+        EventCode==11, "file_created_on_share",
+        EventCode==5145, "smb_write_access")
+    | stats
+        count            as events,
+        values(activity) as activities,
+        values(TargetFilename) as files_created,
+        values(Relative_Target_Name) as smb_files,
+        values(Share_Name)  as shares,
+        values(Source_Address) as source_ips,
+        values(User)     as users
+        by Computer
+    | table Computer, activities, files_created, smb_files, shares, source_ips, users, events
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Lateral Tool Transfer to $Computer$ via Admin Share"
+        severity: medium
+        drilldown_search: 'index=sysmon EventCode=11 Computer="$Computer$" TargetFilename="*$*"'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 60
+  known_false_positives:
+    - "Software deployment tools pushing installers via admin shares"
+    - "Backup solutions writing to C$ shares"
+  tuning_guidance: >
+    Focus on executable file types (.exe, .dll, .ps1). Filter known
+    deployment tools by Image hash. Cross-reference with subsequent
+    process execution to confirm tool was run after transfer.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1047 — WMI Remote Process Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_wmi_remote_execution:
+  name: "WMI Remote Process Execution"
+  description: >
+    Detects remote WMI execution via wmic.exe /node: commands or WMI provider
+    host (wmiprvse.exe) spawning suspicious child processes on target hosts.
+    Adversaries and tools like Impacket wmiexec, CrackMapExec, and SharpWMI
+    abuse WMI for agentless lateral movement.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: "T1047"
+    technique_name: "Windows Management Instrumentation"
+  severity: HIGH
+  confidence: 80
+  risk_score: 72
+  search: |
+    (index=sysmon EventCode=1
+     (
+       (Image="*\\wmic.exe" CommandLine="*/node:*" CommandLine="*process*call*create*")
+       OR
+       (Image="*\\WMIC.exe" CommandLine="*/node:*")
+       OR
+       (ParentImage="*\\WmiPrvSE.exe"
+        Image IN ("*\\cmd.exe", "*\\powershell.exe", "*\\pwsh.exe",
+                   "*\\rundll32.exe", "*\\mshta.exe", "*\\cscript.exe",
+                   "*\\wscript.exe", "*\\regsvr32.exe"))
+     ))
+    OR
+    (index=sysmon EventCode=3
+     Image="*\\wmic.exe"
+     DestinationPort=135)
+    | eval activity=case(
+        EventCode==1 AND Image="*wmic*", "wmic_remote_command",
+        EventCode==1 AND ParentImage="*WmiPrvSE*", "wmiprvse_child_process",
+        EventCode==3, "wmi_rpc_connection")
+    | stats
+        count            as events,
+        values(activity) as activities,
+        values(Image)    as processes,
+        values(CommandLine) as commands,
+        values(DestinationIp) as remote_hosts,
+        values(User)     as users
+        by Computer
+    | table Computer, activities, processes, commands, remote_hosts, users, events
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "WMI Remote Execution from $Computer$"
+        severity: high
+        drilldown_search: 'index=sysmon EventCode=1 Computer="$Computer$" (Image="*wmic*" CommandLine="*/node:*") OR (ParentImage="*WmiPrvSE*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 72
+  known_false_positives:
+    - "SCCM WMI-based inventory collection"
+    - "Monitoring tools querying WMI remotely for health checks"
+  tuning_guidance: >
+    Focus on wmic.exe with process call create (execution) vs. simple queries.
+    WmiPrvSE.exe spawning shell processes is almost always suspicious — keep
+    this detection tight with minimal filtering.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1550.002 / T1550.003 — Pass the Hash / Pass the Ticket
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_pass_the_hash_ticket:
+  name: "Pass-the-Hash / Pass-the-Ticket Lateral Movement"
+  description: >
+    Detects Pass-the-Hash (PtH) and Pass-the-Ticket (PtT) attacks by identifying
+    NTLM Type 3 logons (4624 LogonType 9 with seclogo package) and Kerberos
+    ticket anomalies. Also detects common PtH/PtT tooling like Mimikatz
+    sekurlsa::pth, Rubeus ptt, and Impacket-based attacks.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: "T1550.002"
+    technique_name: "Use Alternate Authentication Material: Pass the Hash"
+    sub_techniques:
+      - "T1550.003 — Use Alternate Authentication Material: Pass the Ticket"
+  severity: CRITICAL
+  confidence: 85
+  risk_score: 90
+  search: |
+    (index=wineventlog source="WinEventLog:Security" EventCode=4624
+     Logon_Type=9 Authentication_Package="Negotiate"
+     Logon_Process="seclogo")
+    OR
+    (index=wineventlog source="WinEventLog:Security" EventCode=4624
+     Logon_Type=3 Authentication_Package="NTLM"
+     NOT Account_Name="ANONYMOUS LOGON"
+     NOT Account_Name="-"
+     NOT Account_Name="*$")
+    OR
+    (index=sysmon EventCode=1
+     (CommandLine="*sekurlsa::pth*"
+      OR CommandLine="*kerberos::ptt*"
+      OR CommandLine="*Rubeus*ptt*"
+      OR CommandLine="*Rubeus*asktgt*"
+      OR CommandLine="*getTGT*"
+      OR CommandLine="*psexec*-hashes*"
+      OR CommandLine="*wmiexec*-hashes*"))
+    OR
+    (index=wineventlog source="WinEventLog:Security" EventCode=4768
+     Ticket_Encryption_Type="0x17")
+    | eval technique=case(
+        EventCode==4624 AND Logon_Type==9, "pass_the_hash_logon9",
+        EventCode==4624 AND Authentication_Package=="NTLM", "ntlm_network_logon",
+        EventCode==1, "pth_ptt_tool_execution",
+        EventCode==4768 AND Ticket_Encryption_Type=="0x17", "rc4_kerberos_ticket")
+    | stats
+        count            as events,
+        dc(technique)    as technique_count,
+        values(technique) as techniques,
+        values(Account_Name) as accounts,
+        values(Source_Network_Address) as source_ips,
+        values(CommandLine)  as commands,
+        values(Workstation_Name) as workstations
+        by Computer
+    | where technique_count >= 1
+    | eval risk=case(
+        match(mvjoin(techniques,","), "pth_ptt_tool_execution"), "CRITICAL",
+        match(mvjoin(techniques,","), "rc4_kerberos_ticket"), "HIGH",
+        events > 20, "HIGH",
+        1==1, "MEDIUM")
+    | table Computer, risk, techniques, accounts, source_ips, commands, workstations, events
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Pass-the-Hash/Ticket Activity — $Computer$"
+        severity: critical
+        drilldown_search: 'index=wineventlog EventCode IN (4624,4768) Computer="$Computer$" (Logon_Type=9 OR Authentication_Package="NTLM" OR Ticket_Encryption_Type="0x17")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 90
+  known_false_positives:
+    - "Legitimate NTLM fallback authentication in mixed Kerberos/NTLM environments"
+    - "Service accounts using NTLM for legacy application compatibility"
+    - "RC4 Kerberos tickets in environments that haven't migrated to AES"
+  tuning_guidance: >
+    Baseline normal NTLM authentication patterns in your environment.
+    Filter known service accounts and legacy systems. Focus on Type 9 logons
+    with seclogo (strong PtH indicator) and RC4 Kerberos tickets (PtT indicator).
+    Cross-reference with credential access alerts (DCSync, LSASS dump).
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+  lateral_movement_timeline:
+    description: "Build complete lateral movement timeline for a host"
+    search: |
+      (index=sysmon OR index=wineventlog) Computer="$host$"
+      (EventCode IN (1, 3, 11, 17, 18)
+       OR (EventCode=4624 Logon_Type IN (3, 9, 10))
+       OR EventCode IN (5140, 5145, 7045))
+      | eval activity=case(
+          EventCode==7045, "service_install",
+          EventCode==4624 AND Logon_Type==10, "rdp_logon",
+          EventCode==4624 AND Logon_Type==3, "network_logon",
+          EventCode==4624 AND Logon_Type==9, "newcreds_logon",
+          EventCode==17 OR EventCode==18, "named_pipe",
+          EventCode==5140, "share_access",
+          EventCode==3, "network_conn",
+          EventCode==11, "file_create",
+          EventCode==1, "process_exec")
+      | sort _time
+      | table _time, activity, EventCode, Image, ParentImage, CommandLine,
+              DestinationIp, DestinationPort, TargetFilename, PipeName,
+              Share_Name, ServiceName, User
+
+  smb_share_access_audit:
+    description: "Audit all SMB share access for a host"
+    search: |
+      index=wineventlog source="WinEventLog:Security"
+      EventCode IN (5140, 5145) Computer="$host$"
+      | eval access_type=case(
+          Access_Mask=="0x1", "read",
+          Access_Mask=="0x2", "write",
+          Access_Mask=="0x3", "read_write",
+          1==1, Access_Mask)
+      | stats count by Share_Name, Relative_Target_Name, access_type,
+              Source_Address, Account_Name
+      | sort -count
+
+  remote_service_installations:
+    description: "List all remote service installations across the environment"
+    search: |
+      index=wineventlog source="WinEventLog:System" EventCode=7045
+      | where NOT match(ImagePath, "^(C:\\\\Windows\\\\|C:\\\\Program Files)")
+      | stats count, values(ImagePath) as service_paths,
+              values(ServiceName) as service_names by Computer
+      | sort -count
+
+  kerberos_ticket_anomalies:
+    description: "Identify anomalous Kerberos ticket requests"
+    search: |
+      index=wineventlog source="WinEventLog:Security"
+      EventCode IN (4768, 4769)
+      | eval weak_crypto=if(Ticket_Encryption_Type IN ("0x17","0x18"), 1, 0)
+      | stats count, sum(weak_crypto) as weak_tickets,
+              dc(Service_Name) as unique_services,
+              values(Client_Address) as client_ips
+              by Account_Name
+      | where weak_tickets > 0 OR unique_services > 10
+      | sort -weak_tickets
+
+  rdp_session_correlation:
+    description: "Correlate RDP logons with post-logon activity"
+    search: |
+      index=wineventlog source="WinEventLog:Security" EventCode=4624
+      Logon_Type=10 Computer="$host$"
+      | rename Account_Name as rdp_user, Source_Network_Address as rdp_src
+      | join type=left Computer
+        [search index=sysmon EventCode=1 Computer="$host$"
+         | where _time >= relative_time(now(), "-1h")]
+      | table _time, rdp_user, rdp_src, Image, CommandLine, User
+
+
+# ==============================================================================
+#  RESPONSE PLAYBOOK — Lateral Movement
+# ==============================================================================
+
+response_playbook:
+  name: "Windows Lateral Movement Response"
+  steps:
+    - step: 1
+      action: "Validate the Alert"
+      details: >
+        Confirm the lateral movement detection is not a false positive by
+        verifying: (1) the source host is not a known management server,
+        (2) the user account is not a known service account performing
+        authorized tasks, (3) the timing is outside normal maintenance windows.
+
+    - step: 2
+      action: "Identify Scope of Movement"
+      details: >
+        Run the lateral_movement_timeline investigation query against both
+        the source and destination hosts. Map all systems accessed by the
+        same account within the detection time window. Build a graph of
+        host-to-host movement.
+
+    - step: 3
+      action: "Contain Affected Systems"
+      details: >
+        Isolate compromised hosts from the network (disable switch ports or
+        apply micro-segmentation). Disable the compromised account in Active
+        Directory. If Pass-the-Hash/Ticket is confirmed, perform a double
+        Kerberos password reset (krbtgt for PtT, user password for PtH).
+
+    - step: 4
+      action: "Collect Forensic Evidence"
+      details: >
+        Capture memory dumps from affected hosts for credential analysis.
+        Collect Sysmon and Security event logs from all hosts in the
+        movement chain. Preserve SMB share access logs and service
+        installation records.
+
+    - step: 5
+      action: "Eradicate and Recover"
+      details: >
+        Remove any services, scheduled tasks, or tools installed during
+        lateral movement. Reset passwords for all accounts used during
+        the attack. Rotate Kerberos tickets (krbtgt x2 with 12h gap).
+        Re-image heavily compromised hosts. Verify no persistence
+        mechanisms remain using the persistence detection rules.
+
+    - step: 6
+      action: "Post-Incident Improvements"
+      details: >
+        Review and restrict admin share access. Implement LAPS for local
+        admin passwords. Enable Protected Users security group for
+        privileged accounts. Deploy credential guard. Restrict WinRM,
+        RDP, and DCOM to authorized hosts via GPO firewall rules.

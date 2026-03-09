@@ -1,0 +1,844 @@
+# ==============================================================================
+#  Windows Impact Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for Windows impact techniques used
+#                by adversaries to disrupt, destroy, or manipulate victim
+#                systems and data. Covers ransomware, shadow copy deletion,
+#                service disruption, data destruction, system shutdown/reboot,
+#                recovery disablement, and compound ransomware correlation.
+#  MITRE ATT&CK: T1490, T1486, T1489, T1485, T1529, T1561.001
+#  Kill Chain   : Actions on Objectives / Impact
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-09
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES (must be configured BEFORE these rules will generate detections):
+#
+#  1. Sysmon deployed on all Windows endpoints:
+#       - Event 1:  Process Creation (Image, CommandLine, ParentImage)
+#       - Event 11: File Create (TargetFilename)
+#       - Event 23: File Delete (TargetFilename)
+#       - Event 2:  File Creation Time Changed (TargetFilename)
+#
+#  2. Windows Security Audit Policy:
+#       - Audit Process Creation → Success (Event 4688)
+#       - Audit System Events → (Event 7045, 1074)
+#
+#  3. Log forwarding to Splunk via Universal Forwarder:
+#       sourcetype=XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+#       sourcetype=XmlWinEventLog:Security
+#       sourcetype=WinEventLog:System
+#       sourcetype=XmlWinEventLog:Microsoft-Windows-VHDMP-Operational (optional)
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1490 — Shadow Copy Deletion (Pre-Ransomware Indicator)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_shadow_copy_deletion:
+  name: "Volume Shadow Copy Deletion — Pre-Ransomware Activity"
+  description: >
+    Detects deletion of Volume Shadow Copies, a critical pre-ransomware
+    indicator. Adversaries delete shadow copies to prevent file recovery.
+    Covers vssadmin, wmic, PowerShell, and diskshadow-based deletion methods
+    as well as bcdedit recovery disablement that often accompanies shadow
+    copy destruction.
+  mitre:
+    tactic: "Impact"
+    technique: "T1490"
+    technique_name: "Inhibit System Recovery"
+  severity: CRITICAL
+  confidence: 95
+  risk_score: 95
+  search: |
+    index=sysmon EventCode=1
+    (
+      (Image="*\\vssadmin.exe"
+       (CommandLine="*delete*shadows*" OR CommandLine="*resize*shadowstorage*for=*maxsize=*"))
+      OR
+      (Image="*\\wmic.exe" CommandLine="*shadowcopy*delete*")
+      OR
+      (Image IN ("*\\powershell.exe", "*\\pwsh.exe")
+       (CommandLine="*Win32_ShadowCopy*" CommandLine="*Delete*")
+       OR CommandLine="*Get-WmiObject*Win32_ShadowCopy*Remove-WmiObject*")
+      OR
+      (Image="*\\diskshadow.exe" CommandLine="*delete*shadows*")
+      OR
+      (Image="*\\bcdedit.exe"
+       (CommandLine="*recoveryenabled*no*"
+        OR CommandLine="*bootstatuspolicy*ignoreallfailures*"))
+      OR
+      (Image="*\\wbadmin.exe" CommandLine="*delete*catalog*")
+      OR
+      (Image="*\\cmd.exe" CommandLine="*vssadmin*delete*shadows*")
+    )
+    | eval method=case(
+        match(Image, "vssadmin"), "vssadmin_delete",
+        match(Image, "wmic"), "wmic_shadowcopy_delete",
+        match(Image, "powershell|pwsh"), "powershell_shadowcopy_delete",
+        match(Image, "diskshadow"), "diskshadow_delete",
+        match(Image, "bcdedit"), "bcdedit_recovery_disable",
+        match(Image, "wbadmin"), "wbadmin_catalog_delete",
+        match(CommandLine, "vssadmin"), "cmd_vssadmin_delete")
+    | stats
+        count            as events,
+        dc(method)       as methods_used,
+        values(method)   as methods,
+        values(Image)    as processes,
+        values(CommandLine) as commands,
+        values(ParentImage) as parent_processes,
+        values(User)     as users
+        by Computer
+    | eval risk=if(methods_used >= 2, "CRITICAL — multiple recovery methods disabled", "CRITICAL")
+    | table Computer, risk, methods, commands, parent_processes, users, events
+  schedule:
+    cron: "*/2 * * * *"
+    earliest: "-4m"
+    latest: "-15s"
+  throttle:
+    field: "Computer"
+    period: "5m"
+  actions:
+    - notable_event:
+        rule_title: "CRITICAL: Shadow Copy Deletion — $Computer$ (methods: $methods$)"
+        severity: critical
+        drilldown_search: 'index=sysmon EventCode=1 Computer="$Computer$" (CommandLine="*shadow*delete*" OR CommandLine="*recoveryenabled*no*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 95
+  known_false_positives:
+    - "Storage administrators managing shadow copy storage quotas"
+    - "Automated cleanup scripts reducing VSS disk usage"
+  tuning_guidance: >
+    Shadow copy deletion from non-admin contexts or outside maintenance
+    windows is ALWAYS suspicious. vssadmin resize shadowstorage to minimal
+    sizes is functionally equivalent to deletion. Multiple recovery
+    disablement methods in sequence is a near-certain ransomware indicator.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1486 — Ransomware Mass File Encryption (Extension Change)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_ransomware_file_encryption:
+  name: "Ransomware — Mass File Extension Change / Encryption"
+  description: >
+    Detects ransomware encryption activity by identifying rapid creation of
+    files with known ransomware extensions or high-volume file rename/creation
+    patterns consistent with encryption. Monitors for ransom note file creation
+    and mass file modification patterns.
+  mitre:
+    tactic: "Impact"
+    technique: "T1486"
+    technique_name: "Data Encrypted for Impact"
+  severity: CRITICAL
+  confidence: 90
+  risk_score: 95
+  search: |
+    index=sysmon EventCode=11
+    (TargetFilename IN ("*.encrypted", "*.locked", "*.crypto", "*.crypt",
+                         "*.enc", "*.crypted", "*.locky", "*.cerber",
+                         "*.zepto", "*.thor", "*.aesir", "*.zzzzz",
+                         "*.micro", "*.mp3", "*.xxx", "*.ttt",
+                         "*.vvv", "*.ccc", "*.abc", "*.xyz",
+                         "*.aaa", "*.exx", "*.ezz", "*.bleep",
+                         "*.rdmk", "*.r5a", "*.WNCRY", "*.wnry",
+                         "*.wcry", "*.wncrypt", "*.rekt", "*.hacked",
+                         "*.pays", "*.basta", "*.blackbyte",
+                         "*.conti", "*.revil", "*.sodinokibi",
+                         "*.lockbit", "*.alphv", "*.royal")
+     OR
+     TargetFilename IN ("*README*DECRYPT*", "*HOW_TO_DECRYPT*",
+                         "*RECOVER*FILES*", "*!README!*",
+                         "*DECRYPT_INSTRUCTION*", "*RANSOM*NOTE*",
+                         "*-DECRYPT-*", "*restore_files*",
+                         "*HELP_DECRYPT*", "*YOUR_FILES*",
+                         "*_readme.txt", "*-readme.txt"))
+    | bin _time span=1m
+    | stats
+        count            as files_affected,
+        dc(TargetFilename) as unique_files,
+        values(Image)    as encryption_process,
+        values(User)     as users
+        by _time, Computer
+    | where files_affected > 20
+    | stats
+        sum(files_affected) as total_files,
+        max(files_affected) as peak_per_minute,
+        min(_time)       as started,
+        max(_time)       as latest,
+        values(encryption_process) as processes,
+        values(users)    as users
+        by Computer
+    | eval duration_secs=latest - started
+    | eval rate_per_sec=round(total_files/max(duration_secs,1), 1)
+    | table Computer, total_files, peak_per_minute, rate_per_sec,
+            started, processes, users
+    | sort -total_files
+  schedule:
+    cron: "*/1 * * * *"
+    earliest: "-3m"
+    latest: "-10s"
+  throttle:
+    field: "Computer"
+    period: "5m"
+  actions:
+    - notable_event:
+        rule_title: "CRITICAL RANSOMWARE: Mass Encryption — $Computer$ ($total_files$ files, $rate_per_sec$/sec)"
+        severity: critical
+        drilldown_search: 'index=sysmon EventCode=11 Computer="$Computer$" | stats count by Image, TargetFilename | sort -count'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 95
+  known_false_positives:
+    - "Legitimate bulk encryption tools (VeraCrypt, BitLocker on removable media)"
+    - "Backup software creating encrypted archives"
+  tuning_guidance: >
+    This rule runs every minute for rapid detection. Threshold of 20 files/min
+    may need adjustment — legitimate users rarely create 20+ encrypted files
+    per minute. Ransom note file names are very high-confidence indicators.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1486 — Ransomware Process Behavior
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_ransomware_process_behavior:
+  name: "Ransomware — Suspicious Process Encryption Behavior"
+  description: >
+    Detects ransomware-like process behavior by identifying single processes
+    that exhibit multiple ransomware indicators: high-volume file operations,
+    reading files then writing encrypted versions, spawning recovery-disabling
+    commands, and dropping ransom notes. Behavioral detection that catches
+    novel ransomware strains.
+  mitre:
+    tactic: "Impact"
+    technique: "T1486"
+    technique_name: "Data Encrypted for Impact"
+  severity: CRITICAL
+  confidence: 85
+  risk_score: 92
+  search: |
+    index=sysmon EventCode IN (1, 11) Computer="$host$"
+    | eval is_file_create=if(EventCode==11, 1, 0),
+           is_ransom_note=if(EventCode==11 AND
+             match(TargetFilename, "(?i)(readme|decrypt|recover|ransom|restore|help_)"), 1, 0),
+           is_recovery_kill=if(EventCode==1 AND
+             (match(CommandLine, "(?i)vssadmin.*delete") OR
+              match(CommandLine, "(?i)bcdedit.*recovery") OR
+              match(CommandLine, "(?i)wmic.*shadowcopy") OR
+              match(CommandLine, "(?i)wbadmin.*delete")), 1, 0)
+    | stats
+        sum(is_file_create)   as files_created,
+        sum(is_ransom_note)   as ransom_notes,
+        sum(is_recovery_kill) as recovery_kills,
+        dc(TargetFilename)    as unique_files,
+        values(Image)         as processes,
+        values(User)          as users
+        by Computer
+    | eval ransomware_score=(files_created*0.3) + (ransom_notes*30) + (recovery_kills*40)
+    | where ransomware_score > 50
+    | eval verdict=case(
+        ransomware_score > 100, "CONFIRMED RANSOMWARE",
+        ransomware_score > 70, "HIGHLY LIKELY RANSOMWARE",
+        1==1, "POSSIBLE RANSOMWARE")
+    | table Computer, verdict, ransomware_score, files_created, ransom_notes,
+            recovery_kills, processes, users
+  schedule:
+    cron: "*/2 * * * *"
+    earliest: "-5m"
+    latest: "-15s"
+  throttle:
+    field: "Computer"
+    period: "5m"
+  actions:
+    - notable_event:
+        rule_title: "RANSOMWARE BEHAVIOR: $verdict$ — $Computer$ (score=$ransomware_score$)"
+        severity: critical
+        drilldown_search: 'index=sysmon Computer="$Computer$" EventCode IN (1,11) | stats count by EventCode, Image, CommandLine, TargetFilename | sort -count'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 92
+  known_false_positives:
+    - "Very rare — scoring system minimizes false positives"
+  tuning_guidance: >
+    Adjust ransomware_score weights if needed. The combination of file
+    creation + ransom note + recovery disablement is extremely high
+    confidence. Reduce file_created weight if your environment has
+    legitimate bulk file creation processes.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1489 — Service Stop (Disabling Security and Backup Services)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_service_stop:
+  name: "Critical Service Disruption — Security and Backup Service Stop"
+  description: >
+    Detects adversaries stopping critical security and backup services prior to
+    ransomware deployment or to evade detection. Monitors for sc.exe, net.exe,
+    taskkill, and PowerShell commands targeting antivirus, backup, database,
+    and monitoring services.
+  mitre:
+    tactic: "Impact"
+    technique: "T1489"
+    technique_name: "Service Stop"
+  severity: HIGH
+  confidence: 85
+  risk_score: 80
+  search: |
+    index=sysmon EventCode=1
+    (
+      (Image IN ("*\\sc.exe", "*\\net.exe", "*\\net1.exe")
+       CommandLine="*stop*"
+       CommandLine IN (
+         "*vss*", "*sql*", "*mysql*", "*oracle*", "*postgres*",
+         "*backup*", "*veeam*", "*acronis*", "*arcserve*",
+         "*MsMpSvc*", "*WinDefend*", "*McAfee*", "*Symantec*",
+         "*sophos*", "*avast*", "*avg*", "*eset*", "*trend*",
+         "*crowdstrike*", "*csfalcon*", "*carbon*", "*sentinel*",
+         "*splunk*", "*sysmon*", "*ossec*", "*wazuh*",
+         "*exchange*", "*mssql*", "*mongo*"))
+      OR
+      (Image="*\\taskkill.exe"
+       CommandLine IN (
+         "*sqlservr*", "*mysqld*", "*oracle*", "*postgres*",
+         "*MsMpEng*", "*mcshield*", "*avp*",
+         "*SentinelAgent*", "*CSFalcon*", "*CylanceSvc*",
+         "*veeam*", "*backup*"))
+      OR
+      (Image IN ("*\\powershell.exe", "*\\pwsh.exe")
+       CommandLine="*Stop-Service*"
+       CommandLine IN ("*sql*", "*backup*", "*veeam*", "*defend*",
+                       "*splunk*", "*sysmon*", "*sentinel*"))
+      OR
+      (Image="*\\sc.exe" CommandLine="*config*" CommandLine="*disabled*"
+       CommandLine IN ("*vss*", "*sql*", "*backup*", "*defend*",
+                       "*sysmon*", "*splunk*"))
+    )
+    | eval action_type=case(
+        match(CommandLine, "(?i)stop"), "service_stop",
+        match(CommandLine, "(?i)taskkill"), "process_kill",
+        match(CommandLine, "(?i)config.*disabled"), "service_disabled")
+    | eval target_category=case(
+        match(CommandLine, "(?i)(vss|backup|veeam|acronis|arcserve)"), "backup_service",
+        match(CommandLine, "(?i)(sql|mysql|oracle|postgres|mongo|exchange)"), "database_service",
+        match(CommandLine, "(?i)(defend|mcafee|symantec|sophos|avast|avg|eset|trend|crowdstrike|csfalcon|carbon|sentinel|avp|cylance)"), "security_service",
+        match(CommandLine, "(?i)(splunk|sysmon|ossec|wazuh)"), "monitoring_service",
+        1==1, "other_service")
+    | stats
+        count            as events,
+        dc(target_category) as category_count,
+        values(action_type)     as actions,
+        values(target_category) as target_categories,
+        values(CommandLine) as commands,
+        values(User)     as users,
+        values(ParentImage) as parent_processes
+        by Computer
+    | eval risk=case(
+        category_count >= 3, "CRITICAL — multi-category service disruption",
+        match(mvjoin(target_categories,","), "security_service"), "HIGH — security service targeted",
+        1==1, "HIGH")
+    | table Computer, risk, target_categories, actions, commands, parent_processes, users, events
+  schedule:
+    cron: "*/3 * * * *"
+    earliest: "-5m"
+    latest: "-15s"
+  throttle:
+    field: "Computer"
+    period: "10m"
+  actions:
+    - notable_event:
+        rule_title: "Critical Service Disruption — $Computer$ ($target_categories$)"
+        severity: high
+        drilldown_search: 'index=sysmon EventCode=1 Computer="$Computer$" (CommandLine="*stop*" OR CommandLine="*taskkill*") | stats count by Image, CommandLine'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 80
+  known_false_positives:
+    - "Planned maintenance stopping services for patching"
+    - "Database administrators performing scheduled maintenance"
+  tuning_guidance: >
+    Multiple service categories being stopped in rapid succession is a
+    strong ransomware pre-deployment indicator. Single service stops during
+    business hours by admin accounts are more likely legitimate.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1485 — Data Destruction
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_data_destruction:
+  name: "Data Destruction — Disk Wiping and Mass File Deletion"
+  description: >
+    Detects data destruction techniques including disk wiping tools, format
+    commands, mass file deletion, and cipher /w overwrite operations. Covers
+    wiper malware patterns and destructive PowerShell commands that overwrite
+    file contents before deletion.
+  mitre:
+    tactic: "Impact"
+    technique: "T1485"
+    technique_name: "Data Destruction"
+  severity: CRITICAL
+  confidence: 85
+  risk_score: 90
+  search: |
+    index=sysmon EventCode=1
+    (
+      (Image="*\\cipher.exe" CommandLine="*/w:*")
+      OR
+      (Image="*\\format.exe" CommandLine="*/y*")
+      OR
+      (Image="*\\sdelete*.exe")
+      OR
+      (Image="*\\eraser.exe" OR Image="*\\dban*")
+      OR
+      (Image IN ("*\\powershell.exe", "*\\pwsh.exe")
+       (CommandLine="*Remove-Item*-Recurse*-Force*"
+        OR CommandLine="*Clear-Content*-Path*"
+        OR CommandLine="*[System.IO.File]::WriteAllBytes*"
+        OR CommandLine="*Get-ChildItem*Remove-Item*-Force*"))
+      OR
+      (Image="*\\cmd.exe"
+       (CommandLine="*del /s /q /f*"
+        OR CommandLine="*rd /s /q*"
+        OR CommandLine="*rmdir /s /q*"
+        OR (CommandLine="*del*" CommandLine="*\\*.*" CommandLine="*/f*")))
+      OR
+      (Image="*\\diskpart.exe" CommandLine="*clean*")
+    )
+    | eval destruction_method=case(
+        match(Image, "cipher"), "cipher_overwrite",
+        match(Image, "format"), "disk_format",
+        match(Image, "sdelete"), "secure_delete",
+        match(Image, "eraser|dban"), "wipe_tool",
+        match(Image, "diskpart"), "diskpart_clean",
+        match(Image, "powershell|pwsh") AND match(CommandLine, "Remove-Item"), "powershell_mass_delete",
+        match(Image, "powershell|pwsh"), "powershell_data_overwrite",
+        match(Image, "cmd") AND match(CommandLine, "del.*\\*\\.\\*"), "cmd_wildcard_delete",
+        match(Image, "cmd") AND match(CommandLine, "rd.*\\/s"), "cmd_recursive_delete",
+        1==1, "other_destruction")
+    | stats
+        count            as events,
+        values(destruction_method) as methods,
+        values(Image)    as processes,
+        values(CommandLine) as commands,
+        values(ParentImage) as parent_processes,
+        values(User)     as users
+        by Computer
+    | table Computer, methods, commands, parent_processes, users, events
+  schedule:
+    cron: "*/3 * * * *"
+    earliest: "-5m"
+    latest: "-15s"
+  throttle:
+    field: "Computer"
+    period: "10m"
+  actions:
+    - notable_event:
+        rule_title: "CRITICAL: Data Destruction — $Computer$ ($methods$)"
+        severity: critical
+        drilldown_search: 'index=sysmon EventCode=1 Computer="$Computer$" (Image="*cipher*" OR Image="*sdelete*" OR Image="*format*" OR CommandLine="*del /s /q*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 90
+  known_false_positives:
+    - "Secure deletion of sensitive files per data retention policy"
+    - "Drive formatting during system reprovisioning"
+    - "cipher /w for secure free-space wiping after file deletion"
+  tuning_guidance: >
+    cipher /w and sdelete on user workstations outside IT maintenance
+    is highly suspicious. format /y bypasses confirmation and indicates
+    automated/scripted destruction. Mass del commands with wildcards
+    targeting user directories should always alert.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1529 — System Shutdown / Reboot (Mass Disruption)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_system_shutdown:
+  name: "Mass System Shutdown or Reboot"
+  description: >
+    Detects adversary-initiated system shutdowns and reboots used for
+    disruption, ransomware note display, or to complete encryption. Identifies
+    shutdown commands with force flags, remote shutdown attempts, and
+    suspicious shutdown events outside maintenance windows.
+  mitre:
+    tactic: "Impact"
+    technique: "T1529"
+    technique_name: "System Shutdown/Reboot"
+  severity: HIGH
+  confidence: 75
+  risk_score: 65
+  search: |
+    (index=sysmon EventCode=1
+     (
+       (Image="*\\shutdown.exe"
+        (CommandLine="*/s*" OR CommandLine="*/r*")
+        (CommandLine="*/f*" OR CommandLine="*/t 0*"))
+       OR
+       (Image="*\\shutdown.exe" CommandLine="*/m \\\\*")
+       OR
+       (Image IN ("*\\powershell.exe", "*\\pwsh.exe")
+        (CommandLine="*Stop-Computer*" OR CommandLine="*Restart-Computer*"
+         OR CommandLine="*-Force*-ComputerName*"))
+       OR
+       (Image="*\\wmic.exe" CommandLine="*os*" CommandLine="*shutdown*")
+     ))
+    OR
+    (index=wineventlog source="WinEventLog:System" EventCode=1074
+     NOT User IN ("NT AUTHORITY\\SYSTEM")
+     NOT Message="*Windows Update*")
+    | eval method=case(
+        EventCode==1 AND match(CommandLine, "shutdown.*\\/m"), "remote_shutdown",
+        EventCode==1 AND match(Image, "shutdown"), "local_shutdown",
+        EventCode==1 AND match(CommandLine, "Stop-Computer|Restart-Computer"), "powershell_shutdown",
+        EventCode==1 AND match(Image, "wmic"), "wmi_shutdown",
+        EventCode==1074, "system_shutdown_event")
+    | stats
+        count            as events,
+        values(method)   as methods,
+        values(CommandLine) as commands,
+        values(User)     as users,
+        values(ParentImage) as parent_processes
+        by Computer
+    | table Computer, methods, commands, parent_processes, users, events
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "System Shutdown/Reboot — $Computer$ ($methods$)"
+        severity: high
+        drilldown_search: 'index=sysmon EventCode=1 Computer="$Computer$" (Image="*shutdown*" OR CommandLine="*Stop-Computer*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 65
+  known_false_positives:
+    - "Scheduled patch reboots via SCCM/WSUS"
+    - "User-initiated reboots"
+  tuning_guidance: >
+    Focus on forced shutdowns (/f /t 0) and remote shutdowns (/m \\host).
+    Correlate with preceding shadow copy deletion or service stop events —
+    shutdown after ransomware deployment is common for forcing ransom note
+    display on reboot.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1490 — Boot Recovery Disablement
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_recovery_disablement:
+  name: "Boot Recovery Disablement and BCD Tampering"
+  description: >
+    Detects tampering with Boot Configuration Data (BCD) and Windows Recovery
+    Environment to prevent system recovery after ransomware or wiper attacks.
+    Identifies bcdedit modifications, WinRE disablement, safe mode
+    manipulation, and boot record tampering.
+  mitre:
+    tactic: "Impact"
+    technique: "T1490"
+    technique_name: "Inhibit System Recovery"
+  severity: CRITICAL
+  confidence: 90
+  risk_score: 88
+  search: |
+    index=sysmon EventCode=1
+    (
+      (Image="*\\bcdedit.exe"
+       (CommandLine="*recoveryenabled*No*"
+        OR CommandLine="*bootstatuspolicy*ignoreallfailures*"
+        OR CommandLine="*set*{default}*safeboot*"
+        OR CommandLine="*deletevalue*{default}*safeboot*"
+        OR CommandLine="*/delete*{*}*"
+        OR CommandLine="*/deletevalue*"
+        OR CommandLine="*set*{bootmgr}*timeout*0*"))
+      OR
+      (Image="*\\reagentc.exe" CommandLine="*/disable*")
+      OR
+      (Image="*\\bootrec.exe" CommandLine="*/fixboot*")
+      OR
+      (Image IN ("*\\powershell.exe", "*\\pwsh.exe")
+       CommandLine="*bcdedit*" CommandLine="*recovery*")
+      OR
+      (Image="*\\cmd.exe" CommandLine="*bcdedit*"
+       (CommandLine="*recoveryenabled*" OR CommandLine="*bootstatuspolicy*"))
+    )
+    | eval tampering_type=case(
+        match(CommandLine, "(?i)recoveryenabled.*no"), "recovery_disabled",
+        match(CommandLine, "(?i)bootstatuspolicy.*ignore"), "boot_failure_ignored",
+        match(CommandLine, "(?i)safeboot"), "safe_mode_manipulation",
+        match(CommandLine, "(?i)delete"), "bcd_entry_deleted",
+        match(CommandLine, "(?i)timeout.*0"), "boot_timeout_zeroed",
+        match(Image, "reagentc"), "winre_disabled",
+        match(Image, "bootrec"), "boot_record_modified",
+        1==1, "other_bcd_tampering")
+    | stats
+        count            as events,
+        dc(tampering_type)  as tampering_types,
+        values(tampering_type) as methods,
+        values(CommandLine) as commands,
+        values(ParentImage) as parent_processes,
+        values(User)     as users
+        by Computer
+    | eval risk=if(tampering_types >= 2,
+        "CRITICAL — multiple recovery methods disabled",
+        "CRITICAL")
+    | table Computer, risk, methods, commands, parent_processes, users, events
+  schedule:
+    cron: "*/2 * * * *"
+    earliest: "-4m"
+    latest: "-15s"
+  throttle:
+    field: "Computer"
+    period: "5m"
+  actions:
+    - notable_event:
+        rule_title: "CRITICAL: Boot Recovery Disabled — $Computer$ ($methods$)"
+        severity: critical
+        drilldown_search: 'index=sysmon EventCode=1 Computer="$Computer$" (Image="*bcdedit*" OR Image="*reagentc*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 88
+  known_false_positives:
+    - "System administrators configuring BCD for multi-boot setups"
+    - "OEM recovery environment management"
+  tuning_guidance: >
+    bcdedit with recoveryenabled No outside of an IT provisioning context
+    is almost always malicious. reagentc /disable is rarely used legitimately.
+    Combination of multiple BCD tampering types is near-certain ransomware.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: Compound Ransomware Correlation (Kill Chain)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_compound_ransomware_correlation:
+  name: "Compound Ransomware Kill Chain Correlation"
+  description: >
+    Correlates multiple ransomware indicators across the attack lifecycle to
+    provide high-confidence ransomware detection. Combines shadow copy deletion,
+    service disruption, recovery disablement, mass file operations, and ransom
+    note creation into a single scoring model that triggers when multiple
+    indicators appear on the same host within a short time window.
+  mitre:
+    tactic: "Impact"
+    technique: "T1486"
+    technique_name: "Data Encrypted for Impact"
+    sub_techniques:
+      - "T1490 — Inhibit System Recovery"
+      - "T1489 — Service Stop"
+      - "T1485 — Data Destruction"
+  severity: CRITICAL
+  confidence: 98
+  risk_score: 100
+  search: |
+    index=sysmon EventCode IN (1, 11) Computer=*
+    | eval shadow_delete=if(EventCode==1 AND
+        (match(CommandLine, "(?i)vssadmin.*delete.*shadow") OR
+         match(CommandLine, "(?i)wmic.*shadowcopy.*delete") OR
+         match(CommandLine, "(?i)Win32_ShadowCopy.*Delete")), 1, 0),
+      recovery_disable=if(EventCode==1 AND
+        (match(CommandLine, "(?i)bcdedit.*recoveryenabled.*no") OR
+         match(CommandLine, "(?i)bcdedit.*bootstatuspolicy.*ignore") OR
+         match(CommandLine, "(?i)wbadmin.*delete.*catalog") OR
+         match(CommandLine, "(?i)reagentc.*/disable")), 1, 0),
+      service_kill=if(EventCode==1 AND
+        (match(CommandLine, "(?i)(sc|net|net1).*stop.*(sql|vss|backup|veeam|defend|sophos|crowd|sentinel|splunk|sysmon)") OR
+         match(CommandLine, "(?i)taskkill.*(sqlservr|mysqld|MsMpEng|veeam)")), 1, 0),
+      ransom_note=if(EventCode==11 AND
+        match(TargetFilename, "(?i)(readme.*decrypt|how.to.decrypt|recover.*files|ransom.*note|decrypt.*instruction|help_decrypt|_readme\\.txt)"), 1, 0),
+      mass_encrypt=if(EventCode==11 AND
+        match(TargetFilename, "(?i)\\.(encrypted|locked|crypto|crypt|enc|crypted|locky|cerber|WNCRY|lockbit|alphv|royal|basta|blackbyte|conti|revil|sodinokibi)$"), 1, 0)
+    | stats
+        sum(shadow_delete)   as shadow_deletes,
+        sum(recovery_disable) as recovery_disables,
+        sum(service_kill)    as service_kills,
+        sum(ransom_note)     as ransom_notes,
+        sum(mass_encrypt)    as encrypted_files,
+        min(_time)           as first_indicator,
+        max(_time)           as last_indicator,
+        values(Image)        as processes,
+        values(User)         as users
+        by Computer
+    | eval total_indicators=shadow_deletes + recovery_disables + service_kills + ransom_notes
+    | eval ransomware_score=
+        (shadow_deletes * 25) +
+        (recovery_disables * 25) +
+        (service_kills * 15) +
+        (ransom_notes * 30) +
+        (min(encrypted_files, 100) * 0.5)
+    | where ransomware_score >= 40
+    | eval attack_window_secs=last_indicator - first_indicator
+    | eval severity=case(
+        ransomware_score >= 100, "CRITICAL — ACTIVE RANSOMWARE",
+        ransomware_score >= 70, "CRITICAL — PROBABLE RANSOMWARE",
+        ransomware_score >= 40, "HIGH — RANSOMWARE INDICATORS")
+    | table Computer, severity, ransomware_score, shadow_deletes, recovery_disables,
+            service_kills, ransom_notes, encrypted_files, attack_window_secs,
+            first_indicator, processes, users
+    | sort -ransomware_score
+  schedule:
+    cron: "*/2 * * * *"
+    earliest: "-5m"
+    latest: "-10s"
+  throttle:
+    field: "Computer"
+    period: "5m"
+  actions:
+    - notable_event:
+        rule_title: "$severity$ on $Computer$ — Score: $ransomware_score$ (shadows=$shadow_deletes$, recovery=$recovery_disables$, svc_kill=$service_kills$, notes=$ransom_notes$, encrypted=$encrypted_files$)"
+        severity: critical
+        drilldown_search: 'index=sysmon Computer="$Computer$" EventCode IN (1,11) (CommandLine="*shadow*delete*" OR CommandLine="*bcdedit*" OR CommandLine="*stop*" OR TargetFilename="*decrypt*" OR TargetFilename="*.encrypted*") | sort _time'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 100
+  known_false_positives:
+    - "Virtually none at score >= 70 (multiple independent indicators)"
+  tuning_guidance: >
+    This is a compound correlation rule designed for near-zero false
+    positives. Score >= 100 indicates active ransomware with very high
+    confidence. Score 40-70 may indicate early-stage ransomware or
+    testing. Integrate with SOAR for automated isolation at score >= 70.
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+  ransomware_full_timeline:
+    description: "Complete ransomware attack timeline for an affected host"
+    search: |
+      index=sysmon Computer="$host$" EventCode IN (1, 11, 23)
+      | eval activity=case(
+          EventCode==1 AND match(CommandLine, "(?i)vssadmin|wmic.*shadow|bcdedit|wbadmin|reagentc"), "recovery_disabled",
+          EventCode==1 AND match(CommandLine, "(?i)(sc|net).*stop|taskkill"), "service_stopped",
+          EventCode==1, "process_execution",
+          EventCode==11 AND match(TargetFilename, "(?i)readme|decrypt|ransom"), "ransom_note_dropped",
+          EventCode==11 AND match(TargetFilename, "(?i)\\.(encrypted|locked|crypto)"), "file_encrypted",
+          EventCode==11, "file_created",
+          EventCode==23, "file_deleted")
+      | sort _time
+      | table _time, activity, Image, CommandLine, TargetFilename, User
+
+  encryption_rate_analysis:
+    description: "Analyze file encryption rate over time"
+    search: |
+      index=sysmon EventCode=11 Computer="$host$"
+      TargetFilename IN ("*.encrypted","*.locked","*.crypto","*.crypt","*.enc")
+      | bin _time span=30s
+      | stats count as files_encrypted, dc(TargetFilename) as unique_files by _time
+      | sort _time
+      | streamstats sum(files_encrypted) as cumulative_total
+
+  affected_directories:
+    description: "Identify which directories were affected by encryption"
+    search: |
+      index=sysmon EventCode=11 Computer="$host$"
+      TargetFilename IN ("*.encrypted","*.locked","*.crypto","*.crypt","*.enc",
+                          "*.lockbit","*.alphv","*.royal","*.basta")
+      | rex field=TargetFilename "^(?<directory>.*\\\\)[^\\\\]+$"
+      | stats count as encrypted_files by directory
+      | sort -encrypted_files
+
+  service_disruption_audit:
+    description: "Audit all service stop/disable commands on a host"
+    search: |
+      index=sysmon EventCode=1 Computer="$host$"
+      ((Image="*sc.exe" OR Image="*net.exe" OR Image="*net1.exe")
+       CommandLine="*stop*")
+      OR (Image="*taskkill*")
+      OR (Image="*sc.exe" CommandLine="*config*disabled*")
+      | table _time, Image, CommandLine, ParentImage, User
+      | sort _time
+
+  lateral_ransomware_spread:
+    description: "Check if ransomware indicators appear on other hosts"
+    search: |
+      index=sysmon EventCode IN (1, 11)
+      (CommandLine="*vssadmin*delete*shadow*"
+       OR CommandLine="*bcdedit*recoveryenabled*no*"
+       OR TargetFilename="*README*DECRYPT*"
+       OR TargetFilename="*.encrypted" OR TargetFilename="*.locked")
+      | stats count,
+              values(CommandLine) as commands,
+              values(TargetFilename) as files
+              by Computer
+      | sort -count
+
+
+# ==============================================================================
+#  RESPONSE PLAYBOOK — Ransomware / Impact
+# ==============================================================================
+
+response_playbook:
+  name: "Windows Ransomware & Impact Response"
+  steps:
+    - step: 1
+      action: "IMMEDIATE: Network Isolation"
+      details: >
+        If compound ransomware score >= 70, IMMEDIATELY isolate the affected
+        host from the network. Use EDR network containment if available, or
+        disable the switch port. Do NOT power off the system — encryption keys
+        may be in memory. Alert the SOC manager and initiate the IR process.
+
+    - step: 2
+      action: "Assess Blast Radius"
+      details: >
+        Run lateral_ransomware_spread to identify other affected hosts. Check
+        network share access logs for evidence of ransomware spreading via
+        SMB. Identify all hosts the compromised account has access to.
+        If multiple hosts are affected, invoke enterprise-wide containment.
+
+    - step: 3
+      action: "Preserve Evidence"
+      details: >
+        Capture full memory dump of affected hosts (encryption keys may be
+        recoverable). Preserve Sysmon logs, Security event logs, and MFT.
+        Image the disk if possible before any recovery attempts. Document
+        the ransom note contents and any communication channels provided.
+
+    - step: 4
+      action: "Identify Ransomware Variant"
+      details: >
+        Collect encrypted file samples and ransom note. Use ID Ransomware
+        (id-ransomware.malwarehunterteam.com) to identify the variant.
+        Check for known decryptors at nomoreransom.org. Analyze the
+        encryption process binary for IOCs and C2 infrastructure.
+
+    - step: 5
+      action: "Recovery Execution"
+      details: >
+        If decryptor is available, test on isolated copies first. Restore
+        from offline/immutable backups — verify backup integrity before
+        restoring. Rebuild affected systems from golden images where
+        possible. Restore data from most recent clean backup. Reset ALL
+        passwords for domain accounts — assume full credential compromise.
+
+    - step: 6
+      action: "Post-Incident Hardening"
+      details: >
+        Implement offline/immutable backup strategy. Deploy application
+        whitelisting on critical servers. Restrict admin share access.
+        Enable controlled folder access (Windows). Segment backup
+        infrastructure from production. Test restore procedures quarterly.
+        Consider cyber insurance review and tabletop exercises.

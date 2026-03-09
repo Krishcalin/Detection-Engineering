@@ -1,0 +1,1008 @@
+# ==============================================================================
+#  Windows Defense Evasion Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detection rules for Windows defense evasion techniques
+#                including disabling Windows Defender, AMSI bypass, event log
+#                clearing, firewall disablement, masquerading, timestomping,
+#                command-line obfuscation, registry tampering, and BITS abuse.
+#  MITRE ATT&CK: T1562.001, T1070.001, T1562.004, T1036.005, T1070.006,
+#                T1027.010, T1112, T1197
+#  Kill Chain   : Defense Evasion
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-09
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Sysmon Events: 1 (Process), 2 (File Time Changed), 13 (Registry)
+#  2. PowerShell Script Block Logging: Event 4104
+#  3. Windows Security: Event 1102 (Security Log Cleared)
+#  4. Windows System: Event 104 (System Log Cleared), 7036 (Service State)
+#  5. BITS-Client/Operational log forwarded to Splunk
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1562.001 — Disable/Modify Windows Defender
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_disable_windows_defender:
+  name: "Windows Defender Disabled — RealTimeMonitoring / Tamper Protection Bypass"
+  description: >
+    Detects attempts to disable Windows Defender components via PowerShell
+    Set-MpPreference, registry modifications, or service manipulation.
+    Disabling Defender is a prerequisite step in most malware and ransomware
+    attack chains.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1562.001"
+    technique_name: "Impair Defenses: Disable or Modify Tools"
+    related_techniques:
+      - "T1112: Modify Registry"
+  severity: critical
+  confidence: 90
+  risk_score: 95
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Sysmon Event 13 (Registry Value Set)"
+    - "PowerShell Script Block Logging (Event 4104)"
+  prerequisites:
+    - "Sysmon installed with Process Creation and Registry logging"
+    - "PowerShell Script Block Logging enabled"
+
+  search: |
+    (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+        ```PowerShell disabling Defender```
+        (Image="*\\powershell.exe" OR Image="*\\pwsh.exe")
+        (match(CommandLine, "(?i)Set-MpPreference.*-Disable(RealTimeMonitoring|IOAVProtection|BehaviorMonitoring|ScriptScanning)\s+\$?true")
+         OR match(CommandLine, "(?i)Set-MpPreference.*-SubmitSamplesConsent\s+0")
+         OR match(CommandLine, "(?i)Add-MpPreference.*-ExclusionPath")
+         OR match(CommandLine, "(?i)sc\s+(stop|config|delete)\s+WinDefend")))
+    OR
+    (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13
+        ```Registry keys to disable Defender```
+        (match(TargetObject, "(?i)Windows Defender\\\\(DisableAntiSpyware|DisableRealtimeMonitoring|DisableAntiVirus)")
+         OR match(TargetObject, "(?i)Windows Defender\\\\Real-Time Protection\\\\Disable")
+         OR match(TargetObject, "(?i)Windows Defender\\\\SpyNet\\\\SubmitSamplesConsent"))
+        Details IN ("DWORD (0x00000001)", "1"))
+    OR
+    (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+        ```Service manipulation to stop Defender```
+        (Image="*\\sc.exe" AND match(CommandLine, "(?i)(stop|config|delete).*WinDefend"))
+        OR (Image="*\\net.exe" AND match(CommandLine, "(?i)stop.*WinDefend")))
+    | eval evasion_method=case(
+        match(CommandLine, "(?i)Set-MpPreference"), "PowerShell Set-MpPreference",
+        match(TargetObject, "(?i)DisableAntiSpyware"), "Registry DisableAntiSpyware",
+        match(TargetObject, "(?i)DisableRealtimeMonitoring"), "Registry DisableRealtimeMonitoring",
+        match(CommandLine, "(?i)ExclusionPath"), "Defender Exclusion Added",
+        match(CommandLine, "(?i)(sc|net).*WinDefend"), "Service Manipulation",
+        1==1, "Defender Modification"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(evasion_method) as methods,
+        values(CommandLine) as command_lines,
+        values(Image) as processes,
+        values(User) as users
+        by ComputerName
+    | eval mitre_technique="T1562.001"
+    | table first_seen, last_seen, ComputerName, methods, processes, users,
+            event_count, command_lines, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "30m"
+
+  actions:
+    - notable_event:
+        rule_title: "Windows Defender Disabled — $methods$ on $ComputerName$"
+        rule_description: >
+          Windows Defender was disabled or modified on $ComputerName$ via
+          $methods$ by $users$. This is a critical pre-attack indicator.
+          Immediately investigate for follow-on malware execution.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog ComputerName="$ComputerName$"
+          ((EventCode=1 AND match(CommandLine, "(?i)(Defender|MpPreference|WinDefend)"))
+           OR (EventCode=13 AND match(TargetObject, "(?i)Defender")))
+          | sort -_time | table _time, EventCode, Image, CommandLine, TargetObject, Details
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 95
+
+  known_false_positives:
+    - "IT administrators temporarily disabling Defender for troubleshooting"
+    - "Legitimate software adding Defender exclusions during installation"
+
+  tuning_guidance: |
+    1. Adding exclusions for entire drives (C:\) is always suspicious
+    2. Disabling RealTimeMonitoring is critical — immediate investigation
+    3. Correlate with subsequent process creation for malware execution
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1562.001 — AMSI Bypass Techniques
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_amsi_bypass:
+  name: "AMSI Bypass — Antimalware Scan Interface Evasion"
+  description: >
+    Detects known AMSI bypass patterns in PowerShell Script Block Logging
+    (Event 4104). AMSI bypass disables runtime malware scanning of scripts,
+    allowing subsequent malicious PowerShell to execute undetected.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1562.001"
+    technique_name: "Impair Defenses: Disable or Modify Tools"
+    related_techniques:
+      - "T1059.001: PowerShell"
+  severity: critical
+  confidence: 90
+  risk_score: 90
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "PowerShell Script Block Logging (Event 4104)"
+  prerequisites:
+    - "PowerShell Script Block Logging enabled"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-PowerShell/Operational"
+        EventCode=4104
+    | where match(ScriptBlockText, "(?i)(amsiInitFailed|AmsiScanBuffer|amsiContext)")
+        OR match(ScriptBlockText, "(?i)System\.Management\.Automation\.AmsiUtils")
+        OR match(ScriptBlockText, "(?i)\[Ref\]\.Assembly\.GetType.*AMSI")
+        OR match(ScriptBlockText, "(?i)amsi\.dll.*VirtualProtect")
+        OR match(ScriptBlockText, "(?i)Bypass.*amsi")
+        OR match(ScriptBlockText, "(?i)iex.*amsi")
+    | eval bypass_type=case(
+        match(ScriptBlockText, "(?i)amsiInitFailed"), "amsiInitFailed flag set",
+        match(ScriptBlockText, "(?i)AmsiScanBuffer"), "AmsiScanBuffer memory patch",
+        match(ScriptBlockText, "(?i)AmsiUtils"), ".NET Reflection AMSI bypass",
+        match(ScriptBlockText, "(?i)VirtualProtect"), "VirtualProtect memory patch",
+        1==1, "AMSI bypass variant"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(bypass_type) as bypass_types,
+        values(Path) as script_paths,
+        values(UserID) as users
+        by ComputerName
+    | eval mitre_technique="T1562.001"
+    | table first_seen, last_seen, ComputerName, bypass_types, script_paths,
+            users, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "AMSI Bypass — $bypass_types$ on $ComputerName$"
+        rule_description: >
+          AMSI bypass detected on $ComputerName$. Type: $bypass_types$.
+          Subsequent PowerShell execution will not be scanned by antimalware.
+          Check for malicious scripts executed after the bypass.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog EventCode=4104 ComputerName="$ComputerName$"
+          | sort _time | table _time, ScriptBlockText, Path, UserID
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "Security researchers testing AMSI bypass in controlled environments"
+    - "Penetration testing tools (Cobalt Strike, Empire)"
+
+  tuning_guidance: |
+    1. AMSI bypass is always malicious in production — no tuning needed
+    2. Always investigate subsequent Script Block events after bypass
+    3. Correlate with process creation to identify attack framework
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1070.001 — Windows Event Log Clearing
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_event_log_clearing:
+  name: "Event Log Clearing — Security Audit Trail Destruction"
+  description: >
+    Detects clearing of Windows Event Logs via wevtutil cl, Clear-EventLog,
+    or direct service manipulation. Event 1102 (Security log cleared) and
+    Event 104 (System log cleared) are generated when logs are wiped.
+    Event 1100 fires when the EventLog service stops. Log clearing is a
+    classic anti-forensics technique used by adversaries to cover tracks.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1070.001"
+    technique_name: "Indicator Removal: Clear Windows Event Logs"
+    related_techniques:
+      - "T1070: Indicator Removal on Host"
+  severity: critical
+  confidence: 95
+  risk_score: 95
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Windows Security Event Log (Event 1102)"
+    - "Windows System Event Log (Event 104)"
+    - "Sysmon Event 1 (Process Creation)"
+  prerequisites:
+    - "Security and System Event Logs forwarded to Splunk"
+    - "Sysmon installed with Process Creation logging"
+
+  search: |
+    (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode IN (1100, 1102))
+    OR
+    (index=wineventlog sourcetype="XmlWinEventLog:System" EventCode=104)
+    OR
+    (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+        ((Image="*\\wevtutil.exe" AND match(CommandLine, "(?i)(cl |clear-log)"))
+         OR (Image="*\\powershell.exe" AND match(CommandLine, "(?i)Clear-EventLog"))
+         OR (Image="*\\powershell.exe" AND match(CommandLine, "(?i)Remove-EventLog"))))
+    | eval clear_method=case(
+        EventCode==1102, "Security Log Cleared (Event 1102)",
+        EventCode==104, "System/Application Log Cleared (Event 104)",
+        EventCode==1100, "EventLog Service Stopped (Event 1100)",
+        match(Image, "(?i)wevtutil"), "wevtutil cl command",
+        match(CommandLine, "(?i)Clear-EventLog"), "PowerShell Clear-EventLog",
+        1==1, "Log clearing detected"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(clear_method) as methods,
+        values(Account_Name) as users,
+        values(CommandLine) as command_lines
+        by ComputerName
+    | eval mitre_technique="T1070.001"
+    | table first_seen, last_seen, ComputerName, methods, users,
+            command_lines, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "30m"
+
+  actions:
+    - notable_event:
+        rule_title: "Event Logs Cleared — $methods$ on $ComputerName$"
+        rule_description: >
+          Event logs were cleared on $ComputerName$ by $users$. Method:
+          $methods$. This destroys the audit trail. Investigate what
+          the attacker was trying to hide.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog ComputerName="$ComputerName$"
+          (EventCode IN (1100, 1102, 104) OR
+           (EventCode=1 AND (Image="*\\wevtutil.exe" OR match(CommandLine, "(?i)Clear-EventLog"))))
+          | sort -_time | table _time, EventCode, Image, CommandLine, Account_Name
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 95
+
+  known_false_positives:
+    - "IT administrators clearing logs during maintenance (should be rare)"
+    - "Log rotation scripts (should use proper log management, not clearing)"
+
+  tuning_guidance: |
+    1. Event 1102 is almost always an attack indicator
+    2. If log clearing is part of maintenance, use change management to exclude
+    3. EventLog service stop (1100) during uptime is always suspicious
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1562.004 — Disable Windows Firewall
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_disable_windows_firewall:
+  name: "Windows Firewall Disabled — Network Protection Removal"
+  description: >
+    Detects disabling of the Windows Firewall via netsh, PowerShell
+    Set-NetFirewallProfile, or registry modification. Attackers disable
+    the firewall to enable unrestricted network communication for C2
+    or lateral movement.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1562.004"
+    technique_name: "Impair Defenses: Disable or Modify System Firewall"
+    related_techniques:
+      - "T1562.001: Disable or Modify Tools"
+  severity: high
+  confidence: 90
+  risk_score: 85
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Sysmon Event 13 (Registry Value Set)"
+    - "PowerShell Script Block Logging (Event 4104)"
+  prerequisites:
+    - "Sysmon installed with Process Creation and Registry logging"
+
+  search: |
+    (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+        ((Image="*\\netsh.exe" AND match(CommandLine, "(?i)advfirewall.*set.*state\s+off"))
+         OR (Image="*\\netsh.exe" AND match(CommandLine, "(?i)firewall.*set.*opmode.*disable"))
+         OR ((Image="*\\powershell.exe" OR Image="*\\pwsh.exe")
+             AND match(CommandLine, "(?i)Set-NetFirewallProfile.*-Enabled\s+(False|\$false|0)"))))
+    OR
+    (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13
+        match(TargetObject, "(?i)\\\\FirewallPolicy\\\\.*\\\\EnableFirewall")
+        Details="DWORD (0x00000000)")
+    | eval disable_method=case(
+        match(CommandLine, "(?i)netsh.*advfirewall"), "netsh advfirewall set state off",
+        match(CommandLine, "(?i)Set-NetFirewallProfile"), "PowerShell Set-NetFirewallProfile",
+        EventCode==13, "Registry EnableFirewall=0",
+        1==1, "Firewall disablement"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(disable_method) as methods,
+        values(User) as users,
+        values(CommandLine) as command_lines
+        by ComputerName
+    | eval mitre_technique="T1562.004"
+    | table first_seen, last_seen, ComputerName, methods, users,
+            command_lines, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Windows Firewall Disabled — $ComputerName$"
+        rule_description: >
+          Windows Firewall was disabled on $ComputerName$ by $users$
+          via $methods$. Check for C2 communication or lateral movement.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog ComputerName="$ComputerName$"
+          (EventCode=1 AND match(CommandLine, "(?i)(netsh|firewall|NetFirewallProfile)"))
+          | sort -_time | table _time, Image, CommandLine, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 85
+
+  known_false_positives:
+    - "IT troubleshooting temporarily disabling firewall"
+    - "Software installation requiring firewall changes"
+
+  tuning_guidance: |
+    1. Firewall disablement on servers is always critical
+    2. Correlate with subsequent network connections (C2 indicators)
+    3. Check if firewall was re-enabled — if not, higher urgency
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1036.005 — Masquerading: System Binary Name from Wrong Path
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_masquerading_system_binaries:
+  name: "Masquerading — System Binary Running from Non-Standard Path"
+  description: >
+    Detects critical Windows system binary names (svchost.exe, lsass.exe,
+    csrss.exe, services.exe, smss.exe, wininit.exe) executing from paths
+    other than C:\Windows\System32. Malware frequently masquerades as
+    system processes to blend in.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1036.005"
+    technique_name: "Masquerading: Match Legitimate Name or Location"
+    related_techniques:
+      - "T1036.004: Masquerade Task or Service"
+  severity: critical
+  confidence: 90
+  risk_score: 95
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    | where match(Image, "(?i)\\\\(svchost|lsass|csrss|services|smss|wininit|winlogon|spoolsv|lsm|taskhost)\.exe$")
+    ```Exclude legitimate paths```
+    | where NOT match(Image, "(?i)^C:\\\\Windows\\\\(System32|SysWOW64|WinSxS)")
+        AND NOT match(Image, "(?i)^C:\\\\Windows\\\\system32")
+    | eval masquerading_binary=replace(Image, ".*\\\\", "")
+    | eval actual_path=replace(Image, "\\\\[^\\\\]+$", "")
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(CommandLine) as command_lines,
+        values(ParentImage) as parent_processes,
+        values(User) as users,
+        values(Hashes) as file_hashes
+        by ComputerName, masquerading_binary, Image
+    | eval mitre_technique="T1036.005"
+    | table first_seen, last_seen, ComputerName, masquerading_binary, Image,
+            parent_processes, command_lines, file_hashes, users,
+            event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Masquerading — $masquerading_binary$ from $Image$ on $ComputerName$"
+        rule_description: >
+          $masquerading_binary$ is running from $Image$ instead of System32
+          on $ComputerName$. This is almost certainly malware masquerading
+          as a system process. Immediate investigation required.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          Image="$Image$"
+          | sort -_time | table _time, Image, CommandLine, ParentImage, User, Hashes
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 95
+
+  known_false_positives:
+    - "None — system binaries should only run from System32"
+
+  tuning_guidance: |
+    1. Zero false positives expected — system binaries from wrong path is always malware
+    2. Submit file hash to threat intelligence for identification
+    3. Check if process is doing network communication (C2)
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1070.006 — Timestomping
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_timestomping:
+  name: "Timestomping — File Creation Time Modified on Executables"
+  description: >
+    Detects Sysmon Event 2 (File Creation Time Changed) on executable files.
+    Adversaries modify file timestamps to blend malicious files with
+    legitimate system files and evade timeline-based forensic analysis.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1070.006"
+    technique_name: "Indicator Removal: Timestomp"
+    related_techniques:
+      - "T1070: Indicator Removal on Host"
+  severity: high
+  confidence: 75
+  risk_score: 75
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Sysmon Event 2 (File Creation Time Changed)"
+  prerequisites:
+    - "Sysmon installed with FileCreateTime (Event 2) logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=2
+    ```Focus on executable files```
+    | where match(TargetFilename, "(?i)\.(exe|dll|sys|ps1|bat|cmd|vbs|js|scr|com)$")
+    ```Exclude system processes performing legitimate time modifications```
+    | where NOT match(Image, "(?i)(TiWorker|TrustedInstaller|msiexec|setup)")
+    ```Calculate time difference between creation time and previous time```
+    | eval creation_time=strptime(CreationUtcTime, "%Y-%m-%d %H:%M:%S")
+    | eval previous_time=strptime(PreviousCreationUtcTime, "%Y-%m-%d %H:%M:%S")
+    | eval time_diff_days=abs(creation_time - previous_time) / 86400
+    ```Flag large time differences (stomped far into the past)```
+    | where time_diff_days > 30
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as stomp_count,
+        values(TargetFilename) as files,
+        values(Image) as stomping_processes,
+        values(User) as users
+        by ComputerName
+    | eval mitre_technique="T1070.006"
+    | table first_seen, last_seen, ComputerName, files, stomping_processes,
+            users, stomp_count, mitre_technique
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+
+  throttle:
+    field: "ComputerName"
+    period: "2h"
+
+  actions:
+    - notable_event:
+        rule_title: "Timestomping — $stomp_count$ files modified on $ComputerName$"
+        rule_description: >
+          File creation timestamps were modified on $ComputerName$ for
+          $files$ by $stomping_processes$. This is an anti-forensics technique.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=2 ComputerName="$ComputerName$"
+          | sort -_time | table _time, TargetFilename, CreationUtcTime, PreviousCreationUtcTime, Image
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 75
+
+  known_false_positives:
+    - "Software installers setting file times to match build timestamps"
+    - "Archive extraction tools preserving original file times"
+
+  tuning_guidance: |
+    1. Focus on executables in Temp/AppData directories
+    2. Timestamps set far in the past (>1 year) are more suspicious
+    3. Correlate with file creation events (Event 11) for the same file
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1027.010 — Command-Line Obfuscation (DOSfuscation)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_commandline_obfuscation:
+  name: "Command-Line Obfuscation — Caret Insertion / Variable Abuse"
+  description: >
+    Detects command-line obfuscation techniques including excessive caret
+    characters (^), environment variable abuse (%comspec%, %temp%), string
+    concatenation with set variables, and FOR /F loops used to construct
+    commands character-by-character (DOSfuscation).
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1027.010"
+    technique_name: "Obfuscated Files or Information: Command Obfuscation"
+    related_techniques:
+      - "T1059.003: Windows Command Shell"
+  severity: high
+  confidence: 80
+  risk_score: 80
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Windows Security Event Log (Event ID 4688)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+    - "Command-line auditing enabled"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+        (Image="*\\cmd.exe" OR Image="*\\powershell.exe")
+    | where
+        ```Excessive caret characters for obfuscation```
+        (len(CommandLine) - len(replace(CommandLine, "^", "")) > 5)
+        OR
+        ```Environment variable abuse for command construction```
+        match(CommandLine, "(?i)%comspec%")
+        OR
+        ```SET variable concatenation```
+        (match(CommandLine, "(?i)set\s+\w+=") AND match(CommandLine, "(?i)call\s+%"))
+        OR
+        ```FOR /F loop command construction```
+        (match(CommandLine, "(?i)for\s+/[fF]") AND match(CommandLine, "(?i)do\s+"))
+        OR
+        ```Character-by-character building via SET```
+        (match(CommandLine, "(?i)set\s+\w=.{1,3}") AND len(CommandLine) > 200)
+    | eval obfuscation_type=case(
+        (len(CommandLine) - len(replace(CommandLine, "^", "")) > 5), "Caret insertion",
+        match(CommandLine, "(?i)%comspec%"), "Environment variable abuse",
+        match(CommandLine, "(?i)set.*call.*%"), "SET variable concatenation",
+        match(CommandLine, "(?i)for\s+/[fF]"), "FOR /F loop construction",
+        1==1, "Command-line obfuscation"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(obfuscation_type) as obfuscation_types,
+        values(CommandLine) as command_lines,
+        values(ParentImage) as parent_processes,
+        values(User) as users
+        by ComputerName
+    | eval mitre_technique="T1027.010"
+    | table first_seen, last_seen, ComputerName, obfuscation_types, users,
+            parent_processes, command_lines, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Command Obfuscation — $obfuscation_types$ on $ComputerName$"
+        rule_description: >
+          Obfuscated command-line execution detected on $ComputerName$.
+          Type: $obfuscation_types$. Command-line obfuscation is used to
+          bypass static detection rules and confuse analysts.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          (Image="*\\cmd.exe" OR Image="*\\powershell.exe")
+          | sort -_time | table _time, Image, CommandLine, ParentImage, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "Complex batch scripts with legitimate caret usage for line continuation"
+    - "Build systems using FOR loops for file processing"
+
+  tuning_guidance: |
+    1. Caret count > 10 is very suspicious — most legitimate use has < 3
+    2. SET variable concatenation followed by CALL is a DOSfuscation hallmark
+    3. Correlate with parent process — Office/browser parents increase severity
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1112 — Security-Critical Registry Modification
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_security_registry_tampering:
+  name: "Security Registry Tampering — LSA / WDigest / Credential Guard"
+  description: >
+    Detects modifications to security-critical registry keys including LSA
+    protection (RunAsPPL), WDigest UseLogonCredential, Credential Guard,
+    Security Packages, and DisableRestrictedAdmin. These modifications
+    weaken Windows security controls to enable credential theft.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1112"
+    technique_name: "Modify Registry"
+    related_techniques:
+      - "T1003.001: LSASS Memory"
+      - "T1562.001: Disable or Modify Tools"
+  severity: critical
+  confidence: 90
+  risk_score: 90
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Sysmon Event 13 (Registry Value Set)"
+  prerequisites:
+    - "Sysmon installed with Registry Value Set logging for LSA keys"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13
+    | where
+        ```LSA protection disable```
+        (match(TargetObject, "(?i)\\\\Control\\\\Lsa\\\\RunAsPPL") AND Details=="DWORD (0x00000000)")
+        OR
+        ```WDigest credential caching enable```
+        (match(TargetObject, "(?i)\\\\Control\\\\SecurityProviders\\\\WDigest\\\\UseLogonCredential") AND Details=="DWORD (0x00000001)")
+        OR
+        ```Credential Guard disable```
+        (match(TargetObject, "(?i)\\\\DeviceGuard\\\\EnableVirtualizationBasedSecurity") AND Details=="DWORD (0x00000000)")
+        OR
+        ```Restricted Admin mode disable```
+        (match(TargetObject, "(?i)\\\\Control\\\\Lsa\\\\DisableRestrictedAdmin") AND Details=="DWORD (0x00000000)")
+        OR
+        ```Security Packages modification (Skeleton Key indicator)```
+        match(TargetObject, "(?i)\\\\Control\\\\Lsa\\\\Security Packages")
+        OR
+        ```Authentication Packages modification```
+        match(TargetObject, "(?i)\\\\Control\\\\Lsa\\\\Authentication Packages")
+    | eval security_impact=case(
+        match(TargetObject, "(?i)RunAsPPL"), "LSA Protection Disabled — enables LSASS dumping",
+        match(TargetObject, "(?i)UseLogonCredential"), "WDigest Enabled — cleartext passwords in memory",
+        match(TargetObject, "(?i)EnableVirtualizationBasedSecurity"), "Credential Guard Disabled",
+        match(TargetObject, "(?i)DisableRestrictedAdmin"), "Restricted Admin Disabled — PTH risk",
+        match(TargetObject, "(?i)Security Packages"), "Security Packages Modified — Skeleton Key?",
+        match(TargetObject, "(?i)Authentication Packages"), "Auth Packages Modified",
+        1==1, "Security Registry Modification"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(security_impact) as impacts,
+        values(TargetObject) as registry_keys,
+        values(Details) as values_set,
+        values(Image) as modifying_processes,
+        values(User) as users
+        by ComputerName
+    | eval mitre_technique="T1112"
+    | table first_seen, last_seen, ComputerName, impacts, registry_keys,
+            values_set, modifying_processes, users, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "30m"
+
+  actions:
+    - notable_event:
+        rule_title: "Security Registry Tampered — $impacts$ on $ComputerName$"
+        rule_description: >
+          Security-critical registry modification on $ComputerName$:
+          $impacts$. Modified by: $modifying_processes$. This weakens
+          Windows security controls to enable credential theft.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog EventCode=13 ComputerName="$ComputerName$"
+          | where match(TargetObject, "(?i)(Lsa|WDigest|DeviceGuard)")
+          | sort -_time | table _time, TargetObject, Details, Image, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "Group Policy updating LSA settings during maintenance"
+    - "Legitimate security configuration changes via SCCM"
+
+  tuning_guidance: |
+    1. WDigest UseLogonCredential=1 is always a credential theft setup
+    2. RunAsPPL=0 disables LSASS protection — immediate investigation
+    3. Security Packages modification may indicate Skeleton Key attack
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 9: T1197 — BITS Jobs for Download & Persistence
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_9_bits_abuse:
+  name: "BITS Job Abuse — Download or Persistence via Background Transfer"
+  description: >
+    Detects abuse of Windows Background Intelligent Transfer Service (BITS)
+    for downloading files (bitsadmin /transfer) or establishing persistence
+    via BITS notification commands (SetNotifyCmdLine). BITS transfers bypass
+    many network monitoring tools because they use the legitimate Windows
+    update infrastructure.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1197"
+    technique_name: "BITS Jobs"
+    related_techniques:
+      - "T1105: Ingress Tool Transfer"
+  severity: high
+  confidence: 85
+  risk_score: 80
+  kill_chain_phase: "Defense Evasion"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Windows Security Event Log (Event ID 4688)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    (
+        ```bitsadmin download commands```
+        (Image="*\\bitsadmin.exe" AND
+            (match(CommandLine, "(?i)/transfer") OR match(CommandLine, "(?i)/create")
+             OR match(CommandLine, "(?i)/addfile") OR match(CommandLine, "(?i)/SetNotifyCmdLine")
+             OR match(CommandLine, "(?i)/resume")))
+        OR
+        ```PowerShell BITS transfer```
+        ((Image="*\\powershell.exe" OR Image="*\\pwsh.exe") AND
+            match(CommandLine, "(?i)Start-BitsTransfer"))
+    )
+    | eval bits_usage=case(
+        match(CommandLine, "(?i)/transfer"), "BITS Download (/transfer)",
+        match(CommandLine, "(?i)SetNotifyCmdLine"), "BITS Persistence (SetNotifyCmdLine)",
+        match(CommandLine, "(?i)Start-BitsTransfer"), "PowerShell BITS Transfer",
+        match(CommandLine, "(?i)/create"), "BITS Job Creation",
+        1==1, "BITS Activity"
+      )
+    | eval has_url=if(match(CommandLine, "(?i)http[s]?://"), "YES", "NO")
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(bits_usage) as usage_types,
+        values(CommandLine) as command_lines,
+        values(User) as users
+        by ComputerName, has_url
+    | eval mitre_technique="T1197"
+    | table first_seen, last_seen, ComputerName, usage_types, has_url,
+            users, command_lines, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "BITS Job Abuse — $usage_types$ on $ComputerName$"
+        rule_description: >
+          BITS was used for $usage_types$ on $ComputerName$. External URL: $has_url$.
+          BITS transfers bypass many network monitoring tools.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          (Image="*\\bitsadmin.exe" OR match(CommandLine, "(?i)BitsTransfer"))
+          | sort -_time | table _time, Image, CommandLine, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "WSUS/SCCM using BITS for update delivery"
+    - "Legitimate software updates using BITS"
+
+  tuning_guidance: |
+    1. SetNotifyCmdLine is persistence — always investigate
+    2. BITS downloads from external URLs are suspicious
+    3. Exclude known update infrastructure URLs
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  query_1_defender_status_timeline:
+    name: "Windows Defender status changes on a host"
+    description: >
+      Track all Defender-related events to see when it was disabled/enabled.
+    search: |
+      index=wineventlog ComputerName="<INSERT_HOST>" earliest="-7d" latest="now"
+      ((EventCode=13 AND match(TargetObject, "(?i)Defender"))
+       OR (EventCode=1 AND match(CommandLine, "(?i)(MpPreference|WinDefend)")))
+      | sort _time
+      | table _time, EventCode, Image, CommandLine, TargetObject, Details, User
+
+  query_2_log_clearing_audit:
+    name: "All log clearing events across fleet"
+    description: >
+      Fleet-wide audit of log clearing activity.
+    search: |
+      index=wineventlog EventCode IN (1100, 1102, 104) earliest="-30d" latest="now"
+      | stats count, min(_time) as first_clear, max(_time) as last_clear
+              by ComputerName, EventCode
+      | sort -count
+      | table ComputerName, EventCode, first_clear, last_clear, count
+
+  query_3_masquerading_check:
+    name: "All processes with system binary names from wrong paths"
+    description: >
+      Fleet-wide check for masquerading processes.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=1 earliest="-7d" latest="now"
+      | where match(Image, "(?i)\\\\(svchost|lsass|csrss|services|smss)\.exe$")
+          AND NOT match(Image, "(?i)^C:\\\\Windows\\\\System32")
+      | stats count by ComputerName, Image, User
+      | table ComputerName, Image, User, count
+
+  query_4_security_registry_baseline:
+    name: "Current security registry values across fleet"
+    description: >
+      Check LSA, WDigest, and Credential Guard settings.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=13 earliest="-30d" latest="now"
+      | where match(TargetObject, "(?i)(Lsa\\\\RunAsPPL|WDigest\\\\UseLogonCredential|DeviceGuard)")
+      | stats latest(Details) as current_value, latest(_time) as last_changed
+              by ComputerName, TargetObject
+      | table ComputerName, TargetObject, current_value, last_changed
+
+  query_5_bits_jobs_inventory:
+    name: "All BITS job activity in last 7 days"
+    description: >
+      Review all BITS-related process execution.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=1 earliest="-7d" latest="now"
+          (Image="*\\bitsadmin.exe" OR match(CommandLine, "(?i)BitsTransfer"))
+      | sort _time
+      | table _time, ComputerName, Image, CommandLine, User
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+response_playbook:
+  name: "Windows Defense Evasion — Incident Response Procedure"
+  description: >
+    Response procedure for confirmed defense evasion activity.
+
+  immediate_actions:
+    - step: 1
+      action: "Re-enable disabled security controls"
+      detail: >
+        Immediately re-enable Windows Defender, AMSI, and firewall.
+        Set-MpPreference -DisableRealtimeMonitoring $false
+        Enable-NetFirewallProfile -All
+        Do this BEFORE investigating to prevent further compromise.
+
+    - step: 2
+      action: "Isolate the host if active compromise is suspected"
+      detail: >
+        If defense evasion is accompanied by other attack indicators
+        (execution, persistence, lateral movement), isolate immediately.
+
+    - step: 3
+      action: "Investigate what the attacker was trying to hide"
+      detail: >
+        Defense evasion is a means, not an end. Check for:
+        - Malware execution after Defender was disabled
+        - Credential theft after WDigest was enabled
+        - Lateral movement after firewall was disabled
+        - Data exfiltration after log clearing
+
+    - step: 4
+      action: "Restore audit trail"
+      detail: >
+        If logs were cleared, check centralized log storage (Splunk)
+        for events before the clearing. The Splunk index retains
+        forwarded events even if local logs are wiped.
+
+    - step: 5
+      action: "Harden security controls"
+      detail: >
+        After remediation:
+        - Enable Tamper Protection for Defender (prevents disablement)
+        - Set RunAsPPL=1 for LSASS protection via GPO
+        - Disable WDigest via GPO (UseLogonCredential=0)
+        - Enable Credential Guard where supported
+
+  forensic_actions:
+    - "Collect memory dump for malware analysis"
+    - "Check Splunk for all events before log clearing timestamp"
+    - "Analyze registry modifications for credential theft setup"
+    - "Review process tree for attack chain reconstruction"
+    - "Check for persistence mechanisms installed after evasion"

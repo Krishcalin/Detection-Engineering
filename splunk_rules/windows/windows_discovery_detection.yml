@@ -1,0 +1,863 @@
+# ==============================================================================
+#  Windows Discovery & Reconnaissance Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detection rules for Windows discovery and reconnaissance
+#                techniques used by adversaries to enumerate accounts, systems,
+#                network configuration, shares, and services after gaining
+#                initial access. Discovery is typically a burst of multiple
+#                enumeration commands within a short time window.
+#  MITRE ATT&CK: T1087.001, T1087.002, T1018, T1082, T1016, T1069.001,
+#                T1069.002, T1135, T1049, T1046
+#  Kill Chain   : Discovery / Reconnaissance
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-09
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#  1. Sysmon Events: 1 (Process Creation), 3 (Network Connection)
+#  2. Windows Security: 4688 (Process Creation with command line)
+#  3. PowerShell Script Block Logging: 4104
+#  4. Security Events: 5140/5145 (Share Access)
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1087 — Account Enumeration Burst
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_account_enumeration_burst:
+  name: "Account Enumeration — Rapid User/Group Discovery Commands"
+  description: >
+    Detects a burst of account enumeration commands (net user, net localgroup,
+    whoami, Get-ADUser, etc.) from the same host within 60 seconds. A single
+    discovery command may be benign; multiple commands in quick succession
+    indicate systematic reconnaissance typical of post-exploitation toolkits.
+  mitre:
+    tactic: "Discovery"
+    technique: "T1087.001"
+    technique_name: "Account Discovery: Local Account"
+    related_techniques:
+      - "T1087.002: Account Discovery: Domain Account"
+      - "T1033: System Owner/User Discovery"
+  severity: medium
+  confidence: 80
+  risk_score: 65
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Windows Security Event Log (Event ID 4688)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+    - "Command-line auditing enabled for Event 4688"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    | where match(CommandLine, "(?i)(net\s+user|net\s+localgroup|net\s+group|whoami\s+/all|whoami\s+/priv|whoami\s+/groups)")
+        OR match(CommandLine, "(?i)(Get-ADUser|Get-LocalUser|Get-ADGroupMember|Get-LocalGroupMember)")
+        OR match(CommandLine, "(?i)(quser|query\s+user|dsquery\s+user)")
+        OR match(CommandLine, "(?i)(net\s+accounts)")
+    ```Count enumeration commands per host within 60-second windows```
+    | bin _time span=60s
+    | stats
+        count as enum_commands,
+        dc(CommandLine) as unique_commands,
+        values(CommandLine) as command_list,
+        values(Image) as binaries_used,
+        values(User) as users,
+        min(_time) as first_seen,
+        max(_time) as last_seen
+        by ComputerName, _time
+    | where enum_commands >= 3
+    | eval recon_severity=case(
+        enum_commands >= 6, "HIGH — Extensive enumeration",
+        enum_commands >= 4, "MEDIUM — Moderate enumeration",
+        1==1, "LOW — Minimal burst"
+      )
+    | eval mitre_technique="T1087"
+    | table first_seen, last_seen, ComputerName, users, enum_commands,
+            unique_commands, command_list, binaries_used, recon_severity,
+            mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Account Enumeration Burst — $enum_commands$ commands on $ComputerName$"
+        rule_description: >
+          $enum_commands$ account enumeration commands were executed within
+          60 seconds on $ComputerName$ by $users$. This indicates
+          systematic post-exploitation reconnaissance.
+        severity: "medium"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          | where match(CommandLine, "(?i)(net user|net localgroup|whoami|Get-AD)")
+          | sort -_time | table _time, Image, CommandLine, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 65
+
+  known_false_positives:
+    - "IT administrators running audit scripts"
+    - "SCCM/Intune compliance checks"
+
+  tuning_guidance: |
+    1. Threshold of 3 commands in 60s is conservative — adjust per environment
+    2. Add IT admin workstations to an allowlist if they generate frequent alerts
+    3. Focus on workstations — servers may have legitimate automation
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1018 — Remote System Discovery
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_remote_system_discovery:
+  name: "Remote System Discovery — Network Host Enumeration"
+  description: >
+    Detects commands used to discover remote systems on the network including
+    net view, nltest, ping sweeps, nbtstat, arp scanning, and PowerShell
+    AD computer enumeration. Adversaries map the network to identify
+    targets for lateral movement.
+  mitre:
+    tactic: "Discovery"
+    technique: "T1018"
+    technique_name: "Remote System Discovery"
+    related_techniques:
+      - "T1046: Network Service Scanning"
+  severity: medium
+  confidence: 75
+  risk_score: 60
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    | where match(CommandLine, "(?i)(net\s+view|nltest\s+/dclist|nltest\s+/domain_trusts)")
+        OR match(CommandLine, "(?i)(nbtstat\s+-[aA]|nbtstat\s+-[rRsS])")
+        OR match(CommandLine, "(?i)(arp\s+-a)")
+        OR match(CommandLine, "(?i)(Get-ADComputer|Get-NetComputer)")
+        OR match(CommandLine, "(?i)(dsquery\s+computer|dsquery\s+server)")
+        OR match(CommandLine, "(?i)(ping\s+-n\s+1.*\s+(10\.|172\.|192\.168\.))")
+        OR match(CommandLine, "(?i)(Test-Connection\s+-Count\s+1)")
+    | bin _time span=120s
+    | stats
+        count as discovery_commands,
+        dc(CommandLine) as unique_commands,
+        values(CommandLine) as command_list,
+        values(User) as users,
+        min(_time) as first_seen,
+        max(_time) as last_seen
+        by ComputerName, _time
+    | where discovery_commands >= 2
+    | eval mitre_technique="T1018"
+    | table first_seen, last_seen, ComputerName, users, discovery_commands,
+            unique_commands, command_list, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Remote System Discovery — $ComputerName$"
+        rule_description: >
+          $discovery_commands$ network discovery commands detected on
+          $ComputerName$ by $users$. The attacker is mapping the network.
+        severity: "medium"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          | where match(CommandLine, "(?i)(net view|nltest|nbtstat|arp|Get-ADComputer)")
+          | sort -_time | table _time, Image, CommandLine, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 60
+
+  known_false_positives:
+    - "Network administrators troubleshooting connectivity"
+    - "Monitoring tools performing network inventory"
+
+  tuning_guidance: |
+    1. nltest /domain_trusts from workstations is always suspicious
+    2. Ping sweeps should be rare from non-admin hosts
+    3. Combine with account enumeration for higher confidence
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1082 — System Information Discovery (Recon Burst)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_system_info_recon_burst:
+  name: "System Information Discovery — Automated Recon Burst"
+  description: >
+    Detects 3+ system reconnaissance commands within 60 seconds from the
+    same host. This pattern of systeminfo, hostname, whoami, ipconfig,
+    tasklist executed in rapid succession is the signature of automated
+    post-exploitation enumeration scripts.
+  mitre:
+    tactic: "Discovery"
+    technique: "T1082"
+    technique_name: "System Information Discovery"
+    related_techniques:
+      - "T1016: System Network Configuration Discovery"
+      - "T1033: System Owner/User Discovery"
+  severity: high
+  confidence: 85
+  risk_score: 75
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    | where match(Image, "(?i)\\\\(systeminfo|hostname|whoami|ipconfig|tasklist|ver|wmic|net|arp|netstat|route|nslookup|qwinsta|query)\.exe$")
+        OR match(CommandLine, "(?i)(wmic\s+os\s+get|wmic\s+computersystem|wmic\s+cpu)")
+        OR match(CommandLine, "(?i)(Get-ComputerInfo|Get-CimInstance\s+Win32)")
+    | eval recon_category=case(
+        match(Image, "(?i)systeminfo"), "System Info",
+        match(Image, "(?i)whoami"), "User Identity",
+        match(Image, "(?i)ipconfig"), "Network Config",
+        match(Image, "(?i)tasklist"), "Process List",
+        match(Image, "(?i)netstat"), "Network Connections",
+        match(Image, "(?i)net\.exe"), "Net Commands",
+        1==1, "Other Recon"
+      )
+    | bin _time span=60s
+    | stats
+        count as recon_commands,
+        dc(recon_category) as categories_used,
+        values(recon_category) as recon_types,
+        values(CommandLine) as command_list,
+        values(User) as users,
+        values(ParentImage) as parent_processes,
+        min(_time) as first_seen,
+        max(_time) as last_seen
+        by ComputerName, _time
+    | where recon_commands >= 3 AND categories_used >= 2
+    | eval recon_severity=case(
+        recon_commands >= 8 AND categories_used >= 5, "CRITICAL — Full automated recon",
+        recon_commands >= 5, "HIGH — Extensive recon",
+        1==1, "MEDIUM — Moderate recon"
+      )
+    | eval mitre_technique="T1082"
+    | table first_seen, last_seen, ComputerName, users, parent_processes,
+            recon_commands, categories_used, recon_types, command_list,
+            recon_severity, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "System Recon Burst — $recon_commands$ commands ($categories_used$ categories) on $ComputerName$"
+        rule_description: >
+          Automated reconnaissance detected on $ComputerName$: $recon_commands$
+          commands across $categories_used$ categories in 60 seconds. Types:
+          $recon_types$. This is consistent with post-exploitation enumeration.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          | sort -_time | table _time, Image, CommandLine, ParentImage, User
+          | head 50
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 75
+
+  known_false_positives:
+    - "IT admin running manual system checks"
+    - "Asset inventory scripts"
+
+  tuning_guidance: |
+    1. 5+ commands across 3+ categories is high-confidence recon
+    2. Check parent process — cmd.exe or PowerShell from unusual parent = higher risk
+    3. Correlate with logon events to identify the attacker's entry point
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1016 — System Network Configuration Discovery
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_network_config_discovery:
+  name: "Network Configuration Discovery — IP/Route/DNS Enumeration"
+  description: >
+    Detects a burst of network configuration discovery commands including
+    ipconfig, netstat, route, arp, nslookup, and PowerShell equivalents.
+  mitre:
+    tactic: "Discovery"
+    technique: "T1016"
+    technique_name: "System Network Configuration Discovery"
+    related_techniques:
+      - "T1049: System Network Connections Discovery"
+  severity: medium
+  confidence: 75
+  risk_score: 55
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    | where match(CommandLine, "(?i)(ipconfig\s+/all|ipconfig\s+/displaydns)")
+        OR match(CommandLine, "(?i)(netstat\s+-an|netstat\s+-b|netstat\s+-r)")
+        OR match(CommandLine, "(?i)(route\s+print)")
+        OR match(CommandLine, "(?i)(arp\s+-a)")
+        OR match(CommandLine, "(?i)(nslookup)")
+        OR match(CommandLine, "(?i)(Get-NetIPConfiguration|Get-DnsClientCache|Get-NetRoute|Get-NetTCPConnection)")
+    | bin _time span=120s
+    | stats
+        count as net_recon_commands,
+        dc(CommandLine) as unique_commands,
+        values(CommandLine) as command_list,
+        values(User) as users,
+        min(_time) as first_seen,
+        max(_time) as last_seen
+        by ComputerName, _time
+    | where net_recon_commands >= 3
+    | eval mitre_technique="T1016"
+    | table first_seen, last_seen, ComputerName, users, net_recon_commands,
+            unique_commands, command_list, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Network Config Discovery — $net_recon_commands$ commands on $ComputerName$"
+        rule_description: >
+          Network configuration enumeration burst on $ComputerName$ by $users$.
+        severity: "medium"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          | where match(CommandLine, "(?i)(ipconfig|netstat|route|arp|nslookup)")
+          | sort -_time | table _time, Image, CommandLine, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 55
+
+  known_false_positives:
+    - "Network administrators troubleshooting"
+    - "VPN client diagnostics"
+
+  tuning_guidance: |
+    1. Combine with other discovery rules for compound detection
+    2. Focus on workstations — servers may run scheduled network checks
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1069 — Permission Groups Discovery
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_group_discovery:
+  name: "Permission Groups Discovery — Admin Group Enumeration"
+  description: >
+    Detects enumeration of local and domain groups, especially privileged
+    groups like Domain Admins, Enterprise Admins, and local Administrators.
+  mitre:
+    tactic: "Discovery"
+    technique: "T1069.002"
+    technique_name: "Permission Groups Discovery: Domain Groups"
+    related_techniques:
+      - "T1069.001: Permission Groups Discovery: Local Groups"
+  severity: medium
+  confidence: 80
+  risk_score: 65
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "PowerShell Script Block Logging (Event 4104)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+    - "PowerShell Script Block Logging enabled"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    | where match(CommandLine, "(?i)net\s+(localgroup|group)")
+        OR match(CommandLine, "(?i)(Get-ADGroupMember|Get-ADGroup|Get-LocalGroupMember)")
+        OR match(CommandLine, "(?i)(net\s+group\s+.*(Domain Admins|Enterprise Admins|Schema Admins|Administrators))")
+        OR match(CommandLine, "(?i)(dsquery\s+group)")
+        OR match(CommandLine, "(?i)(Get-NetGroup|Find-LocalAdminAccess|Invoke-EnumerateLocalAdmin)")
+    | eval targets_privileged=if(
+        match(CommandLine, "(?i)(Domain Admins|Enterprise Admins|Schema Admins|Administrators|Backup Operators|Account Operators)"),
+        "YES", "NO"
+      )
+    | eval is_bloodhound=if(
+        match(CommandLine, "(?i)(Find-LocalAdminAccess|Invoke-EnumerateLocalAdmin|Get-NetGroup)"),
+        "YES — BloodHound/PowerView", "NO"
+      )
+    | stats
+        count as group_enum_commands,
+        values(CommandLine) as command_list,
+        values(User) as users,
+        max(targets_privileged) as targets_privileged_groups,
+        max(is_bloodhound) as bloodhound_detected,
+        min(_time) as first_seen,
+        max(_time) as last_seen
+        by ComputerName
+    | eval severity=case(
+        bloodhound_detected=="YES — BloodHound/PowerView", "critical",
+        targets_privileged_groups=="YES", "high",
+        1==1, "medium"
+      )
+    | eval mitre_technique="T1069"
+    | table first_seen, last_seen, ComputerName, users, group_enum_commands,
+            targets_privileged_groups, bloodhound_detected, command_list,
+            severity, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Group Discovery — Privileged: $targets_privileged_groups$, BloodHound: $bloodhound_detected$ on $ComputerName$"
+        rule_description: >
+          Permission group enumeration on $ComputerName$ by $users$.
+          Privileged groups targeted: $targets_privileged_groups$.
+        severity: "medium"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          | where match(CommandLine, "(?i)(net group|net localgroup|Get-AD)")
+          | sort -_time | table _time, Image, CommandLine, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 65
+
+  known_false_positives:
+    - "IT admin checking group membership for access reviews"
+
+  tuning_guidance: |
+    1. Domain Admins enumeration from workstations is always suspicious
+    2. BloodHound/PowerView cmdlets are critical findings
+    3. Combine with LDAP connection events for higher confidence
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1135 — Network Share Discovery
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_network_share_discovery:
+  name: "Network Share Discovery — SMB Share Enumeration"
+  description: >
+    Detects enumeration of network shares via net share, net view,
+    Get-SmbShare, and Win32_Share. Also detects scanning multiple hosts
+    for shares (lateral discovery pattern).
+  mitre:
+    tactic: "Discovery"
+    technique: "T1135"
+    technique_name: "Network Share Discovery"
+    related_techniques:
+      - "T1021.002: Remote Services: SMB/Windows Admin Shares"
+  severity: medium
+  confidence: 80
+  risk_score: 65
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Windows Security Event Log (Events 5140, 5145)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+    - "Audit Object Access: File Share enabled (Events 5140/5145)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    | where match(CommandLine, "(?i)(net\s+share|net\s+view\s+\\\\)")
+        OR match(CommandLine, "(?i)(Get-SmbShare|Get-WmiObject\s+Win32_Share|Get-FileShare)")
+        OR match(CommandLine, "(?i)(Invoke-ShareFinder|Find-DomainShare|Find-InterestingDomainShareFile)")
+    | eval is_remote=if(match(CommandLine, "(?i)\\\\\\\\"), "YES", "NO")
+    | eval is_powerview=if(
+        match(CommandLine, "(?i)(Invoke-ShareFinder|Find-DomainShare|Find-InterestingDomainShareFile)"),
+        "YES — PowerView", "NO"
+      )
+    | stats
+        count as share_enum_commands,
+        values(CommandLine) as command_list,
+        values(User) as users,
+        max(is_remote) as remote_enumeration,
+        max(is_powerview) as powerview_detected,
+        min(_time) as first_seen,
+        max(_time) as last_seen
+        by ComputerName
+    | eval mitre_technique="T1135"
+    | table first_seen, last_seen, ComputerName, users, share_enum_commands,
+            remote_enumeration, powerview_detected, command_list, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Share Discovery — Remote: $remote_enumeration$, PowerView: $powerview_detected$ on $ComputerName$"
+        rule_description: >
+          Network share enumeration on $ComputerName$ by $users$.
+        severity: "medium"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          | where match(CommandLine, "(?i)(net share|net view|SmbShare|ShareFinder)")
+          | sort -_time | table _time, Image, CommandLine, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 65
+
+  known_false_positives:
+    - "File server administrators checking share configuration"
+
+  tuning_guidance: |
+    1. PowerView ShareFinder is always malicious — critical finding
+    2. net view to multiple hosts indicates lateral reconnaissance
+    3. Correlate with subsequent SMB file access (Event 5145)
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1049 — System Network Connections Discovery
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_network_connections_discovery:
+  name: "Network Connections Discovery — Active Connection Enumeration"
+  description: >
+    Detects enumeration of active network connections combined with other
+    discovery techniques, indicating compound reconnaissance activity.
+  mitre:
+    tactic: "Discovery"
+    technique: "T1049"
+    technique_name: "System Network Connections Discovery"
+    related_techniques:
+      - "T1016: System Network Configuration Discovery"
+  severity: low
+  confidence: 70
+  risk_score: 45
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    | where match(CommandLine, "(?i)(netstat\s+-[abnop]|Get-NetTCPConnection|Get-NetUDPEndpoint)")
+        OR match(CommandLine, "(?i)(tasklist\s+/svc|tasklist\s+/v)")
+    | bin _time span=120s
+    | stats
+        count as conn_enum_commands,
+        values(CommandLine) as command_list,
+        values(User) as users,
+        min(_time) as first_seen,
+        max(_time) as last_seen
+        by ComputerName, _time
+    | where conn_enum_commands >= 2
+    | eval mitre_technique="T1049"
+    | table first_seen, last_seen, ComputerName, users, conn_enum_commands,
+            command_list, mitre_technique
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+
+  throttle:
+    field: "ComputerName"
+    period: "2h"
+
+  actions:
+    - notable_event:
+        rule_title: "Network Connection Discovery on $ComputerName$"
+        rule_description: >
+          Active network connections were enumerated on $ComputerName$.
+        severity: "low"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          | where match(CommandLine, "(?i)(netstat|Get-NetTCPConnection)")
+          | sort -_time | table _time, Image, CommandLine, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 45
+
+  known_false_positives:
+    - "Administrators troubleshooting network issues"
+    - "Network monitoring scripts"
+
+  tuning_guidance: |
+    1. Low priority alone; combine with other discovery for compound detection
+    2. netstat -b from non-admin accounts is more suspicious
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1046 — Network Service Scanning
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_network_service_scanning:
+  name: "Network Service Scanning — Port Scan Detection"
+  description: >
+    Detects port scanning tools (nmap, masscan, Advanced Port Scanner) and
+    behavioral port scanning patterns (high-volume Sysmon Event 3 connections
+    to many destinations on the same port from a single host).
+  mitre:
+    tactic: "Discovery"
+    technique: "T1046"
+    technique_name: "Network Service Scanning"
+    related_techniques:
+      - "T1018: Remote System Discovery"
+  severity: high
+  confidence: 85
+  risk_score: 80
+  kill_chain_phase: "Reconnaissance"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Sysmon Event 3 (Network Connection)"
+  prerequisites:
+    - "Sysmon installed with Process Creation and Network Connection logging"
+
+  search: |
+    (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+        ```Known scanning tools```
+        (match(Image, "(?i)(nmap|masscan|zmap|Advanced.Port.Scanner|PortScan|ScanLine|angry.?ip)")
+         OR match(CommandLine, "(?i)(Test-NetConnection.*-Port|1\.\.65535|1\.\.1024)")))
+    OR
+    (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=3
+        Initiated="true"
+        ```Behavioral: many destinations on same port from single host```
+        | bin _time span=60s
+        | stats dc(DestinationIp) as unique_destinations,
+                values(DestinationPort) as ports_scanned,
+                values(Image) as scanning_processes
+                by ComputerName, DestinationPort, _time
+        | where unique_destinations >= 20)
+    | eval scan_type=case(
+        match(Image, "(?i)nmap"), "Nmap Scanner",
+        match(Image, "(?i)masscan"), "Masscan",
+        EventCode==3 AND unique_destinations>=20, "Behavioral Port Scan",
+        match(CommandLine, "(?i)Test-NetConnection"), "PowerShell Port Scan",
+        1==1, "Port Scanning Tool"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        values(scan_type) as scan_types,
+        values(CommandLine) as command_lines,
+        values(User) as users,
+        max(unique_destinations) as max_targets_scanned
+        by ComputerName
+    | eval mitre_technique="T1046"
+    | table first_seen, last_seen, ComputerName, scan_types, users,
+            max_targets_scanned, command_lines, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Port Scanning — $scan_types$ from $ComputerName$"
+        rule_description: >
+          Port scanning detected from $ComputerName$. Type: $scan_types$.
+          Targets scanned: $max_targets_scanned$. Port scanning from
+          internal hosts indicates active reconnaissance or compromised host.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode IN (1, 3) ComputerName="$ComputerName$"
+          | sort -_time | table _time, EventCode, Image, CommandLine, DestinationIp, DestinationPort
+          | head 100
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "Authorized vulnerability scanners (Nessus, Qualys, Rapid7)"
+    - "Network monitoring tools performing service checks"
+
+  tuning_guidance: |
+    1. Create a lookup of authorized scanner IPs and exclude them
+    2. 20+ unique destinations on same port in 60s is a clear scan
+    3. Nmap/masscan on workstations is always suspicious
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  query_1_full_recon_timeline:
+    name: "Complete reconnaissance timeline for a host"
+    description: >
+      Reconstruct all discovery activity on a host in the last 24 hours.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=1 ComputerName="<INSERT_HOST>"
+          earliest="-24h" latest="now"
+      | where match(Image, "(?i)\\\\(net|net1|whoami|systeminfo|ipconfig|netstat|arp|route|nslookup|nbtstat|ping|tasklist|hostname|qwinsta|nltest|dsquery)\.exe$")
+          OR match(CommandLine, "(?i)(Get-AD|Get-Net|Get-Local|Get-Smb|Get-Dns|Get-CimInstance)")
+      | sort _time
+      | table _time, Image, CommandLine, ParentImage, User
+
+  query_2_discovery_by_user:
+    name: "All discovery activity by a specific user"
+    description: >
+      Track discovery commands run by a suspected compromised user across all hosts.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=1 User="*<INSERT_USER>*"
+          earliest="-48h" latest="now"
+      | where match(Image, "(?i)\\\\(net|whoami|systeminfo|ipconfig|netstat|nltest|dsquery)\.exe$")
+      | stats count, values(CommandLine) as commands by ComputerName, Image
+      | sort -count
+      | table ComputerName, Image, commands, count
+
+  query_3_port_scan_details:
+    name: "Port scan target analysis"
+    description: >
+      Analyze the targets and ports of a detected scan.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=3 ComputerName="<INSERT_HOST>" Initiated="true"
+          earliest="-1h" latest="now"
+      | stats count, dc(DestinationIp) as targets by DestinationPort, Image
+      | sort -targets
+      | table DestinationPort, Image, targets, count
+
+  query_4_ldap_queries_from_host:
+    name: "LDAP connections from suspected host"
+    description: >
+      Check for LDAP enumeration (BloodHound/SharpHound indicators).
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=3 ComputerName="<INSERT_HOST>"
+          DestinationPort IN (389, 636, 3268, 3269)
+          earliest="-24h" latest="now"
+      | stats count, values(DestinationIp) as dc_targets by Image
+      | sort -count
+      | table Image, dc_targets, count
+
+  query_5_compound_discovery_score:
+    name: "Compound discovery activity score across fleet"
+    description: >
+      Identify hosts with the most discovery activity across all categories.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=1 earliest="-24h" latest="now"
+      | where match(Image, "(?i)\\\\(net|whoami|systeminfo|ipconfig|netstat|arp|nslookup|nltest|nmap)\.exe$")
+      | stats count as total_recon, dc(Image) as unique_tools, values(User) as users
+              by ComputerName
+      | where total_recon >= 5
+      | sort -total_recon
+      | table ComputerName, users, total_recon, unique_tools
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+response_playbook:
+  name: "Windows Discovery Activity — Incident Response Procedure"
+  description: >
+    Response for confirmed reconnaissance activity indicating a compromised
+    host performing post-exploitation enumeration.
+
+  immediate_actions:
+    - step: 1
+      action: "Assess the scope of discovery"
+      detail: >
+        Determine what information the attacker has gathered: user accounts,
+        network topology, admin group membership, shares, services.
+        This reveals their next likely move (privilege escalation or lateral movement).
+
+    - step: 2
+      action: "Identify the initial compromise"
+      detail: >
+        Trace back from the discovery activity to the initial access.
+        Check 4624 logon events, process creation chains, and email logs.
+        Discovery typically occurs minutes to hours after initial access.
+
+    - step: 3
+      action: "Contain the affected host"
+      detail: >
+        If compound discovery (multiple categories) is confirmed, isolate
+        the host. The attacker has gathered intelligence and may be about
+        to escalate or move laterally.
+
+    - step: 4
+      action: "Check for escalation and lateral movement"
+      detail: >
+        After discovery, attackers typically:
+        1. Attempt privilege escalation (check privesc rules)
+        2. Move laterally to identified targets (check lateral movement rules)
+        3. Access discovered shares (check Event 5145)
+        Review all activity from this host after the discovery timestamp.
+
+    - step: 5
+      action: "Reset compromised credentials"
+      detail: >
+        If the attacker enumerated privileged groups and obtained admin
+        credentials, reset passwords for all accounts they may have
+        discovered or targeted.
+
+  forensic_actions:
+    - "Document all commands executed during reconnaissance"
+    - "Map discovered network topology against attacker's likely knowledge"
+    - "Check if discovered admin accounts were subsequently compromised"
+    - "Review network connections for data exfiltration of recon results"
+    - "Assess what lateral movement targets the attacker identified"

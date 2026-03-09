@@ -1,0 +1,1051 @@
+# ==============================================================================
+#  Windows Execution Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for Windows execution techniques used
+#                by adversaries to run malicious code. Covers PowerShell abuse,
+#                WMI execution, LOLBin proxy execution (Rundll32, Regsvr32,
+#                MSHTA, MSBuild, CMSTP), command-shell obfuscation, and
+#                malicious Office macro execution chains.
+#  MITRE ATT&CK: T1059.001, T1059.003, T1047, T1218.011, T1218.010,
+#                T1218.001, T1218.004, T1204.002
+#  Kill Chain   : Execution
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-09
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES (must be configured BEFORE these rules will generate detections):
+#
+#  1. Sysmon deployed on all Windows endpoints with a comprehensive config
+#     (e.g., SwiftOnSecurity or Olaf Hartong sysmon-modular):
+#       - Event 1:  Process Creation (Image, CommandLine, ParentImage)
+#       - Event 3:  Network Connection (DestinationIp, DestinationPort)
+#       - Event 7:  Image Loaded (ImageLoaded, Signed, Signature)
+#       - Event 11: File Create (TargetFilename)
+#
+#  2. Windows Security Audit Policy:
+#       - Audit Process Creation → Success (Event 4688)
+#       - Enable "Include command line in process creation events" GPO
+#
+#  3. PowerShell Logging:
+#       - Module Logging: Enable (Event 4103)
+#       - Script Block Logging: Enable (Event 4104)
+#       - Transcription Logging: Enable (optional, high volume)
+#
+#  4. Log forwarding to Splunk via Universal Forwarder:
+#       sourcetype=XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+#       sourcetype=XmlWinEventLog:Security
+#       sourcetype=XmlWinEventLog:Microsoft-Windows-PowerShell/Operational
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1059.001 — Malicious PowerShell: Encoded Commands & Download Cradles
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_malicious_powershell_execution:
+  name: "Malicious PowerShell — Encoded Commands & Download Cradles"
+  description: >
+    Detects PowerShell execution with encoded commands (-enc, -encodedcommand),
+    common download cradle patterns (IEX, Invoke-Expression, Net.WebClient,
+    DownloadString, DownloadFile, Invoke-WebRequest), and known AMSI bypass
+    strings. Encoded PowerShell is the #1 initial execution vector used by
+    commodity malware, APT groups, and red team frameworks (Cobalt Strike,
+    Empire, Covenant). Legitimate encoded PowerShell is rare outside of
+    SCCM/Intune deployment scripts.
+  mitre:
+    tactic: "Execution"
+    technique: "T1059.001"
+    technique_name: "Command and Scripting Interpreter: PowerShell"
+    related_techniques:
+      - "T1027: Obfuscated Files or Information"
+      - "T1105: Ingress Tool Transfer"
+      - "T1562.001: Impair Defenses: Disable or Modify Tools (AMSI bypass)"
+  severity: high
+  confidence: 85
+  risk_score: 85
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Windows Security Event Log (Event ID 4688)"
+    - "PowerShell Script Block Logging (Event ID 4104)"
+  prerequisites:
+    - "Sysmon installed with Process Creation (Event 1) logging"
+    - "PowerShell Script Block Logging enabled (Event 4104)"
+    - "Command-line auditing enabled for Security Event 4688"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+        (Image="*\\powershell.exe" OR Image="*\\pwsh.exe" OR Image="*\\powershell_ise.exe")
+    ```Detect encoded commands and download cradles in command line```
+    | where match(CommandLine, "(?i)\-(enc|encodedcommand|e |ec |en )")
+        OR match(CommandLine, "(?i)(Invoke\-Expression|IEX|Invoke\-WebRequest|iwr)")
+        OR match(CommandLine, "(?i)(Net\.WebClient|DownloadString|DownloadFile|DownloadData)")
+        OR match(CommandLine, "(?i)(Start\-BitsTransfer|Invoke\-RestMethod|irm)")
+        OR match(CommandLine, "(?i)(New\-Object\s+System\.Net)")
+        OR match(CommandLine, "(?i)(FromBase64String|Convert.*Base64)")
+        OR match(CommandLine, "(?i)(bitstransfer|certutil.*\-urlcache)")
+    ```Exclude known legitimate automation```
+    | search NOT ParentImage IN ("*\\sccm\\*", "*\\ccmexec.exe", "*\\intune*")
+    | eval is_encoded=if(match(CommandLine, "(?i)\-(enc|encodedcommand|e |ec |en )"), "YES", "NO")
+    | eval is_download_cradle=if(match(CommandLine, "(?i)(DownloadString|DownloadFile|Invoke\-WebRequest|Net\.WebClient|Start\-BitsTransfer)"), "YES", "NO")
+    | eval risk=case(
+        is_encoded=="YES" AND is_download_cradle=="YES", "CRITICAL",
+        is_encoded=="YES", "HIGH",
+        is_download_cradle=="YES", "HIGH",
+        1==1, "MEDIUM"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(CommandLine) as command_lines,
+        values(ParentImage) as parent_processes,
+        values(User) as users,
+        max(risk) as risk_level
+        by ComputerName, Image
+    | eval mitre_technique="T1059.001"
+    | eval mitre_tactic="Execution"
+    | eval alert_name="Malicious PowerShell — Encoded Commands & Download Cradles"
+    | table first_seen, last_seen, ComputerName, Image, users, parent_processes,
+            event_count, command_lines, is_encoded, is_download_cradle,
+            risk_level, mitre_technique, mitre_tactic, alert_name
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Malicious PowerShell Execution — $ComputerName$ by $users$"
+        rule_description: >
+          PowerShell was executed with encoded commands or download cradle
+          patterns on $ComputerName$ by $users$. Parent process: $parent_processes$.
+          Review command lines for IOCs and check for follow-on execution.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=1 ComputerName="$ComputerName$"
+          (Image="*\\powershell.exe" OR Image="*\\pwsh.exe")
+          | sort -_time | table _time, Image, CommandLine, ParentImage, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 85
+
+  known_false_positives:
+    - "SCCM/Intune deployment scripts using encoded commands — add parent process to exclusion"
+    - "Legitimate admin automation using Invoke-WebRequest for package downloads"
+    - "Azure Arc or DSC configuration scripts"
+
+  tuning_guidance: |
+    1. Baseline encoded PowerShell in your environment for 2 weeks before enabling alerts
+    2. Exclude SCCM (ccmexec.exe) and Intune parent processes if they generate noise
+    3. Add legitimate automation service accounts to an allowlist lookup
+    4. Focus high-severity alerts on workstations; servers may need higher thresholds
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1059.003 — Suspicious Windows Command Shell Usage
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_suspicious_cmd_shell:
+  name: "Suspicious Windows Command Shell — Unusual Parent Process"
+  description: >
+    Detects cmd.exe spawned by unusual parent processes that typically indicate
+    exploitation or LOLBin abuse. Office applications, script engines, web
+    servers, and proxy execution binaries should rarely spawn cmd.exe in
+    normal operations. This pattern is a hallmark of macro-based malware,
+    exploit chains, and living-off-the-land attacks.
+  mitre:
+    tactic: "Execution"
+    technique: "T1059.003"
+    technique_name: "Command and Scripting Interpreter: Windows Command Shell"
+    related_techniques:
+      - "T1204.002: User Execution: Malicious File"
+      - "T1218: System Binary Proxy Execution"
+  severity: high
+  confidence: 80
+  risk_score: 80
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Windows Security Event Log (Event ID 4688)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+    - "Command-line auditing enabled for Security Event 4688"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+        Image="*\\cmd.exe"
+    ```Flag cmd.exe spawned by suspicious parent processes```
+    | where match(ParentImage, "(?i)(wmiprvse|mshta|regsvr32|rundll32|cscript|wscript)")
+        OR match(ParentImage, "(?i)(excel|winword|powerpnt|outlook|onenote|msaccess)")
+        OR match(ParentImage, "(?i)(msbuild|cmstp|certutil|hh\.exe|ieexec)")
+        OR match(ParentImage, "(?i)(w3wp|httpd|tomcat|java|nginx)")
+        OR match(ParentImage, "(?i)(svchost\.exe.*\-k\s+DcomLaunch)")
+    ```Classify parent type for triage```
+    | eval parent_category=case(
+        match(ParentImage, "(?i)(excel|winword|powerpnt|outlook|onenote|msaccess)"), "Office Application",
+        match(ParentImage, "(?i)(wmiprvse)"), "WMI Provider",
+        match(ParentImage, "(?i)(mshta|regsvr32|rundll32|cscript|wscript)"), "Script/LOLBin",
+        match(ParentImage, "(?i)(msbuild|cmstp|certutil)"), "Proxy Execution Binary",
+        match(ParentImage, "(?i)(w3wp|httpd|tomcat|java|nginx)"), "Web Server",
+        1==1, "Other Suspicious"
+      )
+    | eval severity=case(
+        parent_category=="Office Application", "critical",
+        parent_category=="Web Server", "critical",
+        parent_category=="WMI Provider", "high",
+        1==1, "high"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(CommandLine) as cmd_commands,
+        values(ParentCommandLine) as parent_cmd_lines,
+        values(User) as users
+        by ComputerName, ParentImage, parent_category, severity
+    | eval mitre_technique="T1059.003"
+    | table first_seen, last_seen, ComputerName, ParentImage, parent_category,
+            users, event_count, cmd_commands, parent_cmd_lines, severity,
+            mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "30m"
+
+  actions:
+    - notable_event:
+        rule_title: "Suspicious cmd.exe — spawned by $parent_category$ on $ComputerName$"
+        rule_description: >
+          cmd.exe was spawned by $ParentImage$ ($parent_category$) on
+          $ComputerName$. This pattern indicates potential exploitation,
+          macro execution, or LOLBin abuse. Immediate investigation required.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          ParentImage="$ParentImage$"
+          | sort -_time | table _time, Image, CommandLine, ParentImage, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "Office add-ins that legitimately launch cmd.exe for configuration"
+    - "WMI-based monitoring tools spawning cmd for health checks"
+    - "Web application CGI scripts (rare in modern environments)"
+
+  tuning_guidance: |
+    1. Office-to-cmd.exe chains are almost always malicious — keep severity critical
+    2. WMI provider (wmiprvse.exe) spawning cmd may occur from SCCM — baseline first
+    3. Web server to cmd chains indicate webshell or RCE — always investigate
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1047 — WMI Execution for Lateral Movement & Persistence
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_wmi_execution:
+  name: "WMI Remote Execution — Process Create via WMIC or WMI Provider"
+  description: >
+    Detects Windows Management Instrumentation (WMI) being used to execute
+    commands locally or remotely. Adversaries use wmic.exe process call create,
+    Invoke-WmiMethod, or direct WMI provider (wmiprvse.exe) child process
+    spawning for execution and lateral movement. WMI event subscriptions
+    (Events 19/20/21) are covered separately under persistence.
+  mitre:
+    tactic: "Execution"
+    technique: "T1047"
+    technique_name: "Windows Management Instrumentation"
+    related_techniques:
+      - "T1021.002: Remote Services: SMB/Windows Admin Shares"
+      - "T1546.003: Event Triggered Execution: WMI Event Subscription"
+  severity: high
+  confidence: 80
+  risk_score: 80
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Windows Security Event Log (Event ID 4688)"
+    - "Sysmon Events 19/20/21 (WMI Event Subscription)"
+  prerequisites:
+    - "Sysmon installed with Process Creation and WMI event logging"
+    - "Command-line auditing enabled for Security Event 4688"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    (
+        ```Detect wmic.exe process create commands```
+        (Image="*\\wmic.exe" AND CommandLine="*process*call*create*")
+        OR
+        ```Detect wmic with /node: for remote execution```
+        (Image="*\\wmic.exe" AND CommandLine="*/node:*")
+        OR
+        ```Detect wmiprvse.exe spawning suspicious child processes```
+        (ParentImage="*\\wmiprvse.exe" AND
+            (Image="*\\cmd.exe" OR Image="*\\powershell.exe" OR Image="*\\pwsh.exe"
+             OR Image="*\\mshta.exe" OR Image="*\\rundll32.exe"
+             OR Image="*\\regsvr32.exe" OR Image="*\\cscript.exe"
+             OR Image="*\\wscript.exe"))
+    )
+    ```Exclude legitimate WMI usage from known management tools```
+    | search NOT User IN ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE")
+        OR (ParentImage="*\\wmiprvse.exe" AND
+            NOT Image IN ("*\\WmiPrvSE.exe", "*\\WmiApSrv.exe"))
+    | eval is_remote=if(match(CommandLine, "(?i)/node:"), "YES", "NO")
+    | eval execution_type=case(
+        match(Image, "(?i)wmic\.exe") AND match(CommandLine, "(?i)/node:"), "Remote WMI (wmic /node)",
+        match(Image, "(?i)wmic\.exe"), "Local WMI (wmic process call create)",
+        match(ParentImage, "(?i)wmiprvse\.exe"), "WMI Provider Child Spawn",
+        1==1, "WMI Related"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(CommandLine) as command_lines,
+        values(ParentImage) as parent_processes,
+        values(User) as users
+        by ComputerName, Image, execution_type, is_remote
+    | eval mitre_technique="T1047"
+    | table first_seen, last_seen, ComputerName, Image, execution_type,
+            is_remote, users, event_count, command_lines, parent_processes,
+            mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "WMI Execution — $execution_type$ on $ComputerName$"
+        rule_description: >
+          WMI was used for $execution_type$ on $ComputerName$ by $users$.
+          Remote WMI execution is a common lateral movement technique.
+          Review command lines and investigate source host.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          (Image="*\\wmic.exe" OR ParentImage="*\\wmiprvse.exe")
+          | sort -_time | table _time, Image, CommandLine, ParentImage, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "SCCM client health checks using wmic"
+    - "Enterprise monitoring tools (SolarWinds, PRTG) querying WMI"
+    - "IT automation scripts running wmic for inventory"
+
+  tuning_guidance: |
+    1. Remote WMI (/node:) from workstations is almost always suspicious
+    2. Baseline wmiprvse.exe child processes in your environment
+    3. SCCM generates WMI activity — exclude ccmexec.exe parent chain
+    4. Focus on wmiprvse spawning cmd/PowerShell — this is the high-fidelity signal
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1218.011 — Rundll32 Proxy Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_rundll32_proxy_execution:
+  name: "Rundll32 Proxy Execution — Suspicious DLL Loading"
+  description: >
+    Detects rundll32.exe being abused as a proxy execution binary to load
+    malicious DLLs, execute JavaScript via the javascript: protocol handler,
+    or spawn suspicious child processes. Rundll32 is one of the most commonly
+    abused LOLBins because it is a signed Microsoft binary that can load
+    arbitrary DLLs. Adversaries use it to bypass application whitelisting
+    and evade detection.
+  mitre:
+    tactic: "Execution"
+    technique: "T1218.011"
+    technique_name: "System Binary Proxy Execution: Rundll32"
+    related_techniques:
+      - "T1055.001: Process Injection: Dynamic-link Library Injection"
+      - "T1036: Masquerading"
+  severity: high
+  confidence: 75
+  risk_score: 75
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Windows Security Event Log (Event ID 4688)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+    - "Command-line auditing enabled"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+        Image="*\\rundll32.exe"
+    | where
+        ```DLL loaded from suspicious paths```
+        match(CommandLine, "(?i)(\\\\Temp\\\\|\\\\AppData\\\\|\\\\Downloads\\\\|\\\\Users\\\\Public\\\\)")
+        OR
+        ```JavaScript protocol handler abuse```
+        match(CommandLine, "(?i)javascript:")
+        OR
+        ```Rundll32 with no arguments or unusual exports```
+        (CommandLine=="rundll32.exe" OR CommandLine=="rundll32")
+        OR
+        ```Known malicious DLL export patterns```
+        match(CommandLine, "(?i)(DllRegisterServer|DllInstall|Control_RunDLL)")
+        AND match(CommandLine, "(?i)(\\\\Temp\\\\|\\\\AppData\\\\|\\\\Downloads\\\\)")
+        OR
+        ```Rundll32 spawned by suspicious parent```
+        match(ParentImage, "(?i)(excel|winword|powerpnt|outlook|mshta|wscript|cscript)")
+    | eval suspicious_indicator=case(
+        match(CommandLine, "(?i)javascript:"), "JavaScript protocol handler",
+        match(CommandLine, "(?i)(\\\\Temp\\\\|\\\\AppData\\\\|\\\\Downloads\\\\)"), "DLL from user-writable path",
+        (CommandLine=="rundll32.exe" OR CommandLine=="rundll32"), "No arguments (injected)",
+        match(ParentImage, "(?i)(excel|winword|powerpnt|outlook)"), "Office parent process",
+        1==1, "Suspicious pattern"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(CommandLine) as command_lines,
+        values(ParentImage) as parent_processes,
+        values(User) as users
+        by ComputerName, suspicious_indicator
+    | eval mitre_technique="T1218.011"
+    | table first_seen, last_seen, ComputerName, suspicious_indicator, users,
+            event_count, command_lines, parent_processes, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Rundll32 Proxy Execution — $suspicious_indicator$ on $ComputerName$"
+        rule_description: >
+          Rundll32.exe executed with suspicious parameters on $ComputerName$.
+          Indicator: $suspicious_indicator$. Review DLL path and parent process chain.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          Image="*\\rundll32.exe"
+          | sort -_time | table _time, CommandLine, ParentImage, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 75
+
+  known_false_positives:
+    - "Legitimate software using rundll32 for DLL registration"
+    - "Control Panel applet execution (shell32.dll,Control_RunDLL)"
+    - "Printer driver installation"
+
+  tuning_guidance: |
+    1. JavaScript protocol handler is almost always malicious — keep high severity
+    2. Rundll32 with no arguments indicates process injection — critical finding
+    3. Baseline legitimate rundll32 usage from system processes before tuning
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1218.010 — Regsvr32 (Squiblydoo) Proxy Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_regsvr32_squiblydoo:
+  name: "Regsvr32 Squiblydoo — Script Object Proxy Execution"
+  description: >
+    Detects regsvr32.exe abuse (Squiblydoo attack) where it is used with
+    /s /u /i:URL to load remote SCT scriptlets via scrobj.dll, or when
+    regsvr32 makes outbound network connections. This technique bypasses
+    AppLocker default rules and does not require admin privileges.
+  mitre:
+    tactic: "Execution"
+    technique: "T1218.010"
+    technique_name: "System Binary Proxy Execution: Regsvr32"
+    related_techniques:
+      - "T1218.011: Rundll32"
+      - "T1059.005: Visual Basic"
+  severity: critical
+  confidence: 90
+  risk_score: 90
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Sysmon Event 3 (Network Connection)"
+    - "Windows Security Event Log (Event ID 4688)"
+  prerequisites:
+    - "Sysmon installed with Process Creation and Network Connection logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+        Image="*\\regsvr32.exe"
+    | where
+        ```Classic Squiblydoo: /s /u /i:URL scrobj.dll```
+        match(CommandLine, "(?i)/i:http")
+        OR match(CommandLine, "(?i)/i:\\\\\\\\")
+        OR match(CommandLine, "(?i)scrobj\.dll")
+        OR
+        ```Regsvr32 loading DLL from suspicious path```
+        match(CommandLine, "(?i)(\\\\Temp\\\\|\\\\AppData\\\\|\\\\Downloads\\\\|\\\\Users\\\\Public)")
+        OR
+        ```Regsvr32 spawned by unusual parent```
+        match(ParentImage, "(?i)(excel|winword|powerpnt|outlook|mshta|wscript|cscript|cmd\.exe)")
+    | eval attack_type=case(
+        match(CommandLine, "(?i)/i:http"), "Squiblydoo (remote SCT)",
+        match(CommandLine, "(?i)scrobj\.dll"), "Script Object Loading",
+        match(CommandLine, "(?i)(\\\\Temp\\\\|\\\\AppData\\\\)"), "DLL from user-writable path",
+        1==1, "Suspicious regsvr32 usage"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(CommandLine) as command_lines,
+        values(ParentImage) as parent_processes,
+        values(User) as users
+        by ComputerName, attack_type
+    | eval mitre_technique="T1218.010"
+    | table first_seen, last_seen, ComputerName, attack_type, users,
+            event_count, command_lines, parent_processes, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Regsvr32 Squiblydoo — $attack_type$ on $ComputerName$"
+        rule_description: >
+          Regsvr32.exe was used for proxy execution ($attack_type$) on
+          $ComputerName$. This bypasses AppLocker and application whitelisting.
+          Immediate investigation required.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog (EventCode=1 OR EventCode=3) ComputerName="$ComputerName$"
+          Image="*\\regsvr32.exe"
+          | sort -_time | table _time, EventCode, Image, CommandLine, ParentImage,
+                  DestinationIp, DestinationPort
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "Legitimate COM DLL registration during software installation"
+    - "Windows Update registering DLLs (rare, from trusted paths)"
+
+  tuning_guidance: |
+    1. Squiblydoo (/i:http) is almost always malicious — no tuning needed
+    2. Legitimate regsvr32 loads DLLs from System32 or Program Files
+    3. Any regsvr32 loading from Temp/AppData/Downloads is suspicious
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1218.001/T1218.005 — MSHTA & Msiexec Proxy Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_mshta_msiexec_proxy_execution:
+  name: "MSHTA / Msiexec Proxy Execution — HTA and MSI Abuse"
+  description: >
+    Detects mshta.exe executing VBScript/JScript inline or from HTA files
+    (local or remote), and msiexec.exe with quiet install from URL. MSHTA
+    can execute arbitrary scripts and is commonly used for initial access
+    and payload delivery. Msiexec can silently install remote MSI packages.
+  mitre:
+    tactic: "Execution"
+    technique: "T1218.001"
+    technique_name: "System Binary Proxy Execution: Mshta"
+    related_techniques:
+      - "T1218.005: System Binary Proxy Execution: Msiexec"
+      - "T1059.005: Command and Scripting Interpreter: Visual Basic"
+  severity: high
+  confidence: 85
+  risk_score: 85
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Sysmon Event 3 (Network Connection)"
+    - "Windows Security Event Log (Event ID 4688)"
+  prerequisites:
+    - "Sysmon installed with Process Creation and Network Connection logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    (
+        ```MSHTA executing inline scripts or remote HTA```
+        (Image="*\\mshta.exe" AND
+            (match(CommandLine, "(?i)(vbscript:|javascript:)")
+             OR match(CommandLine, "(?i)http[s]?://")
+             OR match(CommandLine, "(?i)\\\\\\\\.*\.hta")))
+        OR
+        ```MSHTA spawning suspicious child processes```
+        (ParentImage="*\\mshta.exe" AND
+            (Image="*\\cmd.exe" OR Image="*\\powershell.exe" OR Image="*\\pwsh.exe"
+             OR Image="*\\wscript.exe" OR Image="*\\cscript.exe"))
+        OR
+        ```Msiexec quiet install from URL```
+        (Image="*\\msiexec.exe" AND
+            match(CommandLine, "(?i)/q") AND match(CommandLine, "(?i)http[s]?://"))
+    )
+    | eval proxy_binary=case(
+        match(Image, "(?i)mshta\.exe"), "MSHTA",
+        match(Image, "(?i)msiexec\.exe"), "Msiexec",
+        match(ParentImage, "(?i)mshta\.exe"), "MSHTA (child spawn)",
+        1==1, "Unknown"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(CommandLine) as command_lines,
+        values(ParentImage) as parent_processes,
+        values(User) as users
+        by ComputerName, Image, proxy_binary
+    | eval mitre_technique=if(proxy_binary=="Msiexec", "T1218.005", "T1218.001")
+    | table first_seen, last_seen, ComputerName, proxy_binary, Image, users,
+            event_count, command_lines, parent_processes, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "$proxy_binary$ Proxy Execution on $ComputerName$"
+        rule_description: >
+          $proxy_binary$ was used for proxy execution on $ComputerName$.
+          MSHTA and Msiexec bypass AppLocker and can execute remote payloads.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          (Image="*\\mshta.exe" OR Image="*\\msiexec.exe" OR ParentImage="*\\mshta.exe")
+          | sort -_time | table _time, Image, CommandLine, ParentImage, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 85
+
+  known_false_positives:
+    - "Legitimate HTA-based internal tools (rare in modern environments)"
+    - "Software deployment via msiexec from internal package servers"
+
+  tuning_guidance: |
+    1. MSHTA with inline vbscript:/javascript: is almost always malicious
+    2. Msiexec from external URLs is highly suspicious — internal repos are OK
+    3. Add internal MSI distribution URLs to an allowlist
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1218.004 — MSBuild Proxy Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_msbuild_proxy_execution:
+  name: "MSBuild Proxy Execution — Inline Task Code Compilation"
+  description: >
+    Detects MSBuild.exe being used to compile and execute inline C#/VB.NET
+    task code, which bypasses AppLocker and application whitelisting. Adversaries
+    craft malicious .csproj or .xml files containing embedded code that MSBuild
+    compiles and executes at runtime. MSBuild running from non-developer
+    workstations or spawning shells is highly suspicious.
+  mitre:
+    tactic: "Execution"
+    technique: "T1218.004"
+    technique_name: "System Binary Proxy Execution: MSBuild"
+    related_techniques:
+      - "T1127.001: Trusted Developer Utilities Proxy Execution: MSBuild"
+  severity: high
+  confidence: 85
+  risk_score: 85
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Windows Security Event Log (Event ID 4688)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    (
+        ```MSBuild executing project files from suspicious locations```
+        (Image="*\\MSBuild.exe" AND
+            (match(CommandLine, "(?i)(\\\\Temp\\\\|\\\\AppData\\\\|\\\\Downloads\\\\|\\\\Users\\\\Public)")
+             OR match(CommandLine, "(?i)\.(csproj|vbproj|xml|targets)")
+             AND NOT match(CommandLine, "(?i)\\\\Program Files")))
+        OR
+        ```MSBuild spawning suspicious child processes```
+        (ParentImage="*\\MSBuild.exe" AND
+            (Image="*\\cmd.exe" OR Image="*\\powershell.exe" OR Image="*\\pwsh.exe"
+             OR Image="*\\rundll32.exe" OR Image="*\\regsvr32.exe"))
+    )
+    ```Exclude legitimate developer build activity```
+    | search NOT ParentImage IN ("*\\devenv.exe", "*\\Visual Studio*", "*\\dotnet.exe")
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(CommandLine) as command_lines,
+        values(ParentImage) as parent_processes,
+        values(User) as users
+        by ComputerName, Image
+    | eval mitre_technique="T1218.004"
+    | table first_seen, last_seen, ComputerName, Image, users, event_count,
+            command_lines, parent_processes, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "MSBuild Proxy Execution on $ComputerName$"
+        rule_description: >
+          MSBuild.exe was used outside of normal development context on
+          $ComputerName$. This may indicate inline task code compilation
+          for AppLocker bypass. Review project file contents.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          (Image="*\\MSBuild.exe" OR ParentImage="*\\MSBuild.exe")
+          | sort -_time | table _time, Image, CommandLine, ParentImage, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 85
+
+  known_false_positives:
+    - "Developers building projects from command line (exclude developer workstations)"
+    - "CI/CD build agents running MSBuild (exclude build server hosts)"
+
+  tuning_guidance: |
+    1. Create a lookup of developer workstations and CI/CD servers to exclude
+    2. MSBuild on non-developer machines is always suspicious
+    3. MSBuild spawning cmd/PowerShell is a high-confidence indicator
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1204.002 — Malicious File Execution: Office Macro Chains
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_office_macro_execution_chain:
+  name: "Office Macro Execution Chain — Office App Spawning Suspicious Child"
+  description: >
+    Detects Microsoft Office applications (Word, Excel, PowerPoint, Outlook,
+    Access, OneNote) spawning suspicious child processes that indicate VBA
+    macro execution, DDE exploitation, or embedded object abuse. Also detects
+    wscript/cscript executing files from temp/downloads directories, which
+    indicates script-based malware delivery.
+  mitre:
+    tactic: "Execution"
+    technique: "T1204.002"
+    technique_name: "User Execution: Malicious File"
+    related_techniques:
+      - "T1059.005: Visual Basic"
+      - "T1559.002: Dynamic Data Exchange"
+      - "T1566.001: Phishing: Spearphishing Attachment"
+  severity: critical
+  confidence: 90
+  risk_score: 95
+  kill_chain_phase: "Execution"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation)"
+    - "Windows Security Event Log (Event ID 4688)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+    - "Command-line auditing enabled for Security Event 4688"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    (
+        ```Office app spawning suspicious child processes```
+        (match(ParentImage, "(?i)(WINWORD|EXCEL|POWERPNT|OUTLOOK|MSACCESS|ONENOTE)\.EXE")
+         AND (Image="*\\cmd.exe" OR Image="*\\powershell.exe" OR Image="*\\pwsh.exe"
+              OR Image="*\\wscript.exe" OR Image="*\\cscript.exe"
+              OR Image="*\\mshta.exe" OR Image="*\\rundll32.exe"
+              OR Image="*\\regsvr32.exe" OR Image="*\\certutil.exe"
+              OR Image="*\\schtasks.exe" OR Image="*\\bitsadmin.exe"
+              OR Image="*\\net.exe" OR Image="*\\net1.exe"))
+        OR
+        ```Script engines executing from temp/downloads```
+        ((Image="*\\wscript.exe" OR Image="*\\cscript.exe") AND
+            match(CommandLine, "(?i)(\\\\Temp\\\\|\\\\Downloads\\\\|\\\\AppData\\\\|\\\\INetCache\\\\)"))
+    )
+    | eval trigger_type=case(
+        match(ParentImage, "(?i)WINWORD\.EXE"), "Word Macro Execution",
+        match(ParentImage, "(?i)EXCEL\.EXE"), "Excel Macro Execution",
+        match(ParentImage, "(?i)POWERPNT\.EXE"), "PowerPoint Macro Execution",
+        match(ParentImage, "(?i)OUTLOOK\.EXE"), "Outlook Macro/OLE Execution",
+        match(ParentImage, "(?i)ONENOTE\.EXE"), "OneNote Embedded Object",
+        match(Image, "(?i)(wscript|cscript)\.exe"), "Script Engine from Temp Directory",
+        1==1, "Office-related Execution"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(CommandLine) as child_commands,
+        values(ParentCommandLine) as parent_commands,
+        values(User) as users
+        by ComputerName, ParentImage, Image, trigger_type
+    | eval mitre_technique="T1204.002"
+    | eval severity="critical"
+    | table first_seen, last_seen, ComputerName, trigger_type, ParentImage,
+            Image, users, event_count, child_commands, parent_commands,
+            severity, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "30m"
+
+  actions:
+    - notable_event:
+        rule_title: "$trigger_type$ — $Image$ spawned on $ComputerName$"
+        rule_description: >
+          An Office application ($ParentImage$) spawned $Image$ on
+          $ComputerName$, indicating macro execution or embedded object
+          abuse. This is a critical indicator of phishing payload delivery.
+          Immediately isolate the host and investigate the document.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog EventCode=1 ComputerName="$ComputerName$"
+          | where match(ParentImage, "(?i)(WINWORD|EXCEL|POWERPNT|OUTLOOK)")
+          | sort -_time | table _time, Image, CommandLine, ParentImage, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 95
+
+  known_false_positives:
+    - "Legitimate Office add-ins that launch helper processes (very rare)"
+    - "Office automation macros in controlled environments"
+
+  tuning_guidance: |
+    1. Office spawning cmd/PowerShell is almost always malicious — keep critical
+    2. Consider deploying ASR rules to block Office child process creation
+    3. OneNote spawning processes indicates embedded object abuse (CVE-2023-21716)
+    4. Script engines from INetCache indicate downloaded content execution
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  query_1_full_process_tree:
+    name: "Full process tree for suspected execution"
+    description: >
+      Reconstruct the complete process execution chain from initial parent
+      to all descendants to understand the full attack flow.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=1 ComputerName="<INSERT_HOST>"
+          earliest="-24h" latest="now"
+      | eval process_chain=ParentImage." → ".Image
+      | stats count, values(CommandLine) as commands,
+              values(User) as users, min(_time) as first_seen
+              by ParentImage, Image, process_chain
+      | sort first_seen
+      | table first_seen, process_chain, commands, users, count
+
+  query_2_powershell_script_blocks:
+    name: "PowerShell Script Block content for host"
+    description: >
+      Retrieve all PowerShell Script Block Logging events to see the
+      actual code that was executed (decoded, not just command line).
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-PowerShell/Operational"
+          EventCode=4104 ComputerName="<INSERT_HOST>"
+          earliest="-24h" latest="now"
+      | sort _time
+      | table _time, ScriptBlockText, Path, UserID
+      | head 100
+
+  query_3_network_connections_from_host:
+    name: "All outbound network connections from suspected host"
+    description: >
+      Identify C2 callbacks, download destinations, and lateral movement
+      connections from the compromised host.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=3 ComputerName="<INSERT_HOST>"
+          Initiated="true"
+          earliest="-24h" latest="now"
+      | stats count, values(DestinationPort) as ports, min(_time) as first_seen,
+              max(_time) as last_seen
+              by Image, DestinationIp
+      | sort -count
+      | table first_seen, last_seen, Image, DestinationIp, ports, count
+
+  query_4_file_creation_events:
+    name: "Files created on suspected host"
+    description: >
+      Identify payloads dropped, tools transferred, and persistence
+      mechanisms written to disk.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=11 ComputerName="<INSERT_HOST>"
+          earliest="-24h" latest="now"
+      | where match(TargetFilename, "(?i)\.(exe|dll|ps1|bat|cmd|vbs|js|hta|sct|inf|scr|com)$")
+      | stats count, values(Image) as creating_process
+              by TargetFilename
+      | sort -count
+      | table TargetFilename, creating_process, count
+
+  query_5_lolbin_activity_timeline:
+    name: "LOLBin execution timeline for host"
+    description: >
+      Track all LOLBin proxy execution activity on the host to build
+      a complete picture of attacker tool usage.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=1 ComputerName="<INSERT_HOST>"
+          (Image="*\\rundll32.exe" OR Image="*\\regsvr32.exe" OR Image="*\\mshta.exe"
+           OR Image="*\\msbuild.exe" OR Image="*\\cmstp.exe" OR Image="*\\certutil.exe"
+           OR Image="*\\wmic.exe" OR Image="*\\msiexec.exe")
+          earliest="-24h" latest="now"
+      | sort _time
+      | table _time, Image, CommandLine, ParentImage, User
+
+  query_6_user_logon_activity:
+    name: "Logon activity for suspected user account"
+    description: >
+      Check all authentication events for the user to identify
+      compromised credential usage across multiple hosts.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security"
+          EventCode IN (4624, 4625) Target_User_Name="<INSERT_USER>"
+          earliest="-24h" latest="now"
+      | stats count by ComputerName, Logon_Type, Source_Network_Address, EventCode
+      | sort -count
+      | table ComputerName, Logon_Type, Source_Network_Address, EventCode, count
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+response_playbook:
+  name: "Windows Execution Attack — Incident Response Procedure"
+  description: >
+    Step-by-step response procedure for confirmed malicious execution
+    activity on a Windows endpoint. Covers initial containment, evidence
+    collection, and remediation.
+
+  immediate_actions:
+    - step: 1
+      action: "Isolate the affected host from the network"
+      detail: >
+        Use EDR network containment or disable the network adapter.
+        Do NOT power off the machine — preserve volatile memory evidence.
+        If EDR containment is available, prefer it over physical isolation.
+
+    - step: 2
+      action: "Identify and terminate malicious processes"
+      detail: >
+        Review the process tree from the alert. Kill the malicious process
+        and all child processes. Use: taskkill /F /PID <pid> /T
+        Document PIDs and process names before termination.
+
+    - step: 3
+      action: "Capture volatile evidence"
+      detail: >
+        Collect memory dump (procdump, WinPMEM, or Magnet RAM Capture)
+        before any reboot or cleanup. Also capture: running processes,
+        network connections (netstat -anob), loaded DLLs, scheduled tasks.
+
+    - step: 4
+      action: "Identify the initial access vector"
+      detail: >
+        Determine how the execution was triggered:
+        - Office macro: Find the source document (email attachment, download)
+        - LOLBin: Trace the parent process chain to origin
+        - WMI: Check for remote source IP in logon events
+        Collect the source artifact (document, script, DLL).
+
+    - step: 5
+      action: "Check for persistence mechanisms"
+      detail: >
+        Search for persistence installed by the attacker:
+        - Registry Run keys (HKLM/HKCU\...\Run)
+        - Scheduled tasks (schtasks /query /v)
+        - Services (sc query | findstr "RUNNING")
+        - WMI subscriptions (Get-WmiObject __FilterToConsumerBinding)
+        - Startup folders
+
+    - step: 6
+      action: "Scan for lateral movement"
+      detail: >
+        Check if the attacker moved to other hosts:
+        - Event 4624 type 3/10 from the compromised host to others
+        - SMB connections (Event 5140/5145)
+        - PsExec artifacts (PSEXESVC service)
+        - WMI remote execution from the source host
+
+    - step: 7
+      action: "Block IOCs at perimeter"
+      detail: >
+        Extract and block:
+        - External IPs/domains contacted by the malicious process
+        - File hashes of dropped payloads
+        - Email sender address if phishing was the vector
+        Add to firewall, proxy, and EDR block lists.
+
+  forensic_actions:
+    - "Collect disk image of affected system for forensic analysis"
+    - "Preserve email with attachment if phishing was the delivery method"
+    - "Extract and analyse all dropped files (malware analysis)"
+    - "Check for data staging or exfiltration indicators"
+    - "Review DNS logs for C2 domain resolution"
+    - "Correlate with threat intelligence for campaign attribution"

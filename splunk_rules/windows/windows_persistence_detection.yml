@@ -1,0 +1,1023 @@
+# ==============================================================================
+#  Windows Persistence Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for Windows persistence mechanisms
+#                used by adversaries to maintain access across reboots. Covers
+#                registry Run keys, scheduled tasks, service creation, WMI event
+#                subscriptions, COM hijacking, Winlogon helpers, Active Setup,
+#                DLL search order hijacking, and Office application startup.
+#  MITRE ATT&CK: T1547.001, T1053.005, T1543.003, T1546.003, T1546.015,
+#                T1547.004, T1547.014, T1574.001, T1137
+#  Kill Chain   : Installation / Persistence
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-09
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Sysmon deployed with comprehensive configuration:
+#       - Event 1:  Process Creation
+#       - Event 7:  Image Loaded (DLL monitoring)
+#       - Event 11: File Create
+#       - Event 12: Registry Object Create/Delete
+#       - Event 13: Registry Value Set
+#       - Event 14: Registry Key/Value Rename
+#       - Event 19: WMI EventFilter Activity
+#       - Event 20: WMI EventConsumer Activity
+#       - Event 21: WMI EventConsumerToFilter Activity
+#
+#  2. Windows Security Audit Policy:
+#       - Audit Process Creation → Success (Event 4688 + command line)
+#       - Audit Security System Extension → Success (Event 4697)
+#
+#  3. System Event Log forwarding (Event 7045 — New Service Installed)
+#
+#  4. Task Scheduler Operational Log (Event 4698 — Task Created)
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1547.001 — Registry Run Keys / Startup Folder Persistence
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_registry_run_key_persistence:
+  name: "Registry Run Key / Startup Folder — Persistence Installation"
+  description: >
+    Detects modifications to Windows Registry Run/RunOnce keys and file drops
+    in Startup folders. These are the most common persistence mechanisms
+    used by malware, RATs, and APT toolkits. Entries in these locations
+    execute automatically at user logon or system boot.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1547.001"
+    technique_name: "Boot or Logon Autostart Execution: Registry Run Keys / Startup Folder"
+    related_techniques:
+      - "T1547.009: Boot or Logon Autostart Execution: Shortcut Modification"
+  severity: high
+  confidence: 80
+  risk_score: 80
+  kill_chain_phase: "Installation"
+  data_sources:
+    - "Sysmon Event 13 (Registry Value Set)"
+    - "Sysmon Event 11 (File Create in Startup folder)"
+  prerequisites:
+    - "Sysmon installed with Registry and File Create event logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13
+    ```Registry Run key modifications```
+    | where match(TargetObject, "(?i)\\\\(Run|RunOnce|RunServices|RunServicesOnce)\\\\")
+        OR match(TargetObject, "(?i)\\\\Explorer\\\\Shell Folders\\\\Startup")
+        OR match(TargetObject, "(?i)\\\\Explorer\\\\User Shell Folders\\\\Startup")
+    ```Exclude legitimate software installers and updates```
+    | where NOT match(Image, "(?i)(msiexec|setup|install|update|patch)")
+        AND NOT match(Image, "(?i)\\\\Program Files")
+        AND NOT match(Details, "(?i)\\\\Program Files")
+    ```Flag entries pointing to suspicious locations```
+    | eval suspicious_path=if(
+        match(Details, "(?i)(\\\\Temp\\\\|\\\\AppData\\\\Local\\\\Temp|\\\\Downloads\\\\|\\\\Users\\\\Public|\\\\ProgramData\\\\[^M])"),
+        "YES", "NO"
+      )
+    | eval registry_hive=case(
+        match(TargetObject, "(?i)HKLM"), "Machine (all users)",
+        match(TargetObject, "(?i)HKU\\\\"), "User-specific",
+        1==1, "Unknown"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(TargetObject) as registry_keys,
+        values(Details) as values_set,
+        values(Image) as modifying_processes,
+        values(User) as users
+        by ComputerName, suspicious_path, registry_hive
+    | eval mitre_technique="T1547.001"
+    | table first_seen, last_seen, ComputerName, registry_hive, suspicious_path,
+            modifying_processes, registry_keys, values_set, users, event_count,
+            mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Registry Run Key Persistence — $ComputerName$"
+        rule_description: >
+          A Registry Run key was modified on $ComputerName$ by
+          $modifying_processes$. Value set: $values_set$. Review
+          the binary path for malicious executables.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=13 ComputerName="$ComputerName$"
+          | where match(TargetObject, "(?i)\\\\Run")
+          | sort -_time | table _time, Image, TargetObject, Details, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "Software installation adding legitimate startup entries"
+    - "Antivirus or EDR agent registration"
+    - "IT management tools (SCCM, Intune) deploying configurations"
+
+  tuning_guidance: |
+    1. Build a baseline of legitimate Run key entries across your fleet
+    2. Focus alerts on entries pointing to Temp/AppData/Downloads paths
+    3. Exclude Program Files paths as they are typically legitimate
+    4. HKLM Run keys require admin — higher severity than HKCU
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1053.005 — Scheduled Task Creation for Persistence
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_scheduled_task_persistence:
+  name: "Scheduled Task Persistence — Suspicious Task Creation"
+  description: >
+    Detects creation of scheduled tasks with suspicious actions (PowerShell,
+    cmd, scripts from temp/appdata directories) via schtasks.exe or the
+    Windows Task Scheduler API. Adversaries create scheduled tasks for
+    persistence, privilege escalation (running as SYSTEM), and timed
+    execution of payloads.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1053.005"
+    technique_name: "Scheduled Task/Job: Scheduled Task"
+    related_techniques:
+      - "T1053.005: Privilege Escalation via SYSTEM-level task"
+  severity: high
+  confidence: 85
+  risk_score: 85
+  kill_chain_phase: "Installation"
+  data_sources:
+    - "Sysmon Event 1 (Process Creation — schtasks.exe)"
+    - "Windows Security Event Log (Event ID 4698 — Scheduled Task Created)"
+  prerequisites:
+    - "Sysmon installed with Process Creation logging"
+    - "Audit Object Access → Other Object Access Events (Event 4698)"
+
+  search: |
+    (index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4698)
+    OR
+    (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+        Image="*\\schtasks.exe" CommandLine="*/create*")
+    ```Parse task details from 4698 events```
+    | eval task_action=coalesce(Task_Content, CommandLine)
+    | where match(task_action, "(?i)(powershell|pwsh|cmd\.exe|wscript|cscript|mshta|rundll32)")
+        OR match(task_action, "(?i)(\\\\Temp\\\\|\\\\AppData\\\\|\\\\Downloads\\\\|\\\\Users\\\\Public)")
+        OR match(task_action, "(?i)(certutil|bitsadmin|regsvr32|msbuild)")
+        OR match(task_action, "(?i)(http[s]?://|\\\\\\\\)")
+    ```Exclude known management tools```
+    | search NOT task_action="*\\Microsoft\\Windows\\*"
+    | eval runs_as_system=if(match(task_action, "(?i)(SYSTEM|S-1-5-18)"), "YES", "NO")
+    | eval task_risk=case(
+        runs_as_system=="YES" AND match(task_action, "(?i)(powershell|cmd\.exe)"), "CRITICAL",
+        match(task_action, "(?i)(\\\\Temp\\\\|\\\\AppData\\\\)"), "HIGH",
+        match(task_action, "(?i)http"), "HIGH",
+        1==1, "MEDIUM"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(task_action) as task_details,
+        values(User) as creating_users,
+        values(EventCode) as event_codes
+        by ComputerName, runs_as_system, task_risk
+    | eval mitre_technique="T1053.005"
+    | table first_seen, last_seen, ComputerName, creating_users, runs_as_system,
+            task_risk, task_details, event_codes, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Suspicious Scheduled Task Created — $ComputerName$"
+        rule_description: >
+          A scheduled task with suspicious actions was created on $ComputerName$
+          by $creating_users$. Runs as SYSTEM: $runs_as_system$. Review task
+          details for malicious commands.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog (EventCode=4698 OR (EventCode=1 Image="*\\schtasks.exe"))
+          ComputerName="$ComputerName$"
+          | sort -_time | table _time, EventCode, User, Task_Content, CommandLine
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 85
+
+  known_false_positives:
+    - "SCCM/Intune creating tasks for software deployment"
+    - "IT automation scripts creating maintenance tasks"
+    - "Windows Update creating temporary tasks"
+
+  tuning_guidance: |
+    1. Tasks running as SYSTEM with PowerShell/cmd are highest priority
+    2. Tasks pointing to Temp/AppData are almost always malicious
+    3. Baseline legitimate scheduled task creation in your environment
+    4. Exclude Microsoft\Windows built-in task paths
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1543.003 — Windows Service Creation for Persistence
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_service_creation_persistence:
+  name: "Windows Service Persistence — Suspicious Service Installation"
+  description: >
+    Detects creation of new Windows services with suspicious binary paths,
+    including services pointing to temp directories, PowerShell/cmd commands,
+    or remote paths. System Event 7045 and Security Event 4697 capture new
+    service installations. PsExec, Cobalt Strike, and many RATs install
+    services for execution and persistence.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1543.003"
+    technique_name: "Create or Modify System Process: Windows Service"
+    related_techniques:
+      - "T1569.002: System Services: Service Execution"
+  severity: high
+  confidence: 85
+  risk_score: 85
+  kill_chain_phase: "Installation"
+  data_sources:
+    - "Windows System Event Log (Event ID 7045 — New Service Installed)"
+    - "Windows Security Event Log (Event ID 4697 — Service Installed)"
+    - "Sysmon Event 1 (sc.exe / New-Service)"
+  prerequisites:
+    - "System Event Log forwarded to Splunk"
+    - "Audit Security System Extension enabled (Event 4697)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:System" EventCode=7045
+    ```Flag services with suspicious binary paths```
+    | where match(Service_File_Name, "(?i)(\\\\Temp\\\\|\\\\AppData\\\\|\\\\Downloads\\\\|\\\\Users\\\\Public)")
+        OR match(Service_File_Name, "(?i)(powershell|pwsh|cmd\.exe|/c |cmd /)")
+        OR match(Service_File_Name, "(?i)(\\\\\\\\|http[s]?://)")
+        OR match(Service_File_Name, "(?i)(PSEXESVC|meterpreter|beacon|cobalt)")
+        OR match(Service_File_Name, "(?i)(rundll32|regsvr32|mshta|certutil)")
+        OR match(Service_File_Name, "(?i)(comspec|%)")
+    ```Classify service risk```
+    | eval service_risk=case(
+        match(Service_File_Name, "(?i)PSEXESVC"), "PsExec Service (Lateral Movement)",
+        match(Service_File_Name, "(?i)(powershell|cmd\.exe|/c )"), "Command Execution Service",
+        match(Service_File_Name, "(?i)(\\\\Temp\\\\|\\\\AppData\\\\)"), "Binary in User-Writable Path",
+        match(Service_File_Name, "(?i)\\\\\\\\"), "Binary on Network Share",
+        1==1, "Suspicious Service"
+      )
+    | eval service_type_text=case(
+        Service_Type=="user mode service", "User Mode",
+        Service_Type=="kernel mode driver", "Kernel Driver",
+        1==1, Service_Type
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(Service_File_Name) as binary_paths,
+        values(Service_Start_Type) as start_types,
+        values(service_type_text) as service_types
+        by ComputerName, Service_Name, service_risk
+    | eval mitre_technique="T1543.003"
+    | table first_seen, last_seen, ComputerName, Service_Name, service_risk,
+            binary_paths, start_types, service_types, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Suspicious Service Created — $Service_Name$ on $ComputerName$"
+        rule_description: >
+          A new service ($Service_Name$) was installed on $ComputerName$
+          with risk classification: $service_risk$. Binary: $binary_paths$.
+          Review for PsExec, Cobalt Strike, or RAT service patterns.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog (EventCode=7045 OR EventCode=4697)
+          ComputerName="$ComputerName$"
+          | sort -_time | table _time, EventCode, Service_Name, Service_File_Name
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 85
+
+  known_false_positives:
+    - "Software installation creating legitimate services"
+    - "SCCM deploying managed services"
+    - "Windows Update installing new service components"
+
+  tuning_guidance: |
+    1. PSEXESVC is always worth investigating — it indicates remote execution
+    2. Services with cmd.exe/PowerShell in binPath are almost always malicious
+    3. Build a baseline of legitimate services in your environment
+    4. Kernel drivers (Service_Type) warrant higher severity
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1546.003 — WMI Event Subscription Persistence
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_wmi_event_subscription:
+  name: "WMI Event Subscription — Permanent Persistence via WMI"
+  description: >
+    Detects creation of WMI permanent event subscriptions, which consist of
+    an EventFilter (trigger), EventConsumer (action), and
+    FilterToConsumerBinding (link). This is a stealthy persistence mechanism
+    that survives reboots and executes without files on disk. Sysmon Events
+    19/20/21 specifically capture WMI subscription activity.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1546.003"
+    technique_name: "Event Triggered Execution: Windows Management Instrumentation Event Subscription"
+    related_techniques:
+      - "T1047: Windows Management Instrumentation"
+  severity: critical
+  confidence: 90
+  risk_score: 90
+  kill_chain_phase: "Installation"
+  data_sources:
+    - "Sysmon Event 19 (WMI EventFilter Activity)"
+    - "Sysmon Event 20 (WMI EventConsumer Activity)"
+    - "Sysmon Event 21 (WMI EventConsumerToFilter Activity)"
+  prerequisites:
+    - "Sysmon installed with WMI event logging (Events 19/20/21)"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        EventCode IN (19, 20, 21)
+    ```Parse WMI subscription components```
+    | eval wmi_component=case(
+        EventCode==19, "EventFilter (Trigger)",
+        EventCode==20, "EventConsumer (Action)",
+        EventCode==21, "FilterToConsumerBinding (Link)"
+      )
+    | eval subscription_detail=coalesce(Destination, Query, Consumer, Filter, Name)
+    | where NOT match(subscription_detail, "(?i)(BVTFilter|SCM Event Log)")
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(wmi_component) as components,
+        values(subscription_detail) as details,
+        values(User) as users,
+        dc(EventCode) as component_count
+        by ComputerName, Name
+    | eval persistence_complete=if(component_count>=2, "YES — Active Persistence", "Partial")
+    | eval mitre_technique="T1546.003"
+    | table first_seen, last_seen, ComputerName, Name, components,
+            persistence_complete, details, users, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "WMI Persistence Subscription — $Name$ on $ComputerName$"
+        rule_description: >
+          A WMI permanent event subscription ($Name$) was created on
+          $ComputerName$. Status: $persistence_complete$. WMI subscriptions
+          are fileless persistence that survives reboots. Immediate review required.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog EventCode IN (19, 20, 21) ComputerName="$ComputerName$"
+          | sort -_time | table _time, EventCode, Name, Destination, Query, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "Enterprise monitoring tools (SCCM, SCOM) creating WMI subscriptions"
+    - "Dell/HP hardware management software"
+
+  tuning_guidance: |
+    1. Baseline existing WMI subscriptions across your fleet
+    2. Any new WMI subscription on workstations is highly suspicious
+    3. Consumer actions containing PowerShell/cmd are critical findings
+    4. FilterToConsumerBinding (Event 21) confirms active persistence
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1546.015 — COM Object Hijacking
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_com_hijacking:
+  name: "COM Object Hijacking — InprocServer32/LocalServer32 Modification"
+  description: >
+    Detects registry modifications to CLSID InprocServer32 or LocalServer32
+    values that point to non-standard DLL/EXE paths. COM hijacking allows
+    adversaries to execute their payload whenever an application loads
+    a hijacked COM object, providing persistence without modifying standard
+    autorun locations.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1546.015"
+    technique_name: "Event Triggered Execution: Component Object Model Hijacking"
+    related_techniques:
+      - "T1574.012: Hijack Execution Flow: COR_PROFILER"
+  severity: high
+  confidence: 75
+  risk_score: 75
+  kill_chain_phase: "Installation"
+  data_sources:
+    - "Sysmon Event 13 (Registry Value Set)"
+  prerequisites:
+    - "Sysmon installed with Registry Value Set logging for CLSID paths"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13
+    | where match(TargetObject, "(?i)\\\\CLSID\\\\.*\\\\(InprocServer32|LocalServer32)")
+    ```Exclude known legitimate system DLLs```
+    | where NOT match(Details, "(?i)\\\\Windows\\\\System32\\\\")
+        AND NOT match(Details, "(?i)\\\\Windows\\\\SysWOW64\\\\")
+        AND NOT match(Details, "(?i)\\\\Program Files")
+        AND Details!="(Empty)"
+    | eval suspicious_path=if(
+        match(Details, "(?i)(\\\\Temp\\\\|\\\\AppData\\\\|\\\\Users\\\\Public|\\\\ProgramData\\\\)"),
+        "YES", "NO"
+      )
+    | rex field=TargetObject "CLSID\\\\(?<clsid>\{[^\}]+\})"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(Details) as dll_paths,
+        values(Image) as modifying_processes,
+        values(User) as users
+        by ComputerName, clsid, suspicious_path
+    | eval mitre_technique="T1546.015"
+    | table first_seen, last_seen, ComputerName, clsid, dll_paths,
+            suspicious_path, modifying_processes, users, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "COM Hijacking — CLSID $clsid$ modified on $ComputerName$"
+        rule_description: >
+          A COM object CLSID ($clsid$) was modified to point to $dll_paths$
+          on $ComputerName$. COM hijacking provides stealthy persistence
+          triggered by legitimate applications.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=13 ComputerName="$ComputerName$"
+          | where match(TargetObject, "(?i)\\\\CLSID")
+          | sort -_time | table _time, TargetObject, Details, Image, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 75
+
+  known_false_positives:
+    - "Software installation registering COM objects"
+    - "Visual Studio or development tools updating COM registrations"
+
+  tuning_guidance: |
+    1. Legitimate COM registrations point to Program Files or System32
+    2. Any CLSID pointing to Temp/AppData/Users is suspicious
+    3. Baseline COM registrations using autoruns before enabling alerts
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1547.004 — Winlogon Helper DLL Persistence
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_winlogon_helper_dll:
+  name: "Winlogon Helper DLL — Logon Process Persistence"
+  description: >
+    Detects modifications to Winlogon registry keys (Shell, Userinit, Notify,
+    VmApplet) that execute during the Windows logon process. Modifying these
+    keys allows adversaries to load their DLL/executable every time a user
+    logs on, with SYSTEM-level privileges.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1547.004"
+    technique_name: "Boot or Logon Autostart Execution: Winlogon Helper DLL"
+    related_techniques:
+      - "T1547.001: Registry Run Keys"
+  severity: critical
+  confidence: 90
+  risk_score: 90
+  kill_chain_phase: "Installation"
+  data_sources:
+    - "Sysmon Event 13 (Registry Value Set)"
+  prerequisites:
+    - "Sysmon installed with Registry Value Set logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13
+    | where match(TargetObject, "(?i)\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Winlogon\\\\(Shell|Userinit|Notify|VmApplet|AppSetup)")
+    ```Exclude legitimate default values```
+    | where NOT (match(TargetObject, "(?i)\\\\Shell$") AND Details=="explorer.exe")
+        AND NOT (match(TargetObject, "(?i)\\\\Userinit$") AND Details=="C:\\Windows\\system32\\userinit.exe,")
+    | eval winlogon_key=case(
+        match(TargetObject, "(?i)\\\\Shell"), "Shell (logon shell replacement)",
+        match(TargetObject, "(?i)\\\\Userinit"), "Userinit (logon initialization)",
+        match(TargetObject, "(?i)\\\\Notify"), "Notify (logon notification DLL)",
+        match(TargetObject, "(?i)\\\\VmApplet"), "VmApplet (virtual memory applet)",
+        1==1, "Winlogon Key"
+      )
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(TargetObject) as registry_keys,
+        values(Details) as new_values,
+        values(Image) as modifying_processes,
+        values(User) as users
+        by ComputerName, winlogon_key
+    | eval mitre_technique="T1547.004"
+    | table first_seen, last_seen, ComputerName, winlogon_key, new_values,
+            modifying_processes, users, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Winlogon Helper Modified — $winlogon_key$ on $ComputerName$"
+        rule_description: >
+          Winlogon registry key ($winlogon_key$) was modified on $ComputerName$
+          to: $new_values$. This provides SYSTEM-level persistence at logon.
+          Critical finding — immediate investigation required.
+        severity: "critical"
+        drilldown_search: >
+          index=wineventlog EventCode=13 ComputerName="$ComputerName$"
+          | where match(TargetObject, "(?i)Winlogon")
+          | sort -_time | table _time, TargetObject, Details, Image, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 90
+
+  known_false_positives:
+    - "Windows updates modifying default Winlogon values (rare)"
+    - "Third-party logon screen customization tools"
+
+  tuning_guidance: |
+    1. Default Shell should only be explorer.exe
+    2. Default Userinit should only be C:\Windows\system32\userinit.exe,
+    3. Any change to these values is highly suspicious — minimal tuning needed
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1547.014 — Active Setup Persistence
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_active_setup_persistence:
+  name: "Active Setup Persistence — StubPath Execution at Logon"
+  description: >
+    Detects new Active Setup entries under HKLM\SOFTWARE\Microsoft\Active
+    Setup\Installed Components. Active Setup runs the StubPath command once
+    per user at logon, making it a reliable persistence mechanism that
+    executes even for new user profiles.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1547.014"
+    technique_name: "Boot or Logon Autostart Execution: Active Setup"
+    related_techniques:
+      - "T1547.001: Registry Run Keys"
+  severity: high
+  confidence: 80
+  risk_score: 80
+  kill_chain_phase: "Installation"
+  data_sources:
+    - "Sysmon Event 13 (Registry Value Set)"
+  prerequisites:
+    - "Sysmon installed with Registry Value Set logging"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13
+    | where match(TargetObject, "(?i)\\\\Active Setup\\\\Installed Components\\\\.*\\\\StubPath")
+    ```Exclude known legitimate Active Setup entries```
+    | where NOT match(Details, "(?i)\\\\Windows\\\\System32\\\\")
+        AND NOT match(Details, "(?i)\\\\Program Files")
+    | eval suspicious_stub=if(
+        match(Details, "(?i)(powershell|cmd|wscript|cscript|mshta|rundll32|\\\\Temp\\\\|\\\\AppData\\\\)"),
+        "YES", "NO"
+      )
+    | rex field=TargetObject "Installed Components\\\\(?<component_guid>[^\\\\]+)"
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(Details) as stub_paths,
+        values(Image) as modifying_processes,
+        values(User) as users
+        by ComputerName, component_guid, suspicious_stub
+    | eval mitre_technique="T1547.014"
+    | table first_seen, last_seen, ComputerName, component_guid, stub_paths,
+            suspicious_stub, modifying_processes, users, event_count, mitre_technique
+
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-10m"
+    latest: "now"
+    window: "5m"
+
+  throttle:
+    field: "ComputerName"
+    period: "1h"
+
+  actions:
+    - notable_event:
+        rule_title: "Active Setup Persistence — $component_guid$ on $ComputerName$"
+        rule_description: >
+          An Active Setup StubPath was created/modified on $ComputerName$.
+          Component: $component_guid$, Path: $stub_paths$.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=13 ComputerName="$ComputerName$"
+          | where match(TargetObject, "(?i)Active Setup")
+          | sort -_time | table _time, TargetObject, Details, Image, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "Software installations registering Active Setup components"
+    - "Windows components (IE, .NET) updating Active Setup entries"
+
+  tuning_guidance: |
+    1. Legitimate Active Setup entries point to System32 or Program Files
+    2. StubPath containing PowerShell/cmd is always suspicious
+    3. New GUIDs not matching known software should be investigated
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1574.001 — DLL Search Order Hijacking
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_dll_search_order_hijacking:
+  name: "DLL Search Order Hijacking — Suspicious DLL Load from Non-Standard Path"
+  description: >
+    Detects known hijackable DLL names (version.dll, dbghelp.dll, winhttp.dll,
+    etc.) being loaded from user-writable or non-standard paths instead of
+    System32. Windows DLL search order allows attackers to place a malicious
+    DLL in the application directory, which gets loaded before the legitimate
+    system copy.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1574.001"
+    technique_name: "Hijack Execution Flow: DLL Search Order Hijacking"
+    related_techniques:
+      - "T1574.002: DLL Side-Loading"
+  severity: high
+  confidence: 75
+  risk_score: 75
+  kill_chain_phase: "Installation"
+  data_sources:
+    - "Sysmon Event 7 (Image Loaded)"
+  prerequisites:
+    - "Sysmon installed with Image Loaded (Event 7) logging for relevant DLLs"
+
+  search: |
+    index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=7
+    ```Known commonly hijacked DLL names```
+    | where match(ImageLoaded, "(?i)\\\\(version|dbghelp|winhttp|wlanapi|faultrep|CRYPTSP|dwmapi|propsys|secur32|uxtheme|wtsapi32|wldp|amsi|comsvcs|wbemcomn|profapi|mpr|dnsapi|iphlpapi|samlib|SHLWAPI)\.dll$")
+    ```Not loaded from standard system directories```
+    | where NOT match(ImageLoaded, "(?i)\\\\Windows\\\\(System32|SysWOW64|WinSxS)")
+        AND NOT match(ImageLoaded, "(?i)\\\\Program Files")
+    | eval hijacked_dll=replace(ImageLoaded, ".*\\\\", "")
+    | eval loading_directory=replace(ImageLoaded, "\\\\[^\\\\]+$", "")
+    | eval is_signed=if(Signed=="true", "Signed", "UNSIGNED")
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as load_count,
+        values(Image) as loading_processes,
+        values(User) as users
+        by ComputerName, hijacked_dll, ImageLoaded, is_signed
+    | eval mitre_technique="T1574.001"
+    | table first_seen, last_seen, ComputerName, hijacked_dll, ImageLoaded,
+            is_signed, loading_processes, users, load_count, mitre_technique
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+
+  throttle:
+    field: "ComputerName"
+    period: "2h"
+
+  actions:
+    - notable_event:
+        rule_title: "DLL Hijack — $hijacked_dll$ loaded from non-standard path on $ComputerName$"
+        rule_description: >
+          $hijacked_dll$ was loaded from $ImageLoaded$ instead of System32 on
+          $ComputerName$. Signature status: $is_signed$. This may indicate
+          DLL search order hijacking for persistence or execution.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode=7 ComputerName="$ComputerName$"
+          ImageLoaded="$ImageLoaded$"
+          | sort -_time | table _time, Image, ImageLoaded, Signed, Signature
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 75
+
+  known_false_positives:
+    - "Applications bundling their own DLL versions (version.dll is common)"
+    - "Development environments with local DLL copies"
+
+  tuning_guidance: |
+    1. Focus on UNSIGNED DLLs from user-writable paths
+    2. version.dll hijacking is very common in malware campaigns
+    3. Baseline legitimate DLL loads in your environment
+    4. Cross-reference with file creation events (Event 11) for the DLL
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 9: T1137 — Office Application Startup Persistence
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_9_office_startup_persistence:
+  name: "Office Application Startup — Add-in and Template Persistence"
+  description: >
+    Detects Office add-in registration, template injection, and XLStart
+    folder modifications used for persistence. Adversaries plant malicious
+    add-ins or templates that execute whenever Office applications launch.
+    This includes .xll, .wll, .dotm, and .xlam files in startup directories.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1137"
+    technique_name: "Office Application Startup"
+    related_techniques:
+      - "T1137.001: Office Template Macros"
+      - "T1137.006: Add-ins"
+  severity: high
+  confidence: 80
+  risk_score: 80
+  kill_chain_phase: "Installation"
+  data_sources:
+    - "Sysmon Event 13 (Registry Value Set)"
+    - "Sysmon Event 11 (File Create)"
+  prerequisites:
+    - "Sysmon installed with Registry and File Create event logging"
+
+  search: |
+    (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13
+        ```Office add-in registry keys```
+        (match(TargetObject, "(?i)\\\\Software\\\\Microsoft\\\\Office\\\\.*\\\\Addins")
+         OR match(TargetObject, "(?i)\\\\Software\\\\Microsoft\\\\Office\\\\.*\\\\Security\\\\Trusted"))
+    )
+    OR
+    (index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=11
+        ```Files dropped in Office startup directories```
+        (match(TargetFilename, "(?i)\\\\Microsoft\\\\Word\\\\STARTUP\\\\")
+         OR match(TargetFilename, "(?i)\\\\Microsoft\\\\Excel\\\\XLSTART\\\\")
+         OR match(TargetFilename, "(?i)\\\\Microsoft\\\\Addins\\\\")
+         OR match(TargetFilename, "(?i)\.(xll|wll|dotm|xlam|ppam|xla)$"))
+    )
+    | eval persistence_type=case(
+        match(TargetObject, "(?i)Addins"), "Office Add-in Registration",
+        match(TargetObject, "(?i)Trusted"), "Trusted Location Modification",
+        match(TargetFilename, "(?i)STARTUP|XLSTART"), "Office Startup Folder Drop",
+        match(TargetFilename, "(?i)\.(xll|wll)$"), "Office Extension DLL",
+        1==1, "Office Startup Persistence"
+      )
+    | eval target=coalesce(TargetObject, TargetFilename)
+    | eval detail=coalesce(Details, Image)
+    | stats
+        min(_time) as first_seen,
+        max(_time) as last_seen,
+        count as event_count,
+        values(target) as targets,
+        values(detail) as details,
+        values(User) as users,
+        values(EventCode) as event_codes
+        by ComputerName, persistence_type
+    | eval mitre_technique="T1137"
+    | table first_seen, last_seen, ComputerName, persistence_type, targets,
+            details, users, event_codes, event_count, mitre_technique
+
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-15m"
+    latest: "now"
+    window: "10m"
+
+  throttle:
+    field: "ComputerName"
+    period: "2h"
+
+  actions:
+    - notable_event:
+        rule_title: "Office Startup Persistence — $persistence_type$ on $ComputerName$"
+        rule_description: >
+          Office startup persistence ($persistence_type$) detected on
+          $ComputerName$. Targets: $targets$. Review for malicious
+          add-ins, templates, or XLL injection.
+        severity: "high"
+        drilldown_search: >
+          index=wineventlog EventCode IN (11, 13) ComputerName="$ComputerName$"
+          | where match(TargetObject, "(?i)Office") OR match(TargetFilename, "(?i)(XLSTART|STARTUP|Addins)")
+          | sort -_time | table _time, EventCode, TargetObject, TargetFilename, Details, Image, User
+    - risk:
+        risk_object: "ComputerName"
+        risk_object_type: "system"
+        risk_score: 80
+
+  known_false_positives:
+    - "Legitimate Office add-in installations (SAP, Bloomberg, etc.)"
+    - "Organization-deployed templates via GPO"
+
+  tuning_guidance: |
+    1. .xll files in XLSTART are commonly used for persistence — investigate all
+    2. Trusted Location modifications can bypass macro security — high priority
+    3. Build an allowlist of legitimate Office add-ins deployed in your org
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+
+  query_1_all_persistence_mechanisms:
+    name: "All persistence mechanisms on a host"
+    description: >
+      Comprehensive query to find all persistence activity on a specific
+      host including registry Run keys, services, tasks, and WMI subscriptions.
+    search: |
+      index=wineventlog ComputerName="<INSERT_HOST>" earliest="-7d" latest="now"
+      (
+          (EventCode=13 AND (match(TargetObject, "(?i)\\\\Run") OR match(TargetObject, "(?i)Winlogon") OR match(TargetObject, "(?i)CLSID")))
+          OR (EventCode=7045)
+          OR (EventCode=4698)
+          OR (EventCode IN (19, 20, 21))
+          OR (EventCode=11 AND match(TargetFilename, "(?i)(Startup|XLSTART)"))
+      )
+      | eval persistence_type=case(
+          EventCode==13, "Registry",
+          EventCode==7045, "Service",
+          EventCode==4698, "Scheduled Task",
+          EventCode IN (19,20,21), "WMI Subscription",
+          EventCode==11, "Startup Folder",
+          1==1, "Other"
+        )
+      | sort _time
+      | table _time, persistence_type, EventCode, TargetObject, Details,
+              Service_Name, Service_File_Name, TargetFilename, Name, User
+
+  query_2_registry_run_key_inventory:
+    name: "Inventory all Registry Run key entries across fleet"
+    description: >
+      Baseline all Run key entries to identify anomalies.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode=13 earliest="-30d" latest="now"
+      | where match(TargetObject, "(?i)\\\\(Run|RunOnce)\\\\")
+      | stats count, dc(ComputerName) as host_count,
+              values(ComputerName) as hosts
+              by Details
+      | sort -host_count
+      | table Details, host_count, count, hosts
+
+  query_3_new_services_last_7_days:
+    name: "All new services created in last 7 days"
+    description: >
+      Review all new service installations for suspicious entries.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:System" EventCode=7045
+          earliest="-7d" latest="now"
+      | stats count by ComputerName, Service_Name, Service_File_Name, Service_Type
+      | sort -count
+      | table ComputerName, Service_Name, Service_File_Name, Service_Type, count
+
+  query_4_scheduled_tasks_created:
+    name: "All scheduled tasks created in last 7 days"
+    description: >
+      Review all new scheduled task creations.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Security" EventCode=4698
+          earliest="-7d" latest="now"
+      | sort _time
+      | table _time, ComputerName, User, Task_Content
+
+  query_5_wmi_subscriptions_inventory:
+    name: "All WMI event subscriptions across fleet"
+    description: >
+      Inventory all WMI permanent event subscriptions.
+    search: |
+      index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          EventCode IN (19, 20, 21) earliest="-30d" latest="now"
+      | stats count, values(EventCode) as components, dc(ComputerName) as host_count
+              by Name
+      | sort -count
+      | table Name, components, host_count, count
+
+
+# ==============================================================================
+#  INCIDENT RESPONSE PLAYBOOK
+# ==============================================================================
+
+response_playbook:
+  name: "Windows Persistence — Incident Response Procedure"
+  description: >
+    Step-by-step response for confirmed persistence mechanism installation
+    on a Windows endpoint. Focus on identifying the full attack chain,
+    removing all persistence, and preventing re-establishment.
+
+  immediate_actions:
+    - step: 1
+      action: "Confirm the persistence mechanism is malicious"
+      detail: >
+        Review the binary/script path, registry value, or service binary.
+        Check file hash against VirusTotal/threat intelligence.
+        If confirmed malicious, proceed with containment.
+
+    - step: 2
+      action: "Isolate the affected host"
+      detail: >
+        Use EDR network containment. Do not power off — preserve memory.
+        Document all persistence artifacts before removal.
+
+    - step: 3
+      action: "Remove persistence mechanisms"
+      detail: >
+        Remove in this order:
+        1. Registry Run keys: reg delete
+        2. Scheduled tasks: schtasks /delete /tn "name" /f
+        3. Services: sc delete "servicename"
+        4. WMI subscriptions: Get-WmiObject -Class __FilterToConsumerBinding | Remove-WmiObject
+        5. Files in Startup folders: delete the file
+        6. COM hijacks: restore CLSID to legitimate DLL path
+
+    - step: 4
+      action: "Identify initial access and dwell time"
+      detail: >
+        Trace back from persistence installation to initial compromise.
+        Check file creation timestamps, first process execution,
+        and earliest logon events from the attacker.
+
+    - step: 5
+      action: "Scan all endpoints for same persistence indicators"
+      detail: >
+        Search fleet-wide for the same file hashes, registry values,
+        service names, and scheduled task names. The attacker may
+        have established persistence on multiple hosts.
+
+  forensic_actions:
+    - "Collect memory dump for malware analysis"
+    - "Image the disk for forensic preservation"
+    - "Extract and analyze all malicious binaries"
+    - "Check for additional persistence not covered by current rules"
+    - "Review network traffic for C2 communication patterns"
+    - "Document full attack timeline from initial access to persistence"

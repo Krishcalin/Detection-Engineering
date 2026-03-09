@@ -1,0 +1,795 @@
+# ==============================================================================
+#  Windows Command & Control Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for Windows C2 (Command & Control)
+#                techniques used by adversaries to maintain communication with
+#                compromised hosts. Covers HTTP beaconing, DNS tunneling,
+#                protocol tunneling, proxy usage, ingress tool transfer,
+#                encrypted channels, non-standard ports, and web service C2.
+#  MITRE ATT&CK: T1071.001, T1071.004, T1572, T1090, T1105, T1573,
+#                T1571, T1102
+#  Kill Chain   : Command and Control
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-09
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES (must be configured BEFORE these rules will generate detections):
+#
+#  1. Sysmon deployed on all Windows endpoints:
+#       - Event 1:  Process Creation (Image, CommandLine, ParentImage)
+#       - Event 3:  Network Connection (DestinationIp, DestinationPort)
+#       - Event 22: DNS Query (QueryName, QueryResults)
+#
+#  2. Network logs forwarded to Splunk:
+#       - Firewall/proxy logs (sourcetype=proxy, sourcetype=firewall)
+#       - DNS server query logs
+#       - IDS/IPS alerts (optional)
+#
+#  3. Log forwarding to Splunk via Universal Forwarder:
+#       sourcetype=XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+#       sourcetype=stream:dns (or equivalent DNS log source)
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1071.001 — HTTP/S Beaconing Detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_http_beaconing:
+  name: "HTTP/S C2 Beaconing — Regular Interval Communication"
+  description: >
+    Detects C2 beaconing by identifying processes making HTTP/HTTPS connections
+    at regular intervals. Calculates connection timing jitter to distinguish
+    automated C2 callbacks from normal browsing. Covers Cobalt Strike, Meterpreter,
+    Sliver, and similar HTTP-based C2 frameworks.
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1071.001"
+    technique_name: "Application Layer Protocol: Web Protocols"
+  severity: HIGH
+  confidence: 75
+  risk_score: 70
+  search: |
+    index=sysmon EventCode=3
+    DestinationPort IN (80, 443, 8080, 8443)
+    NOT Image IN ("*\\chrome.exe", "*\\firefox.exe", "*\\msedge.exe",
+                   "*\\iexplore.exe", "*\\MicrosoftEdgeCP.exe",
+                   "*\\svchost.exe", "*\\OneDrive.exe",
+                   "*\\Teams.exe", "*\\Outlook.exe")
+    | bin _time span=60s
+    | stats count as conns_per_min,
+            dc(DestinationIp) as unique_dests
+            by _time, Computer, Image, DestinationIp, DestinationPort
+    | sort Computer, Image, DestinationIp, _time
+    | autoregress _time as prev_time p=1
+    | eval interval=_time - prev_time
+    | where interval > 0
+    | stats
+        count            as total_callbacks,
+        avg(interval)    as avg_interval,
+        stdev(interval)  as stdev_interval,
+        min(interval)    as min_interval,
+        max(interval)    as max_interval,
+        min(_time)       as first_seen,
+        max(_time)       as last_seen
+        by Computer, Image, DestinationIp, DestinationPort
+    | eval jitter_pct=round((stdev_interval/avg_interval)*100, 2)
+    | where total_callbacks >= 10 AND jitter_pct < 25 AND avg_interval < 600
+    | eval risk=case(
+        jitter_pct < 5 AND total_callbacks > 50, "CRITICAL",
+        jitter_pct < 15, "HIGH",
+        1==1, "MEDIUM")
+    | table Computer, Image, DestinationIp, DestinationPort, total_callbacks,
+            avg_interval, jitter_pct, first_seen, last_seen, risk
+    | sort -total_callbacks
+  schedule:
+    cron: "*/15 * * * *"
+    earliest: "-20m"
+    latest: "-30s"
+  throttle:
+    field: "Computer,DestinationIp"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "HTTP Beaconing — $Computer$ → $DestinationIp$:$DestinationPort$ (jitter=$jitter_pct$%)"
+        severity: high
+        drilldown_search: 'index=sysmon EventCode=3 Computer="$Computer$" Image="$Image$" DestinationIp="$DestinationIp$"'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 70
+  known_false_positives:
+    - "Software update agents polling at regular intervals"
+    - "Health monitoring agents with fixed check-in periods"
+    - "VPN keep-alive connections"
+  tuning_guidance: >
+    Maintain a lookup of known legitimate callback destinations (update servers,
+    monitoring endpoints). Adjust jitter_pct threshold — C2 frameworks typically
+    have <10% jitter while legitimate apps have higher variance.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1071.004 — DNS Tunneling Detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_dns_tunneling:
+  name: "DNS Tunneling — Anomalous DNS Query Patterns"
+  description: >
+    Detects DNS tunneling by identifying anomalously long subdomain labels,
+    high volumes of unique subdomains per parent domain, and TXT record abuse.
+    Covers tools like dnscat2, iodine, DNSExfiltrator, Cobalt Strike DNS
+    beacon, and custom DNS C2 implementations.
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1071.004"
+    technique_name: "Application Layer Protocol: DNS"
+  severity: HIGH
+  confidence: 80
+  risk_score: 75
+  search: |
+    index=sysmon EventCode=22
+    NOT QueryName IN ("*.microsoft.com", "*.windows.com", "*.windowsupdate.com",
+                       "*.office.com", "*.office365.com", "*.live.com",
+                       "*.msftconnecttest.com", "*.digicert.com",
+                       "*.verisign.com", "*.symantec.com")
+    | rex field=QueryName "(?<subdomain>[^.]+)\.(?<parent_domain>[^.]+\.[^.]+)$"
+    | eval subdomain_len=len(subdomain)
+    | eval has_hex=if(match(subdomain, "^[0-9a-fA-F]+$"), 1, 0)
+    | eval entropy=0
+    | stats
+        count            as total_queries,
+        dc(subdomain)    as unique_subdomains,
+        avg(subdomain_len) as avg_label_len,
+        max(subdomain_len) as max_label_len,
+        sum(has_hex)     as hex_subdomains,
+        values(Image)    as processes
+        by Computer, parent_domain
+    | eval hex_ratio=round(hex_subdomains/total_queries*100, 1)
+    | where (unique_subdomains > 50 AND avg_label_len > 20)
+            OR (total_queries > 100 AND max_label_len > 40)
+            OR (hex_ratio > 70 AND total_queries > 30)
+    | eval risk=case(
+        unique_subdomains > 200 AND avg_label_len > 30, "CRITICAL",
+        unique_subdomains > 100, "HIGH",
+        1==1, "MEDIUM")
+    | table Computer, parent_domain, total_queries, unique_subdomains,
+            avg_label_len, max_label_len, hex_ratio, processes, risk
+    | sort -unique_subdomains
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-12m"
+    latest: "-30s"
+  throttle:
+    field: "Computer,parent_domain"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "DNS Tunneling — $Computer$ → $parent_domain$ ($unique_subdomains$ unique subdomains)"
+        severity: high
+        drilldown_search: 'index=sysmon EventCode=22 Computer="$Computer$" QueryName="*$parent_domain$"'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 75
+  known_false_positives:
+    - "CDN services with many subdomain variations (Akamai, CloudFront)"
+    - "Anti-spam DNS blocklist lookups (DNSBL)"
+    - "DKIM/SPF record lookups by mail servers"
+  tuning_guidance: >
+    Build a whitelist of high-volume legitimate domains. Focus on parent
+    domains with both high unique subdomain counts AND long label lengths.
+    Hex-encoded subdomains are a strong indicator of DNS tunneling.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1572 — Protocol Tunneling (SSH, DNS-over-HTTPS, ICMP)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_protocol_tunneling:
+  name: "Protocol Tunneling — SSH, DoH, and ICMP Tunnels"
+  description: >
+    Detects protocol tunneling used to encapsulate C2 traffic within legitimate
+    protocols. Identifies SSH tunnels from unusual processes, DNS-over-HTTPS
+    connections to known DoH providers, and suspicious ICMP traffic patterns
+    indicative of ICMP tunneling tools (icmpsh, ptunnel).
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1572"
+    technique_name: "Protocol Tunneling"
+  severity: HIGH
+  confidence: 75
+  risk_score: 68
+  search: |
+    (index=sysmon EventCode=1
+     (CommandLine="*ssh*-D *" OR CommandLine="*ssh*-L *" OR CommandLine="*ssh*-R *"
+      OR CommandLine="*plink*-D *" OR CommandLine="*plink*-L *"
+      OR CommandLine="*chisel*" OR CommandLine="*ligolo*"
+      OR CommandLine="*ngrok*" OR CommandLine="*cloudflared*tunnel*"))
+    OR
+    (index=sysmon EventCode=3
+     DestinationPort=22
+     NOT Image IN ("*\\ssh.exe", "*\\putty.exe", "*\\git.exe",
+                    "*\\scp.exe", "*\\sftp.exe"))
+    OR
+    (index=sysmon EventCode=22
+     QueryName IN ("dns.google", "cloudflare-dns.com", "dns.quad9.net",
+                    "doh.opendns.com", "dns.adguard.com",
+                    "mozilla.cloudflare-dns.com")
+     NOT Image IN ("*\\chrome.exe", "*\\firefox.exe", "*\\msedge.exe"))
+    OR
+    (index=sysmon EventCode=3
+     DestinationPort IN (443, 853)
+     DestinationIp IN ("8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1",
+                        "9.9.9.9", "149.112.112.112")
+     NOT Image IN ("*\\chrome.exe", "*\\firefox.exe", "*\\msedge.exe"))
+    | eval tunnel_type=case(
+        EventCode==1 AND match(CommandLine, "ssh|plink"), "ssh_tunnel",
+        EventCode==1 AND match(CommandLine, "chisel|ligolo|ngrok|cloudflared"), "reverse_tunnel_tool",
+        EventCode==3 AND DestinationPort==22, "ssh_non_standard_process",
+        EventCode==22, "dns_over_https_query",
+        EventCode==3 AND DestinationPort IN (443,853), "doh_connection")
+    | stats
+        count            as events,
+        values(tunnel_type) as tunnel_types,
+        values(Image)    as processes,
+        values(CommandLine) as commands,
+        values(DestinationIp) as dest_ips,
+        values(QueryName)   as doh_providers,
+        values(User)     as users
+        by Computer
+    | table Computer, tunnel_types, processes, commands, dest_ips, doh_providers, users, events
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-12m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Protocol Tunneling — $Computer$ ($tunnel_types$)"
+        severity: high
+        drilldown_search: 'index=sysmon Computer="$Computer$" (CommandLine="*ssh*-D*" OR CommandLine="*chisel*" OR DestinationPort=22)'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 68
+  known_false_positives:
+    - "Developers using SSH port forwarding for local development"
+    - "Firefox/Chrome with DoH enabled by default"
+    - "Cloudflare Tunnel for legitimate application publishing"
+  tuning_guidance: >
+    Focus on non-interactive processes establishing SSH tunnels. DoH from
+    non-browser processes is almost always suspicious. Reverse tunnel tools
+    (chisel, ligolo, ngrok) should be blocked outright in most environments.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1090 — Proxy Usage for C2
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_proxy_c2:
+  name: "Proxy-based C2 Communication"
+  description: >
+    Detects adversary use of proxy tools to relay C2 traffic. Identifies SOCKS
+    proxy tools (Chisel, reGeorg, Neo-reGeorg, pystinger), netsh port forwarding,
+    and suspicious proxy configuration changes that may indicate C2 relay setup.
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1090"
+    technique_name: "Proxy"
+  severity: HIGH
+  confidence: 80
+  risk_score: 72
+  search: |
+    index=sysmon EventCode=1
+    (
+      (CommandLine="*netsh*portproxy*" CommandLine="*add*")
+      OR
+      (CommandLine="*netsh*interface*portproxy*")
+      OR
+      (Image="*\\plink.exe" CommandLine="*-R *")
+      OR
+      (CommandLine="*reGeorg*" OR CommandLine="*tunnel.aspx*"
+       OR CommandLine="*tunnel.jsp*" OR CommandLine="*tunnel.php*")
+      OR
+      (CommandLine="*Invoke-SocksProxy*"
+       OR CommandLine="*SharpSocks*"
+       OR CommandLine="*rpivot*"
+       OR CommandLine="*goproxy*")
+      OR
+      (Image="*\\netsh.exe" CommandLine="*winhttp*proxy*")
+    )
+    | eval proxy_type=case(
+        match(CommandLine, "netsh.*portproxy"), "netsh_port_forward",
+        match(CommandLine, "plink.*-R"), "plink_reverse_proxy",
+        match(CommandLine, "reGeorg|tunnel\\.aspx|tunnel\\.jsp|tunnel\\.php"), "web_tunnel_proxy",
+        match(CommandLine, "SocksProxy|SharpSocks|rpivot|goproxy"), "socks_proxy_tool",
+        match(CommandLine, "winhttp.*proxy"), "system_proxy_change")
+    | stats
+        count            as events,
+        values(proxy_type) as proxy_types,
+        values(Image)    as processes,
+        values(CommandLine) as commands,
+        values(User)     as users
+        by Computer
+    | table Computer, proxy_types, processes, commands, users, events
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Proxy C2 Activity — $Computer$ ($proxy_types$)"
+        severity: high
+        drilldown_search: 'index=sysmon EventCode=1 Computer="$Computer$" (CommandLine="*netsh*portproxy*" OR CommandLine="*reGeorg*" OR CommandLine="*SocksProxy*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 72
+  known_false_positives:
+    - "Network administrators configuring port forwarding for legitimate services"
+    - "Developers using reverse proxies for local testing"
+  tuning_guidance: >
+    netsh portproxy add is almost always suspicious on endpoints.
+    Web tunnel proxies (reGeorg, Neo-reGeorg) are post-exploitation tools
+    and should generate immediate alerts.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1105 — Ingress Tool Transfer
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_ingress_tool_transfer:
+  name: "Ingress Tool Transfer — Download Cradles and LOLBin Downloads"
+  description: >
+    Detects adversaries downloading additional tools and payloads to compromised
+    hosts using built-in Windows utilities (certutil, bitsadmin, curl, wget) and
+    PowerShell download methods. These LOLBin download techniques are commonly
+    used to stage second-stage payloads.
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1105"
+    technique_name: "Ingress Tool Transfer"
+  severity: HIGH
+  confidence: 85
+  risk_score: 74
+  search: |
+    index=sysmon EventCode=1
+    (
+      (Image="*\\certutil.exe"
+       (CommandLine="*-urlcache*" OR CommandLine="*-verifyctl*"
+        OR CommandLine="*/urlcache*" OR CommandLine="*-f *http*"))
+      OR
+      (Image="*\\bitsadmin.exe"
+       (CommandLine="*/transfer*" OR CommandLine="*/create*"
+        OR CommandLine="*/addfile*"))
+      OR
+      (Image="*\\curl.exe" NOT ParentImage="*\\git.exe"
+       CommandLine="*-o *")
+      OR
+      (Image="*\\wget.exe")
+      OR
+      (Image IN ("*\\powershell.exe", "*\\pwsh.exe")
+       (CommandLine="*DownloadFile*" OR CommandLine="*DownloadString*"
+        OR CommandLine="*DownloadData*" OR CommandLine="*WebClient*"
+        OR CommandLine="*Invoke-WebRequest*" OR CommandLine="*iwr *"
+        OR CommandLine="*wget *" OR CommandLine="*curl *"
+        OR CommandLine="*Start-BitsTransfer*"
+        OR CommandLine="*Net.WebClient*"))
+      OR
+      (Image="*\\mshta.exe" CommandLine="*http*")
+      OR
+      (Image="*\\rundll32.exe" CommandLine="*,DownloadFile*")
+      OR
+      (Image="*\\cmstp.exe" CommandLine="*/s *" CommandLine="*http*")
+      OR
+      (Image="*\\esentutl.exe" CommandLine="*/y *" CommandLine="*http*")
+    )
+    | eval download_method=case(
+        Image="*certutil*", "certutil_download",
+        Image="*bitsadmin*", "bitsadmin_transfer",
+        Image="*curl*", "curl_download",
+        Image="*wget*", "wget_download",
+        Image="*powershell*" OR Image="*pwsh*", "powershell_download",
+        Image="*mshta*", "mshta_download",
+        Image="*rundll32*", "rundll32_download",
+        Image="*cmstp*", "cmstp_download",
+        Image="*esentutl*", "esentutl_download",
+        1==1, "other")
+    | rex field=CommandLine "(?i)(?:https?://)(?<download_url>[^\s\"']+)"
+    | stats
+        count            as events,
+        values(download_method) as methods,
+        values(Image)    as processes,
+        values(CommandLine) as commands,
+        values(download_url) as urls,
+        values(User)     as users,
+        values(ParentImage) as parent_processes
+        by Computer
+    | table Computer, methods, urls, commands, parent_processes, users, events
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Ingress Tool Transfer — $Computer$ via $methods$"
+        severity: high
+        drilldown_search: 'index=sysmon EventCode=1 Computer="$Computer$" (Image="*certutil*" OR Image="*bitsadmin*" OR CommandLine="*DownloadFile*" OR CommandLine="*DownloadString*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 74
+  known_false_positives:
+    - "System administrators using certutil for certificate management"
+    - "BITS-based Windows Update and SCCM downloads"
+    - "Developers using curl/wget for legitimate file downloads"
+  tuning_guidance: >
+    Filter by known download URLs (Windows Update, SCCM distribution points).
+    Focus on certutil with -urlcache -f and bitsadmin /transfer as these are
+    classic LOLBin download techniques. Alert on downloads to temp directories.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1573 — Encrypted C2 Channel
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_encrypted_c2_channel:
+  name: "Encrypted C2 Channel — Self-signed and Anomalous TLS"
+  description: >
+    Detects encrypted C2 channels by identifying non-browser processes making
+    TLS connections to IP addresses (no domain), connections to newly registered
+    or uncommon domains, and processes establishing encrypted connections with
+    self-signed certificates or unusual JA3/JA3S fingerprints.
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1573"
+    technique_name: "Encrypted Channel"
+  severity: MEDIUM
+  confidence: 65
+  risk_score: 55
+  search: |
+    index=sysmon EventCode=3
+    DestinationPort=443
+    NOT Image IN ("*\\chrome.exe", "*\\firefox.exe", "*\\msedge.exe",
+                   "*\\iexplore.exe", "*\\svchost.exe", "*\\OneDrive.exe",
+                   "*\\Teams.exe", "*\\Outlook.exe", "*\\Code.exe",
+                   "*\\WindowsUpdate.exe", "*\\MsMpEng.exe",
+                   "*\\backgroundTaskHost.exe")
+    | where NOT cidrmatch("10.0.0.0/8", DestinationIp) AND
+            NOT cidrmatch("172.16.0.0/12", DestinationIp) AND
+            NOT cidrmatch("192.168.0.0/16", DestinationIp)
+    | stats
+        count            as connections,
+        dc(DestinationIp) as unique_dests,
+        values(DestinationIp) as dest_ips,
+        min(_time)       as first_seen,
+        max(_time)       as last_seen,
+        values(User)     as users
+        by Computer, Image
+    | where connections > 5 AND unique_dests <= 3
+    | eval duration=last_seen - first_seen
+    | where duration > 300
+    | eval suspicion=case(
+        connections > 100 AND unique_dests==1, "HIGH — single dest, many conns",
+        connections > 50, "MEDIUM — moderate volume",
+        1==1, "LOW")
+    | table Computer, Image, dest_ips, connections, unique_dests, duration, suspicion, users
+    | sort -connections
+  schedule:
+    cron: "*/15 * * * *"
+    earliest: "-20m"
+    latest: "-30s"
+  throttle:
+    field: "Computer,Image"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "Encrypted C2 Channel — $Computer$ $Image$ → $dest_ips$"
+        severity: medium
+        drilldown_search: 'index=sysmon EventCode=3 Computer="$Computer$" Image="$Image$" DestinationPort=443'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 55
+  known_false_positives:
+    - "Custom applications with persistent TLS connections"
+    - "Cloud sync agents (Dropbox, Box, Google Drive)"
+  tuning_guidance: >
+    Build a baseline of normal HTTPS connections per process. Focus on
+    executables in temp/user directories making HTTPS connections to
+    single destinations. Cross-reference with threat intel IP lookups.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1571 — Non-Standard Port Communication
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_non_standard_port:
+  name: "C2 Communication on Non-Standard Ports"
+  description: >
+    Detects processes communicating on non-standard ports commonly used by C2
+    frameworks. Identifies HTTP traffic on non-80/443 ports, known C2 framework
+    default ports, and unusual high-port connections from suspicious processes.
+    Covers Cobalt Strike (50050), Metasploit (4444), Empire (8080), and others.
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1571"
+    technique_name: "Non-Standard Port"
+  severity: MEDIUM
+  confidence: 70
+  risk_score: 60
+  search: |
+    index=sysmon EventCode=3
+    NOT DestinationPort IN (53, 80, 443, 445, 389, 636, 88, 135, 139, 993,
+                            995, 587, 25, 110, 143, 3389, 5985, 5986, 22)
+    NOT Image IN ("*\\chrome.exe", "*\\firefox.exe", "*\\msedge.exe",
+                   "*\\svchost.exe", "*\\System", "*\\dns.exe",
+                   "*\\lsass.exe", "*\\spoolsv.exe")
+    | where NOT cidrmatch("10.0.0.0/8", DestinationIp) AND
+            NOT cidrmatch("172.16.0.0/12", DestinationIp) AND
+            NOT cidrmatch("192.168.0.0/16", DestinationIp) AND
+            NOT cidrmatch("127.0.0.0/8", DestinationIp)
+    | eval known_c2_port=case(
+        DestinationPort==4444, "metasploit_default",
+        DestinationPort==4443, "metasploit_https",
+        DestinationPort==50050, "cobalt_strike_teamserver",
+        DestinationPort==8443, "common_c2_https",
+        DestinationPort==8080, "common_c2_http",
+        DestinationPort==1337, "common_c2_leet",
+        DestinationPort==9090, "common_c2_alt",
+        DestinationPort==31337, "classic_backdoor",
+        DestinationPort==6666 OR DestinationPort==6667, "irc_c2",
+        DestinationPort==4545 OR DestinationPort==5555, "common_rat_port",
+        1==1, "non_standard")
+    | stats
+        count            as connections,
+        dc(DestinationPort) as unique_ports,
+        values(DestinationPort) as dest_ports,
+        values(DestinationIp)   as dest_ips,
+        values(known_c2_port)   as c2_indicators,
+        values(User)     as users
+        by Computer, Image
+    | where connections > 3
+    | eval risk=case(
+        match(mvjoin(c2_indicators,","), "metasploit|cobalt_strike|classic_backdoor"), "CRITICAL",
+        match(mvjoin(c2_indicators,","), "irc_c2|common_rat"), "HIGH",
+        1==1, "MEDIUM")
+    | table Computer, Image, dest_ips, dest_ports, c2_indicators, connections, risk, users
+    | sort -risk, -connections
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-12m"
+    latest: "-30s"
+  throttle:
+    field: "Computer,Image"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Non-Standard Port C2 — $Computer$ $Image$ → $dest_ports$ ($c2_indicators$)"
+        severity: medium
+        drilldown_search: 'index=sysmon EventCode=3 Computer="$Computer$" Image="$Image$" DestinationPort IN ($dest_ports$)'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 60
+  known_false_positives:
+    - "Development tools connecting to non-standard ports (Docker, Node.js)"
+    - "Game clients using high ports"
+    - "VPN connections on non-standard ports"
+  tuning_guidance: >
+    Prioritize alerts for known C2 ports (4444, 50050, 31337). Build a
+    lookup of authorized applications and their expected ports. Focus
+    on unsigned executables or those running from temp directories.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1102 — Web Service C2 (Cloud-hosted C2)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_web_service_c2:
+  name: "Web Service C2 — Cloud Platform Abuse"
+  description: >
+    Detects adversaries using legitimate web services and cloud platforms as
+    C2 channels. Identifies non-browser processes communicating with known
+    C2-abused services: Pastebin, Discord webhooks, Telegram Bot API,
+    GitHub raw content, Slack webhooks, Azure/AWS/GCP functions, and
+    Notion/Trello API callbacks.
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1102"
+    technique_name: "Web Service"
+  severity: HIGH
+  confidence: 80
+  risk_score: 72
+  search: |
+    index=sysmon EventCode=22
+    NOT Image IN ("*\\chrome.exe", "*\\firefox.exe", "*\\msedge.exe",
+                   "*\\iexplore.exe", "*\\Teams.exe", "*\\Slack.exe",
+                   "*\\Discord.exe", "*\\Outlook.exe")
+    QueryName IN (
+      "pastebin.com", "*.pastebin.com",
+      "discord.com", "*.discord.com", "discordapp.com",
+      "api.telegram.org",
+      "raw.githubusercontent.com", "gist.githubusercontent.com",
+      "*.webhook.office.com",
+      "*.slack.com",
+      "*.cloudfunctions.net",
+      "*.azurewebsites.net",
+      "*.execute-api.amazonaws.com",
+      "*.run.app",
+      "api.notion.com",
+      "api.trello.com",
+      "paste.ee", "hastebin.com", "ghostbin.com",
+      "transfer.sh", "*.ngrok.io", "*.ngrok-free.app",
+      "*.serveo.net", "*.localhost.run")
+    | eval c2_service=case(
+        match(QueryName, "pastebin|paste\\.ee|hastebin|ghostbin"), "paste_service",
+        match(QueryName, "discord"), "discord_webhook",
+        match(QueryName, "telegram"), "telegram_bot_api",
+        match(QueryName, "githubusercontent"), "github_raw",
+        match(QueryName, "slack"), "slack_webhook",
+        match(QueryName, "cloudfunctions|azurewebsites|execute-api|run\\.app"), "cloud_function",
+        match(QueryName, "notion|trello"), "productivity_api",
+        match(QueryName, "transfer\\.sh|ngrok|serveo|localhost\\.run"), "tunnel_service",
+        1==1, "other_web_service")
+    | stats
+        count            as queries,
+        dc(QueryName)    as unique_domains,
+        values(QueryName) as domains,
+        values(c2_service) as service_types,
+        values(Image)    as processes,
+        values(User)     as users
+        by Computer
+    | table Computer, service_types, domains, processes, queries, users
+    | sort -queries
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Web Service C2 — $Computer$ → $service_types$ ($domains$)"
+        severity: high
+        drilldown_search: 'index=sysmon EventCode=22 Computer="$Computer$" QueryName IN ("*pastebin*","*discord*","*telegram*","*githubusercontent*","*ngrok*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 72
+  known_false_positives:
+    - "Developers using GitHub API or cloud functions legitimately"
+    - "Chat applications (Discord, Slack, Telegram) used for notifications"
+    - "CI/CD pipelines triggering cloud functions"
+  tuning_guidance: >
+    Focus on non-browser, non-IDE processes querying these domains.
+    PowerShell, cmd.exe, rundll32.exe, or unknown executables connecting
+    to paste services or cloud functions are high-confidence C2 indicators.
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+  c2_network_profile:
+    description: "Build complete network profile for a suspected C2 host"
+    search: |
+      index=sysmon EventCode=3 Computer="$host$"
+      | where NOT cidrmatch("10.0.0.0/8", DestinationIp) AND
+              NOT cidrmatch("172.16.0.0/12", DestinationIp) AND
+              NOT cidrmatch("192.168.0.0/16", DestinationIp)
+      | stats count, dc(DestinationIp) as unique_dests,
+              dc(DestinationPort) as unique_ports,
+              values(DestinationIp) as dest_ips,
+              values(DestinationPort) as dest_ports,
+              sum(eval(if(DestinationPort==443,1,0))) as https_conns,
+              sum(eval(if(DestinationPort==80,1,0))) as http_conns
+              by Image
+      | sort -count
+
+  dns_query_analysis:
+    description: "Analyze all DNS queries from a suspected host"
+    search: |
+      index=sysmon EventCode=22 Computer="$host$"
+      | rex field=QueryName "(?<parent_domain>[^.]+\.[^.]+)$"
+      | stats count, dc(QueryName) as unique_queries,
+              values(QueryName) as sample_queries
+              by parent_domain, Image
+      | sort -unique_queries
+
+  beacon_interval_analysis:
+    description: "Statistical analysis of connection intervals for beaconing"
+    search: |
+      index=sysmon EventCode=3 Computer="$host$"
+      Image="$process$" DestinationIp="$dest_ip$"
+      | sort _time
+      | autoregress _time as prev_time p=1
+      | eval interval=_time - prev_time
+      | where interval > 0
+      | stats count, avg(interval) as mean, stdev(interval) as std,
+              median(interval) as med, min(interval) as min_i, max(interval) as max_i
+      | eval jitter_pct=round((std/mean)*100, 2)
+      | eval verdict=case(jitter_pct < 5, "LIKELY C2 BEACON",
+                          jitter_pct < 15, "POSSIBLE C2 BEACON",
+                          1==1, "LIKELY BENIGN")
+
+  process_network_correlation:
+    description: "Correlate process execution with network activity"
+    search: |
+      (index=sysmon EventCode=1 Computer="$host$")
+      OR (index=sysmon EventCode=3 Computer="$host$")
+      | eval activity=if(EventCode==1, "process_start", "network_conn")
+      | sort _time
+      | table _time, activity, Image, ParentImage, CommandLine,
+              DestinationIp, DestinationPort, User
+
+
+# ==============================================================================
+#  RESPONSE PLAYBOOK — Command and Control
+# ==============================================================================
+
+response_playbook:
+  name: "Windows C2 Communication Response"
+  steps:
+    - step: 1
+      action: "Validate the C2 Indicator"
+      details: >
+        Confirm the C2 detection by: (1) checking if the destination IP/domain
+        is in threat intelligence feeds, (2) verifying the process is not a
+        known legitimate application, (3) analyzing the beacon interval pattern,
+        (4) checking for associated process creation or download activity.
+
+    - step: 2
+      action: "Identify the C2 Infrastructure"
+      details: >
+        Run c2_network_profile and dns_query_analysis against the host. Document
+        all C2 destinations (IPs, domains, ports). Check if the same C2
+        infrastructure is seen from other hosts in the environment. Query
+        threat intel platforms (VirusTotal, OTX, AbuseIPDB) for reputation.
+
+    - step: 3
+      action: "Block C2 Communication"
+      details: >
+        Add C2 IPs and domains to firewall/proxy block lists. If DNS tunneling,
+        block the parent domain at the DNS resolver. Apply network isolation
+        to the compromised host while preserving forensic evidence. Do not
+        power off the host — live memory may contain C2 configuration.
+
+    - step: 4
+      action: "Analyze the C2 Agent"
+      details: >
+        Identify the C2 agent process and its parent chain. Capture memory
+        dump of the process. Extract the binary for reverse engineering.
+        Document the C2 framework type (Cobalt Strike, Meterpreter, custom).
+        Check for persistence mechanisms that would restart the C2 agent.
+
+    - step: 5
+      action: "Scope and Contain"
+      details: >
+        Search for the same C2 agent hash across all endpoints. Check for
+        lateral movement from the compromised host. Review credential
+        access logs — assume credentials on the host are compromised.
+        Reset passwords for all accounts that logged into the system.
+
+    - step: 6
+      action: "Eradicate and Harden"
+      details: >
+        Remove the C2 agent and all persistence mechanisms. Block the C2
+        framework's default ports at the perimeter. Implement DNS sinkholing
+        for known C2 domains. Deploy application whitelisting to prevent
+        unauthorized process execution. Review and tighten outbound firewall
+        rules to deny-by-default where possible.

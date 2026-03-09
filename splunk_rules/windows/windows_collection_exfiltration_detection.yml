@@ -1,0 +1,840 @@
+# ==============================================================================
+#  Windows Collection & Exfiltration Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Multi-layered detection for Windows collection and data
+#                exfiltration techniques. Covers keylogging, screen capture,
+#                data archiving, staging, automated collection, and exfiltration
+#                via alternative protocols, cloud storage, and C2 channels.
+#  MITRE ATT&CK: T1056.001, T1113, T1560.001, T1074.001, T1119,
+#                T1048.003, T1567, T1041
+#  Kill Chain   : Collection / Exfiltration
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-03-09
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES (must be configured BEFORE these rules will generate detections):
+#
+#  1. Sysmon deployed on all Windows endpoints:
+#       - Event 1:  Process Creation (Image, CommandLine, ParentImage)
+#       - Event 3:  Network Connection (DestinationIp, DestinationPort)
+#       - Event 7:  Image Loaded (ImageLoaded)
+#       - Event 11: File Create (TargetFilename)
+#       - Event 22: DNS Query (QueryName)
+#
+#  2. Windows Security Audit Policy:
+#       - Audit Process Creation → Success (Event 4688)
+#       - Audit File System → Success (optional, high volume)
+#
+#  3. Log forwarding to Splunk via Universal Forwarder:
+#       sourcetype=XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+#       sourcetype=XmlWinEventLog:Security
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1056.001 — Keylogging Activity
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_keylogging:
+  name: "Keylogging — API Hooking and Keystroke Capture"
+  description: >
+    Detects keylogging activity by identifying processes loading keyboard hook
+    DLLs, known keylogger tool execution, and SetWindowsHookEx API calls
+    for keyboard monitoring. Also detects PowerShell-based keyloggers and
+    AutoHotkey keystroke capture scripts.
+  mitre:
+    tactic: "Collection"
+    technique: "T1056.001"
+    technique_name: "Input Capture: Keylogging"
+  severity: HIGH
+  confidence: 75
+  risk_score: 70
+  search: |
+    (index=sysmon EventCode=1
+     (CommandLine="*Get-Keystrokes*"
+      OR CommandLine="*KeyLogger*"
+      OR CommandLine="*Start-KeyLogger*"
+      OR CommandLine="*SetWindowsHookEx*"
+      OR CommandLine="*user32*GetAsyncKeyState*"
+      OR CommandLine="*user32*GetKeyState*"
+      OR CommandLine="*user32*MapVirtualKey*"
+      OR CommandLine="*Add-Type*keyboard*"
+      OR (Image="*\\AutoHotkey*.exe" CommandLine="*GetKeyState*")
+      OR (Image="*\\python*.exe" CommandLine="*pynput*")
+      OR (Image="*\\python*.exe" CommandLine="*keyboard*hook*")))
+    OR
+    (index=sysmon EventCode=7
+     (ImageLoaded="*\\keylog*" OR ImageLoaded="*\\klog*")
+     NOT ImageLoaded="*\\Windows\\*")
+    OR
+    (index=sysmon EventCode=11
+     (TargetFilename="*keylog*" OR TargetFilename="*keystroke*"
+      OR TargetFilename="*keystrokes*" OR TargetFilename="*typedkeys*")
+     TargetFilename IN ("*.txt", "*.log", "*.dat", "*.csv"))
+    | eval indicator=case(
+        EventCode==1, "keylogger_process",
+        EventCode==7, "keylogger_dll_loaded",
+        EventCode==11, "keystroke_log_file")
+    | stats
+        count            as events,
+        values(indicator) as indicators,
+        values(Image)    as processes,
+        values(CommandLine) as commands,
+        values(ImageLoaded) as dlls_loaded,
+        values(TargetFilename) as output_files,
+        values(User)     as users
+        by Computer
+    | table Computer, indicators, processes, commands, dlls_loaded, output_files, users, events
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Keylogging Activity — $Computer$"
+        severity: high
+        drilldown_search: 'index=sysmon Computer="$Computer$" (CommandLine="*KeyLog*" OR CommandLine="*GetKeyState*" OR TargetFilename="*keylog*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 70
+  known_false_positives:
+    - "Accessibility software using keyboard hooks"
+    - "Password managers hooking keyboard input"
+    - "AutoHotkey scripts for legitimate keyboard macros"
+  tuning_guidance: >
+    Focus on unsigned processes loading keyboard hook DLLs and PowerShell
+    scripts using GetAsyncKeyState. Output files named keylog/keystroke
+    in user profile directories are high-confidence indicators.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1113 — Screen Capture
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_screen_capture:
+  name: "Screen Capture — Automated Screenshot Collection"
+  description: >
+    Detects automated screen capture tools used for visual data collection.
+    Identifies screenshot utilities, PowerShell screen capture methods, and
+    rapid creation of image files in staging directories that indicate
+    adversary reconnaissance or data collection.
+  mitre:
+    tactic: "Collection"
+    technique: "T1113"
+    technique_name: "Screen Capture"
+  severity: MEDIUM
+  confidence: 70
+  risk_score: 55
+  search: |
+    (index=sysmon EventCode=1
+     (CommandLine="*[System.Windows.Forms.Screen]*"
+      OR CommandLine="*CopyFromScreen*"
+      OR CommandLine="*Drawing.Bitmap*"
+      OR CommandLine="*screenshot*"
+      OR CommandLine="*Screen.PrimaryScreen*"
+      OR CommandLine="*nircmd*savescreenshot*"
+      OR CommandLine="*MiniCap*"
+      OR CommandLine="*snippingtool*"
+      OR (Image="*\\ffmpeg.exe" CommandLine="*gdigrab*")
+      OR (Image="*\\python*.exe" CommandLine="*ImageGrab*")
+      OR (Image="*\\python*.exe" CommandLine="*pyautogui*screenshot*")))
+    OR
+    (index=sysmon EventCode=11
+     TargetFilename IN ("*.png", "*.jpg", "*.bmp", "*.gif")
+     (TargetFilename="*screenshot*" OR TargetFilename="*screen_*"
+      OR TargetFilename="*capture_*" OR TargetFilename="*scr_*"
+      OR TargetFilename="*\\Temp\\*.png" OR TargetFilename="*\\Temp\\*.jpg")
+     NOT Image IN ("*\\explorer.exe", "*\\SnippingTool.exe",
+                    "*\\ScreenSketch.exe", "*\\mspaint.exe"))
+    | eval method=case(
+        EventCode==1 AND match(CommandLine, "CopyFromScreen|Drawing\\.Bitmap"), "dotnet_screenshot",
+        EventCode==1 AND match(CommandLine, "nircmd|MiniCap"), "screenshot_tool",
+        EventCode==1 AND match(CommandLine, "ffmpeg.*gdigrab"), "ffmpeg_screen_capture",
+        EventCode==1 AND match(CommandLine, "ImageGrab|pyautogui"), "python_screenshot",
+        EventCode==11, "screenshot_file_created",
+        1==1, "other")
+    | stats
+        count            as events,
+        values(method)   as methods,
+        values(Image)    as processes,
+        values(CommandLine) as commands,
+        values(TargetFilename) as files,
+        values(User)     as users
+        by Computer
+    | table Computer, methods, processes, commands, files, users, events
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-12m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Screen Capture Activity — $Computer$"
+        severity: medium
+        drilldown_search: 'index=sysmon Computer="$Computer$" (CommandLine="*CopyFromScreen*" OR CommandLine="*screenshot*" OR TargetFilename="*screenshot*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 55
+  known_false_positives:
+    - "Windows Snipping Tool and Snip & Sketch"
+    - "Bug reporting tools that capture screenshots"
+    - "Remote support tools capturing screen for troubleshooting"
+  tuning_guidance: >
+    Focus on automated/scripted screenshots rather than user-initiated tools.
+    Multiple screenshot files created in rapid succession from PowerShell
+    or non-standard processes are strong indicators of collection activity.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1560.001 — Data Archiving for Exfiltration
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_data_archiving:
+  name: "Data Archiving — Compression for Exfiltration Staging"
+  description: >
+    Detects data archiving commonly used before exfiltration. Identifies use of
+    7zip, WinRAR, tar, compact, makecab, and PowerShell compression to create
+    archives containing sensitive data. Focus on archives created in staging
+    directories or containing database/document file patterns.
+  mitre:
+    tactic: "Collection"
+    technique: "T1560.001"
+    technique_name: "Archive Collected Data: Archive via Utility"
+  severity: MEDIUM
+  confidence: 75
+  risk_score: 60
+  search: |
+    index=sysmon EventCode=1
+    (
+      (Image IN ("*\\7z.exe", "*\\7za.exe", "*\\7zr.exe")
+       CommandLine="*a *")
+      OR
+      (Image="*\\WinRAR.exe" CommandLine="*a *")
+      OR
+      (Image="*\\rar.exe" CommandLine="*a *")
+      OR
+      (Image="*\\tar.exe")
+      OR
+      (Image="*\\compact.exe" CommandLine="*/c*")
+      OR
+      (Image="*\\makecab.exe")
+      OR
+      (Image IN ("*\\powershell.exe", "*\\pwsh.exe")
+       (CommandLine="*Compress-Archive*"
+        OR CommandLine="*ZipFile*CreateFromDirectory*"
+        OR CommandLine="*IO.Compression*"
+        OR CommandLine="*GZipStream*"))
+    )
+    | rex field=CommandLine "(?i)(?:a\s+|Compress-Archive.*-Path\s+|CreateFromDirectory\(\s*[\"']?)(?<archive_target>[^\s\"']+)"
+    | rex field=CommandLine "(?i)(?<archive_name>\S+\.(?:zip|7z|rar|tar|gz|cab))"
+    | eval archive_tool=case(
+        match(Image, "7z"), "7zip",
+        match(Image, "WinRAR|rar\\.exe"), "winrar",
+        match(Image, "tar"), "tar",
+        match(Image, "compact"), "compact",
+        match(Image, "makecab"), "makecab",
+        match(Image, "powershell|pwsh"), "powershell_compression")
+    | eval suspicious_target=if(
+        match(CommandLine, "(?i)(Documents|Desktop|Downloads|database|backup|confidential|secret|finance|hr|\\*\\.doc|\\*\\.xls|\\*\\.pdf|\\*\\.pst|\\*\\.ost)"),
+        "yes", "no")
+    | stats
+        count            as events,
+        values(archive_tool) as tools,
+        values(archive_name) as archives,
+        values(archive_target) as targets,
+        values(CommandLine) as commands,
+        values(User)     as users,
+        max(suspicious_target) as targets_sensitive_data
+        by Computer
+    | where targets_sensitive_data="yes" OR events > 3
+    | table Computer, tools, archives, targets, targets_sensitive_data, commands, users, events
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-12m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Data Archiving for Exfiltration — $Computer$ ($tools$)"
+        severity: medium
+        drilldown_search: 'index=sysmon EventCode=1 Computer="$Computer$" (Image="*7z*" OR Image="*rar*" OR CommandLine="*Compress-Archive*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 60
+  known_false_positives:
+    - "Backup software using compression"
+    - "Users archiving files for legitimate sharing"
+    - "Software build processes creating archives"
+  tuning_guidance: >
+    Focus on archives targeting sensitive directories (Documents, Desktop,
+    database paths) and archives with password protection (-p flag in 7z/rar).
+    Password-protected archives created from command line are high-priority.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1074.001 — Local Data Staging
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_data_staging:
+  name: "Local Data Staging in Temp and Hidden Directories"
+  description: >
+    Detects adversaries staging collected data in temporary or hidden directories
+    before exfiltration. Identifies bulk file copy operations to staging
+    directories, creation of hidden directories for data collection, and
+    robocopy/xcopy operations targeting sensitive file types.
+  mitre:
+    tactic: "Collection"
+    technique: "T1074.001"
+    technique_name: "Data Staged: Local Data Staging"
+  severity: MEDIUM
+  confidence: 70
+  risk_score: 58
+  search: |
+    index=sysmon EventCode=1
+    (
+      (Image="*\\robocopy.exe"
+       CommandLine IN ("*\\Documents*", "*\\Desktop*", "*\\Downloads*",
+                       "*.doc*", "*.xls*", "*.pdf*", "*.pst*"))
+      OR
+      (Image="*\\xcopy.exe"
+       CommandLine IN ("*\\Documents*", "*\\Desktop*", "*\\Downloads*",
+                       "*.doc*", "*.xls*", "*.pdf*"))
+      OR
+      (Image="*\\cmd.exe"
+       CommandLine="*copy*" CommandLine="*\\Temp\\*"
+       CommandLine IN ("*.doc*", "*.xls*", "*.pdf*", "*.pst*", "*.db*"))
+      OR
+      (Image IN ("*\\powershell.exe", "*\\pwsh.exe")
+       CommandLine="*Copy-Item*"
+       (CommandLine="*\\Temp\\*" OR CommandLine="*\\AppData\\*"
+        OR CommandLine="*$env:TEMP*" OR CommandLine="*Recurse*"))
+      OR
+      (Image="*\\attrib.exe" CommandLine="*+h*")
+      OR
+      (Image="*\\cmd.exe" CommandLine="*mkdir*"
+       (CommandLine="*\\Temp\\.*" OR CommandLine="*\\ProgramData\\.*"))
+    )
+    | eval staging_method=case(
+        match(Image, "robocopy"), "robocopy_bulk_copy",
+        match(Image, "xcopy"), "xcopy_bulk_copy",
+        match(Image, "cmd") AND match(CommandLine, "copy"), "cmd_file_copy",
+        match(Image, "powershell|pwsh"), "powershell_copy",
+        match(Image, "attrib"), "hidden_attribute_set",
+        match(CommandLine, "mkdir"), "hidden_dir_creation")
+    | stats
+        count            as events,
+        values(staging_method) as methods,
+        values(CommandLine) as commands,
+        values(User)     as users
+        by Computer
+    | table Computer, methods, commands, users, events
+  schedule:
+    cron: "*/10 * * * *"
+    earliest: "-12m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    - notable_event:
+        rule_title: "Data Staging Activity — $Computer$ ($methods$)"
+        severity: medium
+        drilldown_search: 'index=sysmon EventCode=1 Computer="$Computer$" (Image="*robocopy*" OR Image="*xcopy*" OR CommandLine="*Copy-Item*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 58
+  known_false_positives:
+    - "Backup scripts copying files to local staging"
+    - "User file organization activities"
+    - "Roaming profile synchronization"
+  tuning_guidance: >
+    Focus on robocopy/xcopy targeting document types into temp directories.
+    Hidden directory creation (attrib +h, mkdir with dot-prefix) in
+    ProgramData or Temp is suspicious. Cross-reference with subsequent
+    archive creation or network upload activity.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1119 — Automated Collection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_automated_collection:
+  name: "Automated Collection — Scripted File Harvesting"
+  description: >
+    Detects automated file collection scripts that enumerate and gather
+    sensitive documents. Identifies PowerShell/cmd scripts using recursive
+    file searches for specific extensions, WMI queries for file enumeration,
+    and rapid sequential access to many files across different directories.
+  mitre:
+    tactic: "Collection"
+    technique: "T1119"
+    technique_name: "Automated Collection"
+  severity: HIGH
+  confidence: 75
+  risk_score: 68
+  search: |
+    index=sysmon EventCode=1
+    (
+      (Image IN ("*\\powershell.exe", "*\\pwsh.exe")
+       (CommandLine="*Get-ChildItem*-Recurse*-Include*"
+        OR CommandLine="*gci*-r*-include*"
+        OR CommandLine="*dir*-recurse*-filter*"
+        OR CommandLine="*ls*-r*-include*")
+       CommandLine IN ("*.doc*", "*.xls*", "*.pdf*", "*.pst*",
+                        "*.kdbx*", "*.key*", "*.pem*", "*.pfx*",
+                        "*.config*", "*.rdp*", "*.vnc*"))
+      OR
+      (Image="*\\cmd.exe"
+       CommandLine="*dir*" CommandLine="*/s*"
+       CommandLine IN ("*.doc*", "*.xls*", "*.pdf*", "*.pst*",
+                        "*.kdbx*", "*.key*", "*.pem*"))
+      OR
+      (Image IN ("*\\powershell.exe", "*\\pwsh.exe")
+       (CommandLine="*Select-String*password*"
+        OR CommandLine="*Select-String*secret*"
+        OR CommandLine="*Select-String*credential*"
+        OR CommandLine="*Select-String*api_key*"
+        OR CommandLine="*findstr*password*"
+        OR CommandLine="*findstr*secret*"))
+      OR
+      (Image="*\\findstr.exe"
+       CommandLine IN ("*password*", "*secret*", "*credential*",
+                       "*api_key*", "*token*", "*private_key*")
+       CommandLine="*/s*")
+    )
+    | eval collection_type=case(
+        match(CommandLine, "Get-ChildItem|gci|dir.*-recurse|dir.*/s"), "recursive_file_search",
+        match(CommandLine, "Select-String|findstr"), "content_search_secrets",
+        1==1, "other_collection")
+    | stats
+        count            as events,
+        values(collection_type) as types,
+        values(CommandLine) as commands,
+        values(User)     as users,
+        values(ParentImage) as parent_processes
+        by Computer
+    | table Computer, types, commands, parent_processes, users, events
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Automated Collection — $Computer$ ($types$)"
+        severity: high
+        drilldown_search: 'index=sysmon EventCode=1 Computer="$Computer$" (CommandLine="*Get-ChildItem*-Recurse*" OR CommandLine="*findstr*password*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 68
+  known_false_positives:
+    - "IT audit scripts searching for sensitive files"
+    - "DLP agents scanning for policy violations"
+    - "Developers searching codebases with findstr/Select-String"
+  tuning_guidance: >
+    Focus on recursive searches targeting credential files (.kdbx, .pem, .pfx,
+    .key) and content searches for secrets/passwords. Scripts spawned from
+    unusual parent processes (wmiprvse, wsmprovhost) are high priority.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1048.003 — Exfiltration Over Alternative Protocol (Non-C2)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_exfiltration_alternative_protocol:
+  name: "Exfiltration via Alternative Protocol — FTP, SCP, SMB Outbound"
+  description: >
+    Detects data exfiltration over non-C2 protocols. Identifies outbound FTP
+    connections, SCP/SFTP file transfers to external hosts, SMB connections to
+    non-internal destinations, and use of data transfer tools like rclone and
+    restic that can exfiltrate data to cloud storage.
+  mitre:
+    tactic: "Exfiltration"
+    technique: "T1048.003"
+    technique_name: "Exfiltration Over Alternative Protocol: Exfiltration Over Unencrypted Non-C2 Protocol"
+  severity: HIGH
+  confidence: 80
+  risk_score: 75
+  search: |
+    (index=sysmon EventCode=1
+     (Image="*\\ftp.exe"
+      OR (Image="*\\scp.exe" NOT ParentImage="*\\git.exe")
+      OR (Image="*\\sftp.exe" NOT ParentImage="*\\git.exe")
+      OR (Image="*\\pscp.exe")
+      OR (Image="*\\winscp.exe" NOT User IN ("*admin*"))
+      OR (Image="*\\rclone.exe")
+      OR (Image="*\\restic.exe")
+      OR (Image="*\\curl.exe"
+          (CommandLine="*--upload-file*" OR CommandLine="*-T *"
+           OR CommandLine="*-X PUT*" OR CommandLine="*-X POST*-d @*"))
+      OR (Image IN ("*\\powershell.exe", "*\\pwsh.exe")
+          (CommandLine="*System.Net.FtpWebRequest*"
+           OR CommandLine="*[Net.WebClient]*UploadFile*"
+           OR CommandLine="*Invoke-RestMethod*-Method*Post*-InFile*"))))
+    OR
+    (index=sysmon EventCode=3
+     DestinationPort IN (20, 21, 69, 445)
+     NOT cidrmatch("10.0.0.0/8", DestinationIp)
+     NOT cidrmatch("172.16.0.0/12", DestinationIp)
+     NOT cidrmatch("192.168.0.0/16", DestinationIp))
+    | eval exfil_method=case(
+        match(Image, "ftp\\.exe") OR EventCode==3 AND DestinationPort IN (20,21), "ftp_transfer",
+        match(Image, "scp|sftp|pscp"), "scp_sftp_transfer",
+        match(Image, "winscp"), "winscp_gui_transfer",
+        match(Image, "rclone"), "rclone_cloud_sync",
+        match(Image, "restic"), "restic_backup_tool",
+        match(Image, "curl") OR match(CommandLine, "UploadFile|InFile"), "http_upload",
+        match(CommandLine, "FtpWebRequest"), "powershell_ftp",
+        EventCode==3 AND DestinationPort==445, "smb_outbound",
+        EventCode==3 AND DestinationPort==69, "tftp_transfer",
+        1==1, "other")
+    | stats
+        count            as events,
+        values(exfil_method) as methods,
+        values(Image)    as processes,
+        values(CommandLine) as commands,
+        values(DestinationIp) as dest_ips,
+        values(DestinationPort) as dest_ports,
+        values(User)     as users
+        by Computer
+    | table Computer, methods, processes, dest_ips, dest_ports, commands, users, events
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Exfiltration via Alternative Protocol — $Computer$ ($methods$)"
+        severity: high
+        drilldown_search: 'index=sysmon Computer="$Computer$" (Image="*ftp*" OR Image="*scp*" OR Image="*rclone*" OR DestinationPort IN (20,21,69))'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 75
+  known_false_positives:
+    - "Authorized FTP/SFTP transfers to business partners"
+    - "rclone used for legitimate cloud backup"
+    - "Developer SCP transfers to staging servers"
+  tuning_guidance: >
+    rclone on workstations is almost always suspicious — it's a favorite
+    tool for ransomware data exfiltration. Build lookup of authorized
+    FTP/SFTP destinations. Alert on SMB port 445 to external IPs immediately.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1567 — Exfiltration to Cloud Storage
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_exfiltration_cloud_storage:
+  name: "Exfiltration to Cloud Storage Services"
+  description: >
+    Detects data exfiltration to cloud storage platforms by identifying non-
+    browser processes connecting to file sharing services. Covers Mega.nz,
+    Dropbox, Google Drive, OneDrive (personal), Box, WeTransfer, and anonymous
+    file sharing services commonly used for data theft.
+  mitre:
+    tactic: "Exfiltration"
+    technique: "T1567"
+    technique_name: "Exfiltration Over Web Service"
+  severity: HIGH
+  confidence: 75
+  risk_score: 70
+  search: |
+    (index=sysmon EventCode=22
+     NOT Image IN ("*\\chrome.exe", "*\\firefox.exe", "*\\msedge.exe",
+                    "*\\iexplore.exe", "*\\OneDrive.exe",
+                    "*\\OneDriveStandaloneUpdater.exe",
+                    "*\\Dropbox.exe", "*\\BoxSync.exe",
+                    "*\\GoogleDriveSync.exe")
+     QueryName IN (
+       "mega.nz", "*.mega.nz", "*.mega.co.nz",
+       "api.dropboxapi.com", "content.dropboxapi.com",
+       "*.drive.google.com", "www.googleapis.com",
+       "api.onedrive.com", "*.sharepoint.com",
+       "upload.box.com", "api.box.com",
+       "wetransfer.com", "*.wetransfer.com",
+       "send-anywhere.com",
+       "file.io", "transfer.sh", "0x0.st",
+       "anonfiles.com", "gofile.io",
+       "pixeldrain.com", "catbox.moe",
+       "temp.sh", "bashupload.com"))
+    OR
+    (index=sysmon EventCode=1
+     (Image="*\\MEGAcmd*.exe"
+      OR Image="*\\megaclient.exe"
+      OR (Image="*\\rclone.exe"
+          CommandLine IN ("*mega*", "*drive*", "*dropbox*", "*onedrive*",
+                          "*s3*", "*b2*", "*box*"))
+      OR (Image IN ("*\\powershell.exe", "*\\pwsh.exe")
+          CommandLine="*upload*"
+          CommandLine IN ("*mega*", "*dropbox*", "*gdrive*", "*onedrive*"))))
+    | eval cloud_service=case(
+        match(QueryName, "mega") OR match(Image, "mega"), "mega_nz",
+        match(QueryName, "dropbox"), "dropbox",
+        match(QueryName, "drive.google|googleapis"), "google_drive",
+        match(QueryName, "onedrive|sharepoint"), "onedrive_sharepoint",
+        match(QueryName, "box\\.com"), "box",
+        match(QueryName, "wetransfer"), "wetransfer",
+        match(QueryName, "file\\.io|transfer\\.sh|0x0|anonfiles|gofile|pixeldrain|catbox|temp\\.sh|bashupload"), "anonymous_file_share",
+        match(CommandLine, "rclone"), "rclone_cloud_upload",
+        1==1, "other_cloud")
+    | stats
+        count            as events,
+        values(cloud_service) as services,
+        values(QueryName) as domains,
+        values(Image)    as processes,
+        values(CommandLine) as commands,
+        values(User)     as users
+        by Computer
+    | eval risk=if(match(mvjoin(services,","), "anonymous_file_share|mega_nz"), "HIGH", "MEDIUM")
+    | table Computer, risk, services, domains, processes, commands, users, events
+    | sort -risk, -events
+  schedule:
+    cron: "*/5 * * * *"
+    earliest: "-7m"
+    latest: "-30s"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    - notable_event:
+        rule_title: "Cloud Storage Exfiltration — $Computer$ → $services$"
+        severity: high
+        drilldown_search: 'index=sysmon EventCode=22 Computer="$Computer$" QueryName IN ("*mega*","*dropbox*","*file.io*","*transfer.sh*","*gofile*")'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 70
+  known_false_positives:
+    - "Authorized cloud storage sync agents (OneDrive for Business, Box Sync)"
+    - "Marketing teams using WeTransfer for large file sharing"
+  tuning_guidance: >
+    Anonymous file sharing services (file.io, transfer.sh, 0x0.st, gofile.io)
+    from non-browser processes are extremely suspicious. Mega.nz is the
+    most commonly abused cloud storage by ransomware operators. Block at
+    proxy level where possible.
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1041 — Exfiltration Over C2 Channel (Volume Anomaly)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_exfiltration_c2_volume:
+  name: "Exfiltration Over C2 Channel — Outbound Volume Anomaly"
+  description: >
+    Detects large-volume data exfiltration over C2 channels by identifying
+    processes with anomalously high outbound network traffic. Correlates
+    Sysmon network events with byte transfer volumes to detect data being
+    siphoned through established C2 connections.
+  mitre:
+    tactic: "Exfiltration"
+    technique: "T1041"
+    technique_name: "Exfiltration Over C2 Channel"
+  severity: HIGH
+  confidence: 70
+  risk_score: 72
+  search: |
+    index=sysmon EventCode=3
+    NOT Image IN ("*\\chrome.exe", "*\\firefox.exe", "*\\msedge.exe",
+                   "*\\iexplore.exe", "*\\svchost.exe", "*\\OneDrive.exe",
+                   "*\\Teams.exe", "*\\Outlook.exe", "*\\Code.exe",
+                   "*\\MsMpEng.exe", "*\\WindowsUpdate.exe")
+    NOT DestinationPort IN (53, 137, 138, 5353)
+    | where NOT cidrmatch("10.0.0.0/8", DestinationIp) AND
+            NOT cidrmatch("172.16.0.0/12", DestinationIp) AND
+            NOT cidrmatch("192.168.0.0/16", DestinationIp) AND
+            NOT cidrmatch("127.0.0.0/8", DestinationIp)
+    | bin _time span=5m
+    | stats
+        count            as connections,
+        dc(DestinationIp) as unique_dests,
+        values(DestinationIp) as dest_ips,
+        values(DestinationPort) as dest_ports
+        by _time, Computer, Image, User
+    | where connections > 50
+    | stats
+        sum(connections)  as total_connections,
+        avg(connections)  as avg_conns_per_5m,
+        max(connections)  as max_conns_per_5m,
+        dc(DestinationIp) as unique_dests,
+        values(DestinationIp) as all_dest_ips,
+        values(DestinationPort) as all_ports,
+        min(_time)       as first_seen,
+        max(_time)       as last_seen
+        by Computer, Image, User
+    | eval duration_mins=round((last_seen - first_seen)/60, 0)
+    | where total_connections > 200 AND unique_dests <= 5
+    | eval risk=case(
+        total_connections > 1000 AND unique_dests==1, "CRITICAL",
+        total_connections > 500, "HIGH",
+        1==1, "MEDIUM")
+    | table Computer, Image, risk, total_connections, avg_conns_per_5m,
+            unique_dests, all_dest_ips, all_ports, duration_mins, User
+    | sort -total_connections
+  schedule:
+    cron: "*/15 * * * *"
+    earliest: "-20m"
+    latest: "-30s"
+  throttle:
+    field: "Computer,Image"
+    period: "1h"
+  actions:
+    - notable_event:
+        rule_title: "C2 Exfiltration Volume Anomaly — $Computer$ $Image$ ($total_connections$ conns → $all_dest_ips$)"
+        severity: high
+        drilldown_search: 'index=sysmon EventCode=3 Computer="$Computer$" Image="$Image$" | stats count by DestinationIp, DestinationPort'
+    - risk_modifier:
+        risk_object: "$Computer$"
+        risk_object_type: "system"
+        risk_score: 72
+  known_false_positives:
+    - "Large file downloads/uploads via legitimate applications"
+    - "Cloud backup agents performing scheduled backups"
+    - "Software distribution tools downloading packages"
+  tuning_guidance: >
+    Baseline normal connection volumes per process in your environment.
+    Focus on processes with high connection counts to single external IPs —
+    this pattern matches C2 data exfiltration. Cross-reference with data
+    archiving/staging alerts for full kill chain correlation.
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES
+# ==============================================================================
+
+investigation_queries:
+  data_collection_timeline:
+    description: "Build timeline of collection and staging activity"
+    search: |
+      index=sysmon Computer="$host$"
+      ((EventCode=1 (CommandLine="*Get-ChildItem*" OR CommandLine="*robocopy*"
+        OR CommandLine="*xcopy*" OR CommandLine="*7z*" OR CommandLine="*rar*"
+        OR CommandLine="*Compress-Archive*"))
+       OR (EventCode=11 TargetFilename IN ("*.zip","*.7z","*.rar","*.tar.gz")))
+      | sort _time
+      | table _time, EventCode, Image, CommandLine, TargetFilename, User
+
+  outbound_traffic_summary:
+    description: "Summarize all outbound network activity for a host"
+    search: |
+      index=sysmon EventCode=3 Computer="$host$"
+      | where NOT cidrmatch("10.0.0.0/8", DestinationIp) AND
+              NOT cidrmatch("172.16.0.0/12", DestinationIp) AND
+              NOT cidrmatch("192.168.0.0/16", DestinationIp)
+      | stats count, dc(DestinationIp) as unique_dests,
+              values(DestinationIp) as dest_ips,
+              values(DestinationPort) as ports
+              by Image
+      | sort -count
+
+  sensitive_file_access:
+    description: "Track access to sensitive file types"
+    search: |
+      index=sysmon EventCode IN (1, 11) Computer="$host$"
+      (CommandLine IN ("*.doc*","*.xls*","*.pdf*","*.pst*","*.kdbx*","*.pem*","*.pfx*")
+       OR TargetFilename IN ("*.doc*","*.xls*","*.pdf*","*.pst*","*.kdbx*","*.pem*","*.pfx*"))
+      | table _time, EventCode, Image, CommandLine, TargetFilename, User
+
+  archive_creation_and_transfer:
+    description: "Correlate archive creation with subsequent network transfers"
+    search: |
+      (index=sysmon EventCode=11 Computer="$host$"
+       TargetFilename IN ("*.zip","*.7z","*.rar","*.tar","*.gz","*.cab"))
+      OR
+      (index=sysmon EventCode=3 Computer="$host$"
+       NOT cidrmatch("10.0.0.0/8", DestinationIp)
+       NOT cidrmatch("172.16.0.0/12", DestinationIp)
+       NOT cidrmatch("192.168.0.0/16", DestinationIp))
+      | eval activity=if(EventCode==11, "archive_created", "network_transfer")
+      | sort _time
+      | table _time, activity, Image, TargetFilename, DestinationIp, DestinationPort
+
+  cloud_storage_dns_audit:
+    description: "Audit all cloud storage DNS queries from non-browser processes"
+    search: |
+      index=sysmon EventCode=22 Computer="$host$"
+      NOT Image IN ("*chrome*","*firefox*","*msedge*","*iexplore*")
+      QueryName IN ("*mega*","*dropbox*","*drive.google*","*onedrive*",
+                     "*box.com*","*wetransfer*","*file.io*","*transfer.sh*")
+      | stats count, values(QueryName) as domains by Image
+      | sort -count
+
+
+# ==============================================================================
+#  RESPONSE PLAYBOOK — Collection & Exfiltration
+# ==============================================================================
+
+response_playbook:
+  name: "Windows Collection & Exfiltration Response"
+  steps:
+    - step: 1
+      action: "Validate Exfiltration Activity"
+      details: >
+        Confirm the alert is not a false positive by checking: (1) the process
+        is not a known authorized backup/sync tool, (2) the destination is not
+        an authorized cloud service, (3) the data volume or file types are
+        abnormal for the user's role. Check DLP logs for corroborating alerts.
+
+    - step: 2
+      action: "Assess Data Impact"
+      details: >
+        Run sensitive_file_access and data_collection_timeline queries to
+        determine what data was collected. Identify file types, volumes,
+        and directories accessed. Cross-reference with data classification
+        tags if DLP is deployed. Determine if regulated data (PII, PHI,
+        financial) was accessed.
+
+    - step: 3
+      action: "Block Active Exfiltration"
+      details: >
+        If exfiltration is ongoing, immediately block the destination IP/domain
+        at the firewall/proxy. Isolate the compromised host from the network.
+        If cloud storage exfiltration, contact the service provider to freeze
+        the receiving account. Preserve the network capture for forensics.
+
+    - step: 4
+      action: "Determine Full Scope"
+      details: >
+        Run outbound_traffic_summary for all hosts the compromised user
+        account has accessed. Check for lateral movement indicators.
+        Search for the same collection scripts or tools across all endpoints.
+        Review archive_creation_and_transfer to identify all staged data.
+
+    - step: 5
+      action: "Evidence Preservation and Notification"
+      details: >
+        Preserve forensic images of affected systems. Collect all relevant
+        logs (Sysmon, Security, proxy, firewall, DLP). If regulated data
+        was exfiltrated, initiate breach notification procedures per
+        compliance requirements (GDPR 72h, HIPAA, PCI-DSS). Engage legal
+        counsel for data breach assessment.
+
+    - step: 6
+      action: "Remediate and Prevent"
+      details: >
+        Block anonymous file sharing services at the proxy. Implement DLP
+        rules for sensitive file type uploads. Restrict archive tool usage
+        via application control. Deploy USB device control for offline
+        exfiltration prevention. Review and tighten outbound firewall rules.
+        Implement network segmentation for sensitive data stores.
