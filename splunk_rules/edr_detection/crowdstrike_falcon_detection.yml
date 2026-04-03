@@ -1,0 +1,472 @@
+# ==============================================================================
+#  CrowdStrike Falcon EDR Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detects attack patterns, EDR evasion, and threat indicators
+#                from CrowdStrike Falcon telemetry — process injection,
+#                credential theft, defense evasion, C2 beacons, ransomware
+#                precursors, fileless attacks, and Falcon sensor tampering.
+#  MITRE ATT&CK: T1055, T1003, T1562, T1059, T1071, T1486, T1027, T1218
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : sourcetype=crowdstrike:events:sensor, crowdstrike:events:incident
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. CrowdStrike Falcon Data Replicator (FDR) or Falcon SIEM Connector:
+#       sourcetype=crowdstrike:events:sensor  (endpoint telemetry)
+#       sourcetype=crowdstrike:events:incident (detection/incident data)
+#       sourcetype=crowdstrike:events:detection (real-time detections)
+#
+#  2. Splunk Add-on for CrowdStrike (TA-crowdstrike-falcon-event-streams)
+#
+#  3. Key Falcon event types:
+#       ProcessRollup2, DnsRequest, NetworkConnect,
+#       ImageHash, FileWrite, RegistryOperationRuntime,
+#       SensorHeartbeat, DetectionSummaryEvent
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1055 — Process Injection Detected by Falcon
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_process_injection:
+  name: "CrowdStrike — Process Injection Chain Detection"
+  description: >
+    Correlates CrowdStrike Falcon process injection indicators — remote
+    thread creation, process hollowing, APC injection, and DLL injection
+    targeting sensitive processes (lsass, winlogon, svchost, explorer).
+  mitre_attack:
+    - T1055.001  # Process Injection: DLL Injection
+    - T1055.003  # Process Injection: Thread Execution Hijacking
+    - T1055.012  # Process Injection: Process Hollowing
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=crowdstrike sourcetype="crowdstrike:events:sensor"
+    event_simpleName IN ("ProcessInjection", "CreateRemoteThread",
+                          "ProcessHollowing", "ReflectiveDllLoaded",
+                          "SuspiciousCreateThread")
+    | eval target_sensitive=if(
+        match(TargetProcessImageFileName, "(?i)lsass|winlogon|svchost|csrss|services|explorer|wininit"),
+        "YES", "NO"
+      )
+    | eval injection_type=case(
+        event_simpleName="CreateRemoteThread", "Remote Thread Creation",
+        event_simpleName="ProcessHollowing", "Process Hollowing",
+        event_simpleName="ReflectiveDllLoaded", "Reflective DLL Injection",
+        event_simpleName="ProcessInjection", "Generic Process Injection",
+        true(), event_simpleName
+      )
+    | stats count values(injection_type) AS techniques
+        values(TargetProcessImageFileName) AS targets
+        values(SourceProcessImageFileName) AS injectors
+        values(target_sensitive) AS hits_sensitive
+        BY aid, ComputerName
+    | where count > 0
+    | sort -count
+
+  throttle: ComputerName, 300
+  notable:
+    rule_title: "Process Injection on $ComputerName$ — $techniques$"
+    rule_description: >
+      CrowdStrike detected $count$ process injection events on
+      $ComputerName$: $techniques$. Injectors: $injectors$.
+      Targets: $targets$. Sensitive process targeted: $hits_sensitive$.
+    recommended_actions:
+      - Contain the host via Falcon RTR (network containment)
+      - Investigate injecting process for malware origin
+      - Check if LSASS was targeted (credential theft)
+      - Collect memory dump for forensic analysis
+      - Kill injecting process tree via Falcon RTR
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1003 — Credential Access / LSASS Interaction
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_credential_theft:
+  name: "CrowdStrike — LSASS Credential Access Detection"
+  description: >
+    Detects credential theft attempts flagged by Falcon — LSASS memory
+    access, SAM database dumping, NTDS.dit extraction, and credential
+    dumping tools (Mimikatz, Rubeus, SharpDump, comsvcs.dll).
+  mitre_attack:
+    - T1003.001  # OS Credential Dumping: LSASS Memory
+    - T1003.002  # OS Credential Dumping: SAM
+    - T1003.003  # OS Credential Dumping: NTDS
+  severity: critical
+  confidence: 95
+
+  search: |
+    index=crowdstrike sourcetype="crowdstrike:events:sensor"
+    (
+      (event_simpleName="LsassAccess" OR event_simpleName="SuspiciousLsassAccess")
+      OR (event_simpleName="ProcessRollup2" AND
+          (CommandLine="*sekurlsa*" OR CommandLine="*lsadump*"
+           OR CommandLine="*comsvcs*MiniDump*" OR CommandLine="*procdump*lsass*"
+           OR CommandLine="*nanodump*" OR CommandLine="*mimikatz*"
+           OR CommandLine="*rubeus*" OR CommandLine="*sharpdump*"
+           OR CommandLine="*ntdsutil*" OR CommandLine="*vssadmin*shadow*"))
+    )
+    | eval tool=case(
+        match(CommandLine, "(?i)sekurlsa|lsadump|mimikatz"), "Mimikatz",
+        match(CommandLine, "(?i)rubeus"), "Rubeus",
+        match(CommandLine, "(?i)comsvcs.*minidump"), "comsvcs.dll LSASS dump",
+        match(CommandLine, "(?i)procdump.*lsass"), "ProcDump LSASS",
+        match(CommandLine, "(?i)nanodump"), "NanoDump",
+        match(CommandLine, "(?i)ntdsutil"), "NTDS.dit extraction",
+        event_simpleName="LsassAccess", "Direct LSASS access",
+        true(), "Credential tool"
+      )
+    | stats count values(tool) AS tools
+        values(CommandLine) AS commands
+        BY aid, ComputerName, UserName
+    | sort -count
+
+  throttle: ComputerName, 120
+  notable:
+    rule_title: "Credential Theft on $ComputerName$ — $tools$"
+    rule_description: >
+      CRITICAL — Credential dumping detected: $tools$ by $UserName$.
+      Commands: $commands$. All credentials on this host and
+      potentially the domain should be considered compromised.
+    recommended_actions:
+      - Network-contain the host immediately via Falcon
+      - Force password reset for ALL accounts that logged into this host
+      - If DC — reset krbtgt password twice, force domain-wide password reset
+      - Check for lateral movement from this host
+      - Full forensic memory capture via Falcon RTR
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1562 — Falcon Sensor Tampering / EDR Evasion
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_sensor_tampering:
+  name: "CrowdStrike Falcon Sensor Tampering / Evasion"
+  description: >
+    Detects attempts to disable, stop, uninstall, or bypass the CrowdStrike
+    Falcon sensor — service stops, driver unloads, sensor process kills,
+    and known EDR evasion techniques.
+  mitre_attack:
+    - T1562.001  # Impair Defenses: Disable or Modify Tools
+  severity: critical
+  confidence: 95
+
+  search: |
+    index=crowdstrike sourcetype="crowdstrike:events:sensor"
+    (
+      (event_simpleName="SensorTamper" OR event_simpleName="SensorUninstall")
+      OR (event_simpleName="ProcessRollup2" AND
+          (CommandLine="*csfalconservice*stop*"
+           OR CommandLine="*CrowdStrike*uninstall*"
+           OR CommandLine="*sc stop csagent*"
+           OR CommandLine="*sc delete csagent*"
+           OR CommandLine="*taskkill*csfalcon*"
+           OR CommandLine="*Remove-CsFalcon*"))
+      OR (event_simpleName="DriverUnloaded" AND
+          ImageFileName="*crowdstrike*")
+    )
+    OR (index=crowdstrike sourcetype="crowdstrike:events:sensor"
+        event_simpleName="SensorHeartbeat"
+        | stats latest(_time) AS last_heartbeat BY aid, ComputerName
+        | eval minutes_since=round((now() - last_heartbeat) / 60, 0)
+        | where minutes_since > 30)
+    | eval indicator=case(
+        event_simpleName="SensorTamper", "Sensor tamper detected",
+        event_simpleName="SensorUninstall", "Sensor uninstall attempted",
+        event_simpleName="DriverUnloaded", "Falcon driver unloaded",
+        match(CommandLine, "(?i)stop|uninstall|delete|taskkill"), "Sensor service manipulation: " + CommandLine,
+        isnotnull(minutes_since), "Sensor offline for " + tostring(minutes_since) + " min",
+        true(), "EDR evasion"
+      )
+    | stats count values(indicator) AS indicators BY ComputerName, aid
+    | sort -count
+
+  throttle: ComputerName, 120
+  notable:
+    rule_title: "Falcon Sensor Tampering on $ComputerName$ — $indicators$"
+    rule_description: >
+      CRITICAL — CrowdStrike Falcon sensor tampering: $indicators$.
+      EDR tampering is a prerequisite for undetected malware execution,
+      lateral movement, and data exfiltration.
+    recommended_actions:
+      - Escalate to SOC Tier 2 immediately
+      - Network-isolate the host at switch/firewall level
+      - Deploy secondary EDR or forensic agent
+      - Investigate via Falcon RTR if sensor is still responsive
+      - Check for ransomware precursor activity
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1059 — Fileless Attack / Living-off-the-Land Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_fileless_attack:
+  name: "CrowdStrike — Fileless Attack / LOLBin Execution Chain"
+  description: >
+    Detects fileless attack patterns from Falcon telemetry — PowerShell
+    download cradles, WMI/WMIC execution, MSBuild/CMSTP/Rundll32 proxy
+    execution, and .NET assembly loading in memory.
+  mitre_attack:
+    - T1059.001  # Command and Scripting Interpreter: PowerShell
+    - T1218      # System Binary Proxy Execution
+    - T1047      # WMI
+  severity: high
+  confidence: 85
+
+  search: |
+    index=crowdstrike sourcetype="crowdstrike:events:sensor"
+    event_simpleName="ProcessRollup2"
+    (
+      (ImageFileName="*powershell*" AND
+       (CommandLine="*-enc*" OR CommandLine="*downloadstring*"
+        OR CommandLine="*iex*" OR CommandLine="*invoke-expression*"
+        OR CommandLine="*frombase64*" OR CommandLine="*bypass*"
+        OR CommandLine="*hidden*" OR CommandLine="*-nop*-w hidden*"))
+      OR (ImageFileName="*wmic*" AND CommandLine="*process*call*create*")
+      OR (ImageFileName="*msbuild*" AND ParentImageFileName NOT IN ("*devenv*", "*msbuild*"))
+      OR (ImageFileName="*rundll32*" AND
+          (CommandLine="*javascript*" OR CommandLine="*vbscript*"
+           OR CommandLine="*comsvcs*"))
+      OR (ImageFileName="*cmstp*" AND CommandLine="*/s*")
+      OR (ImageFileName="*mshta*" AND CommandLine="*http*")
+      OR (ImageFileName="*regsvr32*" AND CommandLine="*/s*/i:http*")
+    )
+    | eval technique=case(
+        match(ImageFileName, "(?i)powershell"), "PowerShell fileless",
+        match(ImageFileName, "(?i)wmic"), "WMI execution",
+        match(ImageFileName, "(?i)msbuild"), "MSBuild proxy exec",
+        match(ImageFileName, "(?i)rundll32"), "Rundll32 proxy exec",
+        match(ImageFileName, "(?i)cmstp"), "CMSTP UAC bypass",
+        match(ImageFileName, "(?i)mshta"), "MSHTA remote execution",
+        match(ImageFileName, "(?i)regsvr32"), "Regsvr32 remote load",
+        true(), "LOLBin"
+      )
+    | stats count values(technique) AS techniques
+        values(CommandLine) AS commands
+        values(ParentImageFileName) AS parents
+        BY ComputerName, UserName
+    | sort -count
+
+  throttle: ComputerName, 300
+  notable:
+    rule_title: "Fileless Attack on $ComputerName$ — $techniques$"
+    rule_description: >
+      $count$ fileless/LOLBin executions by $UserName$: $techniques$.
+      Parent processes: $parents$. Fileless attacks execute entirely
+      in memory, evading traditional file-based detection.
+    recommended_actions:
+      - Investigate parent process chain for initial infection vector
+      - Check for download cradle destinations (C2 servers)
+      - Collect PowerShell script block logs (Event 4104)
+      - Check for persistence mechanisms dropped after execution
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1071 — C2 Beacon / Periodic Callback Detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_c2_beacon:
+  name: "CrowdStrike — C2 Beacon / Periodic DNS/HTTP Callbacks"
+  description: >
+    Detects command and control beaconing patterns from Falcon DNS and
+    network telemetry — periodic callbacks, high-entropy DNS queries,
+    and connections to known C2 frameworks (Cobalt Strike, Sliver, Havoc).
+  mitre_attack:
+    - T1071.001  # Application Layer Protocol: Web
+    - T1071.004  # Application Layer Protocol: DNS
+    - T1573      # Encrypted Channel
+  severity: high
+  confidence: 80
+
+  search: |
+    index=crowdstrike sourcetype="crowdstrike:events:sensor"
+    event_simpleName IN ("DnsRequest", "NetworkConnect")
+    | eval is_dns=if(event_simpleName="DnsRequest", 1, 0)
+    | eval domain=coalesce(DomainName, RemoteAddressIP4)
+    | bin _time span=5m
+    | stats count AS requests dc(_time) AS active_intervals
+        values(event_simpleName) AS event_types
+        BY aid, ComputerName, domain
+    | where active_intervals >= 6 AND requests >= 12
+    | eval beacon_score=round(requests / active_intervals, 1)
+    | where beacon_score >= 1.5 AND beacon_score <= 5
+    | sort -active_intervals
+
+  throttle: ComputerName, 600
+  notable:
+    rule_title: "C2 Beacon from $ComputerName$ → $domain$ ($beacon_score$/interval)"
+    rule_description: >
+      $ComputerName$ is making periodic callbacks to $domain$ —
+      $requests$ requests across $active_intervals$ intervals
+      ($beacon_score$ per interval). Regular periodic callbacks
+      are characteristic of C2 frameworks (Cobalt Strike, Sliver).
+    recommended_actions:
+      - Check domain/IP against threat intelligence
+      - Capture network traffic for protocol analysis
+      - Investigate endpoint for malware and persistence
+      - Block domain/IP at firewall and DNS
+      - Network-contain host if confirmed C2
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1486 — Ransomware Precursor Activity
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_ransomware_precursor:
+  name: "CrowdStrike — Ransomware Precursor / Pre-Encryption Activity"
+  description: >
+    Detects ransomware precursor behaviors from Falcon — shadow copy
+    deletion, recovery mode disabling, mass file encryption indicators,
+    ransomware note creation, and backup destruction.
+  mitre_attack:
+    - T1486  # Data Encrypted for Impact
+    - T1490  # Inhibit System Recovery
+  severity: critical
+  confidence: 95
+
+  search: |
+    index=crowdstrike sourcetype="crowdstrike:events:sensor"
+    event_simpleName="ProcessRollup2"
+    (
+      CommandLine="*vssadmin*delete*shadows*"
+      OR CommandLine="*wmic*shadowcopy*delete*"
+      OR CommandLine="*bcdedit*/set*recoveryenabled*no*"
+      OR CommandLine="*bcdedit*/set*bootstatuspolicy*ignoreallfailures*"
+      OR CommandLine="*wbadmin*delete*catalog*"
+      OR CommandLine="*cipher*/w:*"
+      OR CommandLine="*icacls*grant*Everyone*F*"
+    )
+    OR (event_simpleName="RansomwareDetection"
+        OR event_simpleName="FileEncrypted")
+    | eval precursor=case(
+        match(CommandLine, "(?i)vssadmin.*delete|shadowcopy.*delete"), "Shadow copy deletion",
+        match(CommandLine, "(?i)bcdedit.*recovery"), "Recovery disabled",
+        match(CommandLine, "(?i)wbadmin.*delete"), "Backup catalog deletion",
+        match(CommandLine, "(?i)cipher.*/w"), "Secure file wipe",
+        match(CommandLine, "(?i)icacls.*Everyone.*F"), "File permission override",
+        event_simpleName="RansomwareDetection", "Falcon ransomware detection",
+        true(), "Ransomware precursor"
+      )
+    | stats count values(precursor) AS precursors
+        values(CommandLine) AS commands
+        BY ComputerName, UserName
+    | sort -count
+
+  throttle: ComputerName, 60
+  notable:
+    rule_title: "RANSOMWARE PRECURSOR on $ComputerName$ — $precursors$"
+    rule_description: >
+      EMERGENCY — Ransomware precursor activity: $precursors$ by
+      $UserName$. Shadow copy deletion + recovery disabling are the
+      final steps before file encryption begins.
+    recommended_actions:
+      - EMERGENCY — Network-contain ALL hosts in the same subnet
+      - Isolate the host via Falcon and at switch level
+      - Check for lateral movement to other hosts
+      - Activate ransomware incident response playbook
+      - Preserve Falcon RTR evidence before reimaging
+      - Notify executive leadership and legal
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1027 — Packed/Obfuscated Malware Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_obfuscated_malware:
+  name: "CrowdStrike — Packed/Obfuscated Malware Execution"
+  description: >
+    Detects execution of packed, obfuscated, or unsigned binaries flagged
+    by Falcon — custom packers, UPX-packed executables, and binaries
+    with high entropy sections indicating encryption/packing.
+  mitre_attack:
+    - T1027  # Obfuscated Files or Information
+    - T1027.002  # Software Packing
+  severity: high
+  confidence: 80
+
+  search: |
+    index=crowdstrike sourcetype="crowdstrike:events:sensor"
+    event_simpleName="ProcessRollup2"
+    (
+      (SHA256HashData != "" AND
+       NOT [| inputlookup known_good_hashes | fields sha256 | rename sha256 AS SHA256HashData])
+      OR (ImageIsSigned="false" AND
+          ImageFileName NOT IN ("*\\Temp\\*", "*\\Downloads\\*"))
+    )
+    | lookup crowdstrike_ioc_list sha256 AS SHA256HashData OUTPUT ioc_type
+    | where isnotnull(ioc_type) OR ImageIsSigned="false"
+    | eval risk=case(
+        isnotnull(ioc_type), "Known IOC: " + ioc_type,
+        ImageIsSigned="false", "Unsigned binary",
+        true(), "Suspicious"
+      )
+    | stats count values(risk) AS risk_indicators
+        values(ImageFileName) AS files
+        values(SHA256HashData) AS hashes
+        BY ComputerName, UserName
+    | where count > 0
+    | sort -count
+
+  throttle: ComputerName, 600
+  notable:
+    rule_title: "Suspicious Binary on $ComputerName$ — $risk_indicators$"
+    rule_description: >
+      $count$ suspicious binary executions: $risk_indicators$.
+      Files: $files$. Submit hashes to VirusTotal for analysis.
+    recommended_actions:
+      - Submit SHA256 hashes to VirusTotal and Falcon Sandbox
+      - Quarantine identified files via Falcon RTR
+      - Check parent process for delivery mechanism
+      - Block hashes in Falcon IOC management
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: — Falcon Detection Severity Escalation (Critical/High)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_detection_escalation:
+  name: "CrowdStrike — Critical/High Severity Detection Aggregation"
+  description: >
+    Aggregates CrowdStrike Falcon critical and high severity detections
+    per host for SOC triage prioritization. Multiple high-severity
+    detections on one host indicate active compromise.
+  mitre_attack:
+    - T1059  # Command and Scripting Interpreter
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=crowdstrike sourcetype="crowdstrike:events:detection"
+    Severity IN ("Critical", "High")
+    | stats count dc(DetectName) AS unique_detections
+        values(DetectName) AS detections
+        values(Tactic) AS tactics
+        values(Technique) AS techniques
+        values(Severity) AS severities
+        min(_time) AS first max(_time) AS last
+        BY ComputerName, UserName
+    | where count >= 3 OR unique_detections >= 2
+    | eval time_window_min=round((last - first) / 60, 0)
+    | sort -count
+
+  throttle: ComputerName, 300
+  notable:
+    rule_title: "Multiple Falcon Detections on $ComputerName$ — $unique_detections$ types"
+    rule_description: >
+      $count$ critical/high detections ($unique_detections$ unique) on
+      $ComputerName$ by $UserName$ in $time_window_min$ min.
+      Detections: $detections$. Tactics: $tactics$.
+    recommended_actions:
+      - Triage as active compromise — multiple high detections = confirmed attack
+      - Network-contain the host via Falcon
+      - Begin full incident response
+      - Check for lateral movement to other hosts

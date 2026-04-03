@@ -1,0 +1,432 @@
+# ==============================================================================
+#  Microsoft Defender for Endpoint (MDE) Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detects attack patterns, EDR evasion, and threat indicators
+#                from Microsoft Defender for Endpoint telemetry — AMSI bypass,
+#                ASR rule tampering, tamper protection bypass, fileless attacks,
+#                credential access, and Defender-specific alert correlation.
+#  MITRE ATT&CK: T1055, T1003, T1562, T1059, T1071, T1486, T1218, T1036
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : sourcetype=ms:defender:advanced, ms:defender:alerts
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. MDE data forwarded to Splunk via:
+#       - Microsoft Defender Streaming API → Event Hub → Splunk
+#       - Microsoft 365 Defender connector
+#       sourcetype=ms:defender:advanced  (AdvancedHunting tables)
+#       sourcetype=ms:defender:alerts    (Alert/Incident data)
+#
+#  2. Key MDE tables:
+#       DeviceProcessEvents, DeviceNetworkEvents, DeviceFileEvents,
+#       DeviceRegistryEvents, DeviceLogonEvents, DeviceAlertEvents,
+#       DeviceImageLoadEvents
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1562 — AMSI Bypass / Defender Tamper Detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_amsi_bypass:
+  name: "MDE — AMSI Bypass / Antimalware Scan Interface Evasion"
+  description: >
+    Detects attempts to bypass the Antimalware Scan Interface (AMSI) —
+    the primary defense against fileless/script-based attacks in Windows.
+    Covers AMSI patching, amsiInitFailed manipulation, and known bypass
+    patterns in PowerShell, .NET, and VBScript.
+  mitre_attack:
+    - T1562.001  # Impair Defenses: Disable or Modify Tools
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=mde sourcetype="ms:defender:advanced"
+    ActionType IN ("ProcessCreated", "PowerShellCommand")
+    (
+      ProcessCommandLine="*AmsiInitFailed*"
+      OR ProcessCommandLine="*amsi.dll*VirtualProtect*"
+      OR ProcessCommandLine="*System.Management.Automation.AmsiUtils*"
+      OR ProcessCommandLine="*AmsiScanBuffer*"
+      OR ProcessCommandLine="*Set-MpPreference*-DisableRealtimeMonitoring*"
+      OR ProcessCommandLine="*Set-MpPreference*-DisableIOAVProtection*"
+      OR ProcessCommandLine="*Add-MpPreference*-ExclusionPath*"
+      OR ProcessCommandLine="*New-ItemProperty*DisableAntiSpyware*"
+    )
+    | eval bypass_type=case(
+        match(ProcessCommandLine, "(?i)amsiinitfailed|amsiscan|amsiutils"), "AMSI bypass (in-memory patching)",
+        match(ProcessCommandLine, "(?i)disablerealtimemonitoring"), "Real-time protection disabled",
+        match(ProcessCommandLine, "(?i)disableioavprotection"), "IOAV protection disabled",
+        match(ProcessCommandLine, "(?i)exclusionpath"), "Exclusion path added (evasion)",
+        match(ProcessCommandLine, "(?i)disableantispyware"), "Defender completely disabled",
+        true(), "Defender tampering"
+      )
+    | stats count values(bypass_type) AS bypasses
+        values(ProcessCommandLine) AS commands
+        values(InitiatingProcessFileName) AS parent_processes
+        BY DeviceName, AccountName
+    | sort -count
+
+  throttle: DeviceName, 120
+  notable:
+    rule_title: "AMSI/Defender Bypass on $DeviceName$ — $bypasses$"
+    rule_description: >
+      CRITICAL — $bypasses$ detected on $DeviceName$ by $AccountName$.
+      AMSI bypass is the first step in fileless malware execution.
+      Parent: $parent_processes$. Commands: $commands$.
+    recommended_actions:
+      - Isolate host via MDE (Isolate device)
+      - Re-enable Defender protections via GPO push
+      - Investigate parent process for initial infection
+      - Check for follow-up malware execution post-bypass
+      - Verify Tamper Protection is enabled (should prevent this)
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1562 — ASR Rule Tampering / Reduction Bypass
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_asr_tampering:
+  name: "MDE — Attack Surface Reduction (ASR) Rule Tampering"
+  description: >
+    Detects attempts to disable or weaken ASR rules — the key Defender
+    feature that blocks Office macro exploitation, credential stealing,
+    process injection, and other common attack techniques.
+  mitre_attack:
+    - T1562.001  # Impair Defenses: Disable or Modify Tools
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=mde sourcetype="ms:defender:advanced"
+    ActionType IN ("ProcessCreated", "RegistryValueSet")
+    (
+      ProcessCommandLine="*Set-MpPreference*-AttackSurfaceReductionRules*"
+      OR ProcessCommandLine="*Add-MpPreference*-AttackSurfaceReductionOnlyExclusions*"
+      OR (RegistryKey="*Windows Defender*Attack Surface Reduction*"
+          AND RegistryValueData IN ("0", "2"))
+    )
+    | eval asr_action=case(
+        match(ProcessCommandLine, "(?i)exclusion"), "ASR exclusion added",
+        match(RegistryValueData, "0"), "ASR rule disabled",
+        match(RegistryValueData, "2"), "ASR rule set to audit only",
+        true(), "ASR configuration changed"
+      )
+    | stats count values(asr_action) AS actions
+        values(ProcessCommandLine) AS commands
+        BY DeviceName, AccountName
+    | sort -count
+
+  throttle: DeviceName, 300
+  notable:
+    rule_title: "ASR Rule Tampering on $DeviceName$ — $actions$"
+    rule_description: >
+      ASR rules modified on $DeviceName$ by $AccountName$: $actions$.
+      Disabling ASR removes protection against Office macro abuse,
+      credential theft, and script-based attacks.
+    recommended_actions:
+      - Re-enable ASR rules via Intune/GPO immediately
+      - Investigate why ASR was modified
+      - Check for subsequent malware execution during bypass window
+      - Verify Tamper Protection is enabled and enforced
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1003 — Credential Access via MDE Telemetry
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_credential_access:
+  name: "MDE — Credential Access / LSASS Suspicious Activity"
+  description: >
+    Detects credential theft from MDE telemetry — LSASS memory access,
+    credential dumping tools, DCSync indicators, and SAM/SECURITY
+    registry hive extraction.
+  mitre_attack:
+    - T1003.001  # OS Credential Dumping: LSASS Memory
+    - T1003.002  # OS Credential Dumping: SAM
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=mde sourcetype="ms:defender:advanced"
+    (
+      (ActionType="ProcessCreated" AND
+       (FileName IN ("mimikatz.exe", "rubeus.exe", "sharpdump.exe",
+                      "nanodump.exe", "ppldump.exe")
+        OR ProcessCommandLine="*sekurlsa*" OR ProcessCommandLine="*lsadump*"
+        OR ProcessCommandLine="*comsvcs*MiniDump*"
+        OR ProcessCommandLine="*reg save*sam*"
+        OR ProcessCommandLine="*reg save*security*"
+        OR ProcessCommandLine="*reg save*system*"))
+      OR (ActionType="ProcessAccessed" AND
+          FileName="lsass.exe" AND
+          InitiatingProcessFileName NOT IN ("csrss.exe", "wininit.exe",
+                                             "services.exe", "MsMpEng.exe"))
+    )
+    | eval cred_technique=case(
+        match(FileName, "(?i)mimikatz"), "Mimikatz",
+        match(FileName, "(?i)rubeus"), "Rubeus",
+        match(ProcessCommandLine, "(?i)comsvcs.*minidump"), "comsvcs.dll LSASS dump",
+        match(ProcessCommandLine, "(?i)reg save.*sam"), "SAM registry export",
+        ActionType="ProcessAccessed", "LSASS memory access by " + InitiatingProcessFileName,
+        true(), "Credential tool"
+      )
+    | stats count values(cred_technique) AS techniques
+        values(InitiatingProcessFileName) AS parents
+        BY DeviceName, AccountName
+    | sort -count
+
+  throttle: DeviceName, 120
+  notable:
+    rule_title: "Credential Theft on $DeviceName$ — $techniques$"
+    rule_description: >
+      Credential dumping: $techniques$ by $AccountName$.
+      Parent processes: $parents$. All credentials on this host
+      should be considered compromised.
+    recommended_actions:
+      - Isolate host via MDE immediately
+      - Force password reset for all accounts on this host
+      - Check for Kerberos ticket forging (Golden/Silver Ticket)
+      - Full incident response if DC was targeted
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1059 — Suspicious Script Execution / Malicious Macro Chain
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_malicious_script:
+  name: "MDE — Malicious Script/Macro Execution Chain"
+  description: >
+    Detects suspicious script execution chains from MDE — Office spawning
+    PowerShell/cmd, script-based download cradles, and encoded command
+    execution patterns.
+  mitre_attack:
+    - T1059.001  # PowerShell
+    - T1204.002  # User Execution: Malicious File
+  severity: high
+  confidence: 85
+
+  search: |
+    index=mde sourcetype="ms:defender:advanced"
+    ActionType="ProcessCreated"
+    InitiatingProcessFileName IN ("WINWORD.EXE", "EXCEL.EXE", "POWERPNT.EXE",
+                                   "OUTLOOK.EXE", "MSACCESS.EXE")
+    FileName IN ("powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe",
+                  "mshta.exe", "certutil.exe", "bitsadmin.exe")
+    | eval chain=InitiatingProcessFileName + " → " + FileName
+    | eval is_download=if(
+        match(ProcessCommandLine, "(?i)download|http|invoke-web|urlcache|transfer|iex"),
+        "YES", "NO"
+      )
+    | stats count values(chain) AS execution_chains
+        values(ProcessCommandLine) AS commands
+        values(is_download) AS downloads
+        BY DeviceName, AccountName
+    | sort -count
+
+  throttle: DeviceName, 300
+  notable:
+    rule_title: "Malicious Macro Chain on $DeviceName$ — $execution_chains$"
+    rule_description: >
+      Office application spawned suspicious child process: $execution_chains$.
+      Download activity: $downloads$. User: $AccountName$.
+      This is the classic macro-based initial access chain.
+    recommended_actions:
+      - Quarantine the source Office document
+      - Check user's email for the delivery mechanism
+      - Block the download URL/domain
+      - Investigate for dropped payloads and persistence
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1036 — Masquerading / Suspicious Process Path
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_masquerading:
+  name: "MDE — Process Masquerading / Suspicious Binary Path"
+  description: >
+    Detects executables masquerading as legitimate Windows binaries but
+    running from non-standard paths, or legitimate binary names executed
+    by unexpected parent processes.
+  mitre_attack:
+    - T1036.005  # Masquerading: Match Legitimate Name or Location
+  severity: high
+  confidence: 80
+
+  search: |
+    index=mde sourcetype="ms:defender:advanced"
+    ActionType="ProcessCreated"
+    FileName IN ("svchost.exe", "csrss.exe", "lsass.exe", "services.exe",
+                  "smss.exe", "wininit.exe", "winlogon.exe", "explorer.exe",
+                  "rundll32.exe", "conhost.exe", "taskhost.exe")
+    NOT FolderPath IN ("c:\\windows\\system32\\*", "c:\\windows\\syswow64\\*",
+                        "c:\\windows\\*")
+    | eval masquerade=FileName + " running from " + FolderPath
+    | stats count values(masquerade) AS masquerades
+        values(InitiatingProcessFileName) AS parents
+        values(SHA256) AS hashes
+        BY DeviceName
+    | sort -count
+
+  throttle: DeviceName, 600
+  notable:
+    rule_title: "Process Masquerading on $DeviceName$ — $masquerades$"
+    rule_description: >
+      Windows system binary name(s) executing from non-standard paths:
+      $masquerades$. Parent: $parents$. Hashes: $hashes$.
+      Malware commonly mimics system binary names to blend in.
+    recommended_actions:
+      - Submit hashes to VirusTotal
+      - Quarantine suspicious files
+      - Check parent process for delivery mechanism
+      - Compare binary signatures against Microsoft catalog
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1486 — Ransomware Indicators from MDE
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_ransomware:
+  name: "MDE — Ransomware Behavior Detection"
+  description: >
+    Detects ransomware precursors and active encryption from MDE telemetry
+    — shadow copy deletion, recovery disabling, mass file rename/encrypt,
+    and ransom note creation.
+  mitre_attack:
+    - T1486  # Data Encrypted for Impact
+    - T1490  # Inhibit System Recovery
+  severity: critical
+  confidence: 95
+
+  search: |
+    index=mde sourcetype="ms:defender:advanced"
+    (
+      (ActionType="ProcessCreated" AND
+       (ProcessCommandLine="*vssadmin*delete*shadow*"
+        OR ProcessCommandLine="*wmic*shadowcopy*delete*"
+        OR ProcessCommandLine="*bcdedit*/set*recoveryenabled*no*"
+        OR ProcessCommandLine="*wbadmin*delete*catalog*"))
+      OR (ActionType="FileRenamed" AND
+          FileName="*.encrypted" OR FileName="*.locked" OR FileName="*.crypt"
+          OR FileName="*.ransom" OR FileName="*.pay2decrypt")
+      OR (ActionType="FileCreated" AND
+          FileName IN ("*readme*ransom*", "*how_to_decrypt*", "*RECOVER*FILES*",
+                        "*YOUR_FILES*", "*DECRYPT_INSTRUCTION*"))
+    )
+    | eval indicator=case(
+        match(ProcessCommandLine, "(?i)vssadmin|shadowcopy"), "Shadow copy deletion",
+        match(ProcessCommandLine, "(?i)bcdedit.*recovery"), "Recovery disabled",
+        match(ProcessCommandLine, "(?i)wbadmin.*delete"), "Backup deleted",
+        ActionType="FileRenamed", "File encryption: " + FileName,
+        ActionType="FileCreated", "Ransom note: " + FileName,
+        true(), "Ransomware indicator"
+      )
+    | stats count values(indicator) AS indicators BY DeviceName, AccountName
+    | sort -count
+
+  throttle: DeviceName, 60
+  notable:
+    rule_title: "RANSOMWARE on $DeviceName$ — $indicators$"
+    rule_description: >
+      EMERGENCY — Ransomware activity: $indicators$ by $AccountName$.
+      Activate incident response immediately.
+    recommended_actions:
+      - EMERGENCY — Isolate host AND entire subnet
+      - Activate ransomware incident response playbook
+      - Check for lateral movement to other hosts
+      - Preserve evidence before any remediation
+      - Notify CISO, legal, and executive leadership
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1071 — Suspicious Network Connections (C2/Exfil)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_suspicious_network:
+  name: "MDE — Suspicious Outbound Network Connections"
+  description: >
+    Detects suspicious outbound connections from MDE — connections from
+    LOLBins to external IPs, unusual ports, and high-volume data transfers
+    from non-browser processes.
+  mitre_attack:
+    - T1071  # Application Layer Protocol
+    - T1048  # Exfiltration Over Alternative Protocol
+  severity: high
+  confidence: 80
+
+  search: |
+    index=mde sourcetype="ms:defender:advanced"
+    ActionType="ConnectionSuccess"
+    RemoteIPType="Public"
+    InitiatingProcessFileName IN ("powershell.exe", "cmd.exe", "rundll32.exe",
+                                   "certutil.exe", "mshta.exe", "regsvr32.exe",
+                                   "bitsadmin.exe", "wscript.exe", "cscript.exe",
+                                   "msiexec.exe", "installutil.exe")
+    | stats count sum(RemoteBytes) AS bytes_out
+        dc(RemoteIP) AS unique_dests
+        values(RemoteIP) AS destinations
+        values(RemotePort) AS ports
+        BY DeviceName, InitiatingProcessFileName, AccountName
+    | eval mb_out=round(bytes_out/1024/1024, 2)
+    | where count > 3
+    | sort -bytes_out
+
+  throttle: DeviceName, 600
+  notable:
+    rule_title: "Suspicious Outbound from $DeviceName$ — $InitiatingProcessFileName$ → $destinations$"
+    rule_description: >
+      LOLBin $InitiatingProcessFileName$ made $count$ outbound
+      connections to $unique_dests$ external IPs: $destinations$
+      (ports: $ports$). Data sent: $mb_out$ MB. User: $AccountName$.
+    recommended_actions:
+      - Check destination IPs/domains against threat intelligence
+      - Block destinations at firewall
+      - Investigate the LOLBin execution chain
+      - Check for data exfiltration or C2 activity
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: — MDE Alert Severity Escalation
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_alert_escalation:
+  name: "MDE — Multiple High/Critical Alert Aggregation"
+  description: >
+    Aggregates multiple MDE high and critical alerts per device for
+    SOC triage. Multiple alerts on one device indicate active compromise.
+  mitre_attack:
+    - T1059  # Execution
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=mde sourcetype="ms:defender:alerts"
+    Severity IN ("High", "Critical", "Informational")
+    | where Severity IN ("High", "Critical")
+    | stats count dc(Title) AS unique_alerts
+        values(Title) AS alerts
+        values(Category) AS categories
+        values(Severity) AS severities
+        min(_time) AS first max(_time) AS last
+        BY DeviceName
+    | where count >= 3 OR unique_alerts >= 2
+    | eval window_min=round((last - first) / 60, 0)
+    | sort -count
+
+  throttle: DeviceName, 300
+  notable:
+    rule_title: "Multiple MDE Alerts on $DeviceName$ — $unique_alerts$ types"
+    rule_description: >
+      $count$ high/critical alerts ($unique_alerts$ unique) on
+      $DeviceName$ in $window_min$ min. Alerts: $alerts$.
+      Categories: $categories$.
+    recommended_actions:
+      - Triage as active compromise
+      - Isolate device via MDE
+      - Begin incident response

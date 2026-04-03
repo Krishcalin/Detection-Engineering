@@ -1,0 +1,429 @@
+# ==============================================================================
+#  Trend Micro Deep Security / Vision One Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detects attack patterns, agent tampering, and threat
+#                indicators from Trend Micro Deep Security (on-prem) and
+#                Vision One (XDR) — IPS/IDS evasion, anti-malware bypass,
+#                integrity monitoring alerts, log inspection findings,
+#                web reputation blocks, and agent manipulation.
+#  MITRE ATT&CK: T1055, T1003, T1562, T1059, T1190, T1486, T1027
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : sourcetype=deepsecurity, trendmicro:deep_security
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Trend Micro Deep Security syslog or API forwarding to Splunk:
+#       sourcetype=deepsecurity  (syslog CEF format)
+#       sourcetype=trendmicro:deep_security (API-based)
+#
+#  2. Key Deep Security module logs:
+#       - Anti-Malware (AM): malware detections, quarantine events
+#       - Intrusion Prevention (IPS/IDS): network attack blocking
+#       - Integrity Monitoring (IM): file/registry change detection
+#       - Log Inspection (LI): OS/application log analysis
+#       - Web Reputation (WR): malicious URL blocking
+#       - Firewall (FW): network layer packet filtering
+#       - Application Control (AC): software whitelist enforcement
+#
+#  3. Log fields:
+#       act, cat, cn1 (severity), cs1 (rule name), dvc, dst, src,
+#       dvchost, fname, msg, rt, TrendMicroDsTags
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1562 — Deep Security Agent Tampering / Module Disabled
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_agent_tampering:
+  name: "Trend Micro — Agent Tampering / Protection Module Disabled"
+  description: >
+    Detects Deep Security agent tampering — agent service stopped,
+    protection modules disabled (AM, IPS, IM, FW), agent uninstalled,
+    or self-protection bypassed.
+  mitre_attack:
+    - T1562.001  # Impair Defenses: Disable or Modify Tools
+  severity: critical
+  confidence: 95
+
+  search: |
+    index=deepsecurity
+    (
+      (cat="System Event" AND
+       (msg="*Agent stopped*" OR msg="*Agent offline*"
+        OR msg="*Module disabled*" OR msg="*Self-Protection disabled*"
+        OR msg="*Anti-Malware Engine Offline*"
+        OR msg="*Intrusion Prevention Module Offline*"
+        OR msg="*Agent uninstalled*"))
+      OR (cat="Agent Event" AND act IN ("disabled", "stopped", "uninstalled"))
+    )
+    | eval tamper_type=case(
+        match(msg, "(?i)agent stopped|agent offline"), "Agent service stopped",
+        match(msg, "(?i)module disabled"), "Protection module disabled",
+        match(msg, "(?i)self.protection"), "Self-protection bypassed",
+        match(msg, "(?i)anti.malware.*offline"), "Anti-Malware engine offline",
+        match(msg, "(?i)intrusion.*offline"), "IPS module offline",
+        match(msg, "(?i)uninstalled"), "Agent uninstalled",
+        true(), "Agent tampering"
+      )
+    | stats count values(tamper_type) AS tampering
+        values(msg) AS details
+        BY dvchost
+    | sort -count
+
+  throttle: dvchost, 120
+  notable:
+    rule_title: "Deep Security Tampering on $dvchost$ — $tampering$"
+    rule_description: >
+      CRITICAL — Agent protection compromised: $tampering$.
+      Details: $details$. Agent tampering indicates an active
+      attacker disabling defenses before malware deployment.
+    recommended_actions:
+      - Network-isolate the host immediately
+      - Redeploy Deep Security agent from management console
+      - Re-enable all protection modules
+      - Investigate host for compromise indicators
+      - Check if tampering was preceded by privilege escalation
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1190 — IPS/IDS Critical Exploit Detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_ips_exploit_detection:
+  name: "Trend Micro IPS — Critical Exploit / CVE Detection"
+  description: >
+    Detects critical and high severity IPS/IDS events from Deep Security
+    — exploit attempts, zero-day indicators, and known CVE exploitation
+    targeting protected hosts.
+  mitre_attack:
+    - T1190  # Exploit Public-Facing Application
+    - T1210  # Exploitation of Remote Services
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=deepsecurity cat="Intrusion Prevention"
+    cn1 IN ("4", "3")
+    act IN ("block", "drop", "reset", "detect")
+    | eval severity_label=case(cn1="4", "Critical", cn1="3", "High")
+    | eval exploit_info=cs1 + " (" + act + ")"
+    | eval is_cve=if(match(cs1, "CVE-"), "YES", "NO")
+    | stats count dc(cs1) AS unique_rules
+        values(exploit_info) AS exploits
+        values(src) AS attackers
+        dc(src) AS unique_attackers
+        BY dvchost, dst, severity_label
+    | where count > 0
+    | sort -count
+
+  throttle: dvchost, 300
+  notable:
+    rule_title: "IPS $severity_label$ Exploit on $dvchost$ — $unique_rules$ rules triggered"
+    rule_description: >
+      $count$ IPS events ($severity_label$) on $dvchost$ ($dst$)
+      from $unique_attackers$ attackers: $exploits$.
+    recommended_actions:
+      - Verify exploit was blocked (act=block) vs detected only
+      - Patch the targeted vulnerability if not already patched
+      - Block attacker IPs at perimeter firewall
+      - Check if any exploit attempts succeeded before IPS rule deployed
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1027 — Anti-Malware Detection / Quarantine Events
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_malware_detection:
+  name: "Trend Micro AM — Malware Detection and Quarantine"
+  description: >
+    Aggregates anti-malware detections from Deep Security — malware
+    found, quarantine success/failure, real-time scan events, and
+    manual scan findings. Multiple detections on one host indicate
+    active infection.
+  mitre_attack:
+    - T1027  # Obfuscated Files or Information
+    - T1204  # User Execution
+  severity: high
+  confidence: 85
+
+  search: |
+    index=deepsecurity cat="Anti-Malware"
+    act IN ("quarantine", "clean", "delete", "deny", "pass")
+    | eval action_result=case(
+        act IN ("quarantine", "clean", "delete"), "Remediated",
+        act="deny", "Blocked",
+        act="pass", "ALLOWED (failed to remediate)",
+        true(), act
+      )
+    | eval is_failed=if(act="pass", 1, 0)
+    | stats count sum(is_failed) AS failed_remediations
+        dc(fname) AS unique_malware
+        values(fname) AS malware_files
+        values(action_result) AS actions
+        values(TrendMicroDsTags) AS malware_families
+        BY dvchost
+    | where count > 0
+    | sort -failed_remediations -count
+
+  throttle: dvchost, 600
+  notable:
+    rule_title: "Malware on $dvchost$ — $unique_malware$ samples ($failed_remediations$ failed)"
+    rule_description: >
+      $count$ anti-malware events on $dvchost$. Unique samples:
+      $unique_malware$ ($malware_files$). Families: $malware_families$.
+      Actions: $actions$. Failed remediations: $failed_remediations$.
+    recommended_actions:
+      - If remediation failed — isolate host and manual cleanup
+      - Submit samples to Trend Micro sandbox for analysis
+      - Check infection vector (email, web, USB, lateral movement)
+      - Scan all hosts in same subnet for spread
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1565 — Integrity Monitoring Critical Changes
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_integrity_monitoring:
+  name: "Trend Micro IM — Critical File/Registry Integrity Changes"
+  description: >
+    Detects critical integrity monitoring changes from Deep Security —
+    unauthorized modifications to system files, security configurations,
+    critical application binaries, and Windows registry keys.
+  mitre_attack:
+    - T1565  # Data Manipulation
+    - T1546  # Event Triggered Execution
+  severity: high
+  confidence: 85
+
+  search: |
+    index=deepsecurity cat="Integrity Monitoring"
+    cn1 IN ("4", "3")
+    act IN ("modified", "created", "deleted", "renamed")
+    | eval change_type=case(
+        match(fname, "(?i)system32|drivers|security|sam|ntds"), "System/security file",
+        match(fname, "(?i)hosts|dns|resolv"), "Network configuration",
+        match(fname, "(?i)authorized_keys|ssh|sudoers"), "SSH/sudo config",
+        match(fname, "(?i)crontab|systemd|init\\.d"), "Startup/persistence",
+        match(fname, "(?i)passwd|shadow|group"), "Authentication file",
+        match(fname, "(?i)web\\.config|httpd|nginx|apache"), "Web server config",
+        match(fname, "(?i)registry|hklm|hkcu"), "Registry key",
+        true(), "Monitored file"
+      )
+    | stats count dc(fname) AS unique_files
+        values(fname) AS files_changed
+        values(change_type) AS change_types
+        values(act) AS actions
+        BY dvchost
+    | where count > 0
+    | sort -count
+
+  throttle: dvchost, 600
+  notable:
+    rule_title: "Integrity Change on $dvchost$ — $change_types$ ($unique_files$ files)"
+    rule_description: >
+      $count$ integrity monitoring alerts on $dvchost$: $change_types$.
+      Actions: $actions$. Files: $files_changed$. Unauthorized
+      changes to system files indicate compromise or persistence.
+    recommended_actions:
+      - Compare changed files against known-good baseline
+      - Check who/what process modified the files
+      - Restore files from backup if unauthorized
+      - Investigate for rootkit or backdoor installation
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1071 — Web Reputation / Malicious URL Blocking
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_web_reputation:
+  name: "Trend Micro WR — Malicious URL/C2 Domain Blocked"
+  description: >
+    Detects hosts attempting to connect to malicious URLs, phishing sites,
+    C2 domains, or malware distribution sites blocked by Deep Security
+    web reputation. Multiple blocks indicate active compromise trying
+    to reach C2.
+  mitre_attack:
+    - T1071.001  # Application Layer Protocol: Web
+    - T1566  # Phishing
+  severity: high
+  confidence: 80
+
+  search: |
+    index=deepsecurity cat="Web Reputation"
+    act IN ("block", "deny", "warn")
+    | eval url_risk=case(
+        match(TrendMicroDsTags, "(?i)c2|command|control|botnet"), "C2/Botnet",
+        match(TrendMicroDsTags, "(?i)phish"), "Phishing",
+        match(TrendMicroDsTags, "(?i)malware|exploit"), "Malware distribution",
+        match(TrendMicroDsTags, "(?i)ransomware"), "Ransomware infrastructure",
+        true(), "Malicious URL"
+      )
+    | stats count dc(dst) AS unique_urls
+        values(dst) AS blocked_urls
+        values(url_risk) AS risk_categories
+        BY dvchost, src
+    | where count > 3
+    | sort -count
+
+  throttle: dvchost, 600
+  notable:
+    rule_title: "Malicious URL Blocks on $dvchost$ — $risk_categories$ ($unique_urls$ URLs)"
+    rule_description: >
+      $count$ web reputation blocks on $dvchost$ ($src$):
+      $risk_categories$. URLs: $blocked_urls$. Repeated C2/malware
+      blocks indicate active infection attempting callback.
+    recommended_actions:
+      - Investigate host for malware infection
+      - Check if any connections succeeded before blocking
+      - Block domains/IPs at perimeter firewall
+      - Run full anti-malware scan on the host
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1059 — Log Inspection Critical Findings
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_log_inspection:
+  name: "Trend Micro LI — Critical Log Inspection Findings"
+  description: >
+    Aggregates critical and high log inspection findings from Deep
+    Security — suspicious authentication events, privilege escalation
+    indicators, and application-level attack patterns detected by
+    parsing OS and application logs.
+  mitre_attack:
+    - T1059  # Execution
+    - T1078  # Valid Accounts
+  severity: high
+  confidence: 80
+
+  search: |
+    index=deepsecurity cat="Log Inspection"
+    cn1 IN ("4", "3")
+    | eval finding_type=case(
+        match(cs1, "(?i)brute.force|failed.login|authentication"), "Authentication attack",
+        match(cs1, "(?i)privilege|escalat|sudo|su "), "Privilege escalation",
+        match(cs1, "(?i)injection|xss|traversal|overflow"), "Application attack",
+        match(cs1, "(?i)malware|virus|trojan|backdoor"), "Malware indicator",
+        match(cs1, "(?i)shell|reverse|bind|nc -"), "Reverse shell indicator",
+        true(), "Security event"
+      )
+    | stats count dc(cs1) AS unique_rules
+        values(finding_type) AS finding_types
+        values(cs1) AS rules_triggered
+        BY dvchost
+    | where count > 0
+    | sort -count
+
+  throttle: dvchost, 600
+  notable:
+    rule_title: "Log Inspection Findings on $dvchost$ — $finding_types$"
+    rule_description: >
+      $count$ critical/high log inspection findings: $finding_types$.
+      Rules: $rules_triggered$.
+    recommended_actions:
+      - Investigate findings based on type
+      - For auth attacks — check for compromised accounts
+      - For app attacks — patch vulnerable application
+      - For malware — run full endpoint scan
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: — Application Control Violations
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_application_control:
+  name: "Trend Micro AC — Application Control Violation / Unauthorized Software"
+  description: >
+    Detects execution of unauthorized software blocked by Deep Security
+    Application Control. Repeated blocks indicate an attacker attempting
+    to run tools on a locked-down host.
+  mitre_attack:
+    - T1059  # Execution
+    - T1036  # Masquerading
+  severity: high
+  confidence: 85
+
+  search: |
+    index=deepsecurity cat="Application Control"
+    act IN ("block", "deny")
+    | eval blocked_app=coalesce(fname, cs1, msg)
+    | stats count dc(fname) AS unique_apps
+        values(blocked_app) AS blocked_applications
+        min(_time) AS first max(_time) AS last
+        BY dvchost
+    | where count >= 3
+    | eval window_min=round((last - first) / 60, 0)
+    | sort -count
+
+  throttle: dvchost, 600
+  notable:
+    rule_title: "App Control Violations on $dvchost$ — $unique_apps$ apps blocked"
+    rule_description: >
+      $count$ unauthorized application executions blocked on $dvchost$
+      in $window_min$ minutes: $blocked_applications$. Repeated
+      Application Control blocks indicate an attacker attempting to
+      run tooling on a hardened host.
+    recommended_actions:
+      - Investigate who is attempting to run blocked applications
+      - Check if blocked apps are known attacker tools
+      - Verify application control whitelist is current
+      - If legitimate — request approval through change management
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: — Multi-Module Alert Correlation (Active Compromise)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_multi_module_correlation:
+  name: "Trend Micro — Multi-Module Alert Correlation (Active Compromise)"
+  description: >
+    Correlates alerts across multiple Deep Security protection modules
+    on the same host. Alerts from AM + IPS + IM on one host in a short
+    timeframe is a strong indicator of active compromise.
+  mitre_attack:
+    - T1059  # Execution
+  severity: critical
+  confidence: 95
+
+  search: |
+    index=deepsecurity cn1 IN ("4", "3")
+    | eval module=case(
+        cat="Anti-Malware", "AM",
+        cat="Intrusion Prevention", "IPS",
+        cat="Integrity Monitoring", "IM",
+        cat="Log Inspection", "LI",
+        cat="Web Reputation", "WR",
+        cat="Application Control", "AC",
+        cat="Firewall", "FW",
+        true(), cat
+      )
+    | bin _time span=30m
+    | stats dc(module) AS modules_triggered count
+        values(module) AS active_modules
+        values(cat) AS categories
+        min(_time) AS first max(_time) AS last
+        BY dvchost, _time
+    | where modules_triggered >= 3
+    | sort -modules_triggered
+
+  throttle: dvchost, 300
+  notable:
+    rule_title: "Multi-Module Alert on $dvchost$ — $modules_triggered$ modules ($active_modules$)"
+    rule_description: >
+      $modules_triggered$ Deep Security modules triggered on $dvchost$
+      in 30 min: $active_modules$. $count$ total events.
+      Multi-module correlation indicates active compromise —
+      attacker is triggering IPS, malware, and integrity alerts.
+    recommended_actions:
+      - CRITICAL — Treat as confirmed active compromise
+      - Isolate host immediately
+      - Full incident response — memory capture, disk forensics
+      - Check for lateral movement to adjacent hosts
+      - Engage Trend Micro support for deep analysis
