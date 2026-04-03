@@ -1,0 +1,386 @@
+# ==============================================================================
+#  Check Point Firewall Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detects attack patterns, VPN exploitation, admin compromise,
+#                blade bypass, and threat indicators from Check Point Security
+#                Gateways — including SmartConsole abuse, IPSec/Remote Access
+#                VPN attacks, and Security Management Server (SMS) compromise.
+#  MITRE ATT&CK: T1190, T1133, T1110, T1562, T1048, T1071, T1078
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : sourcetype=cp_log (Check Point Log Exporter / OPSEC LEA)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Check Point Log Exporter or OPSEC LEA forwarding to Splunk:
+#       sourcetype=cp_log
+#       Fields: action, src, dst, service, proto, rule, blade,
+#               product, origin, user, severity, confidence_level
+#
+#  2. Splunk Add-on for Check Point (TA-checkpoint) installed
+#
+#  3. Key Check Point log types:
+#       - Firewall blade:  product="Firewall"
+#       - IPS blade:       product="IPS"
+#       - Anti-Bot blade:  product="Anti-Bot"
+#       - Threat Emulation: product="Threat Emulation"
+#       - VPN blade:       product="VPN"
+#       - SmartConsole:    product="SmartConsole"
+#       - Compliance:      product="Compliance"
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1190 — Check Point Gateway Exploitation (CVEs)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_gateway_exploitation:
+  name: "Check Point Gateway Exploitation — Critical CVE Indicators"
+  description: >
+    Detects exploitation attempts against Check Point Security Gateways
+    including CVE-2024-24919 (Information Disclosure), CVE-2023-28461
+    (Quantum Gateway RCE), and attacks targeting the Security Management
+    Server (SMS). Check Point VPN and management interfaces are high-value
+    targets for state-sponsored actors.
+  mitre_attack:
+    - T1190  # Exploit Public-Facing Application
+  severity: critical
+  confidence: 95
+
+  search: |
+    index=firewall sourcetype="cp_log"
+    (
+      (product="IPS" AND
+       (attack_info="*CVE-2024-24919*" OR attack_info="*CVE-2023-28461*"
+        OR attack_info="*Check Point*Remote*" OR attack_info="*SmartConsole*exploit*"))
+      OR (product="VPN" AND action="Failed"
+          AND service IN ("443", "4434", "18231", "18190")
+          AND severity IN ("High", "Critical"))
+      OR (product="SmartConsole" AND action="Failed"
+          AND [| stats count BY src | where count > 20 | fields src])
+    )
+    | eval indicator=case(
+        match(attack_info, "CVE"), "CVE exploit: " + attack_info,
+        product="SmartConsole", "SmartConsole brute force from " + src,
+        product="VPN", "VPN exploitation attempt",
+        true(), "Check Point exploitation indicator"
+      )
+    | stats count values(indicator) AS indicators
+        values(src) AS sources values(severity) AS severities
+        BY origin
+    | sort -count
+
+  throttle: origin, 120
+  notable:
+    rule_title: "Check Point Exploitation on $origin$ — $indicators$"
+    rule_description: >
+      Check Point gateway exploitation indicators: $indicators$.
+      $count$ events from $sources$. Gateway exploitation grants
+      network-level access and security bypass capabilities.
+    recommended_actions:
+      - Apply latest Check Point hotfix immediately
+      - Check for unauthorized VPN certificates or users
+      - Verify Security Management Server integrity
+      - Review IPS blade logs for exploit attempts
+      - Restrict management access to MGMT VLAN only
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1133 — Remote Access VPN / Mobile Access Brute Force
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_vpn_brute_force:
+  name: "Check Point VPN Brute Force / Credential Stuffing"
+  description: >
+    Detects brute-force attacks against Check Point Remote Access VPN
+    (IPSec or SSL VPN) and Mobile Access portal.
+  mitre_attack:
+    - T1133  # External Remote Services
+    - T1110  # Brute Force
+  severity: high
+  confidence: 85
+
+  search: |
+    index=firewall sourcetype="cp_log"
+    product IN ("VPN", "Mobile Access") action IN ("Failed", "Reject")
+    | stats count dc(user) AS unique_users
+        values(user) AS usernames
+        min(_time) AS first max(_time) AS last
+        BY src
+    | eval rate=round(count / ((last - first) / 60 + 1), 1)
+    | where count > 10
+    | sort -count
+
+  throttle: src, 600
+  notable:
+    rule_title: "Check Point VPN Brute Force from $src$ — $count$ failures"
+    rule_description: >
+      $count$ failed VPN attempts from $src$ targeting $unique_users$
+      user(s) at $rate$/min: $usernames$.
+    recommended_actions:
+      - Block source IP via SAM (Suspicious Activity Monitoring) rule
+      - Enable multi-factor authentication for VPN
+      - Check for successful logins from same source after failures
+      - Review affected accounts for compromise
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1562 — Security Policy / Blade Tampering
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_policy_tampering:
+  name: "Check Point Policy Tampering — Blade Disabled or Rule Modified"
+  description: >
+    Detects unauthorized modifications to Check Point security policy,
+    blade configuration, or threat prevention settings via SmartConsole.
+  mitre_attack:
+    - T1562.004  # Impair Defenses: Disable or Modify System Firewall
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=firewall sourcetype="cp_log" product="SmartConsole"
+    (operation IN ("Modify Rule", "Delete Rule", "Add Rule",
+                   "Install Policy", "Modify Object", "Uninstall Policy")
+     OR (operation="Modify Object" AND
+         object_type IN ("Threat Prevention Policy", "IPS Profile",
+                         "Anti-Bot Profile", "Anti-Virus Profile",
+                         "Threat Emulation Profile")))
+    NOT [| inputlookup approved_admin_ips | fields ip | rename ip AS src]
+    | eval change_type=case(
+        match(operation, "Rule"), "Firewall rule: " + operation,
+        operation="Install Policy", "Policy installed",
+        operation="Uninstall Policy", "Policy UNINSTALLED (critical)",
+        match(object_type, "Threat|IPS|Anti"), "Threat prevention: " + operation,
+        true(), operation
+      )
+    | stats count values(change_type) AS changes
+        values(operation) AS operations
+        BY administrator, src, origin
+    | sort -count
+
+  throttle: administrator, 300
+  notable:
+    rule_title: "Check Point Policy Tampering by $administrator$ from $src$"
+    rule_description: >
+      $count$ policy changes by $administrator$ from $src$ on $origin$:
+      $changes$. Unauthorized policy changes can disable threat prevention
+      blades or create firewall bypass rules.
+    recommended_actions:
+      - Review all recent SmartConsole audit logs
+      - Check for disabled IPS/Anti-Bot/Threat Emulation blades
+      - Verify the admin account in SmartDashboard
+      - Restore policy from SmartConsole revision if unauthorized
+      - Check for "accept any any" rules in rulebase
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1078 — SmartConsole Admin Compromise
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_admin_compromise:
+  name: "Check Point SmartConsole Unauthorized Admin Access"
+  description: >
+    Detects admin logins to Check Point SmartConsole/SmartDashboard from
+    unauthorized IPs or at unusual times.
+  mitre_attack:
+    - T1078  # Valid Accounts
+  severity: high
+  confidence: 85
+
+  search: |
+    index=firewall sourcetype="cp_log" product="SmartConsole"
+    operation IN ("Log In", "Session Start")
+    NOT [| inputlookup approved_admin_ips | fields ip | rename ip AS src]
+    | iplocation src
+    | stats count dc(src) AS unique_ips
+        values(src) AS login_ips
+        values(Country) AS countries
+        BY administrator, origin
+    | sort -count
+
+  throttle: administrator, 600
+  notable:
+    rule_title: "Unauthorized SmartConsole Login — $administrator$ from $login_ips$"
+    rule_description: >
+      Admin $administrator$ accessed SmartConsole on $origin$ from
+      unauthorized IP(s): $login_ips$ ($countries$).
+    recommended_actions:
+      - Verify with the actual admin
+      - Lock SmartConsole admin account if unauthorized
+      - Review all policy changes during the session
+      - Restrict SmartConsole access via SIC and IP filtering
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1048 — Data Exfiltration Through Check Point
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_data_exfiltration:
+  name: "Check Point — Abnormal Outbound Data Volume (Exfiltration)"
+  description: >
+    Detects hosts transferring abnormally large data volumes outbound
+    through the Check Point firewall.
+  mitre_attack:
+    - T1048  # Exfiltration Over Alternative Protocol
+  severity: high
+  confidence: 75
+
+  search: |
+    index=firewall sourcetype="cp_log" product="Firewall"
+    action="Accept"
+    NOT (dst="10.*" OR dst="172.16.*" OR dst="192.168.*")
+    | stats sum(bytes) AS total_bytes dc(dst) AS unique_dests
+        values(service) AS services
+        BY src
+    | eval mb_out=round(total_bytes/1024/1024, 2)
+    | where mb_out > 500
+    | sort -mb_out
+
+  throttle: src, 3600
+  notable:
+    rule_title: "Exfiltration — $src$ sent $mb_out$ MB via $services$"
+    rule_description: >
+      $src$ transferred $mb_out$ MB to $unique_dests$ external
+      destinations via $services$.
+    recommended_actions:
+      - Investigate source host for malware
+      - Check DLP blade logs for data classification
+      - Block outbound access temporarily
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1071 — Threat Prevention Blade Alerts (IPS/Anti-Bot/AV)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_threat_prevention_alerts:
+  name: "Check Point Threat Prevention — Critical/High Blade Alerts"
+  description: >
+    Aggregates critical and high severity alerts from Check Point IPS,
+    Anti-Bot, Anti-Virus, and Threat Emulation blades for correlation
+    with other security events.
+  mitre_attack:
+    - T1071  # Application Layer Protocol
+    - T1204  # User Execution
+  severity: high
+  confidence: 85
+
+  search: |
+    index=firewall sourcetype="cp_log"
+    product IN ("IPS", "Anti-Bot", "Anti-Virus", "Threat Emulation")
+    severity IN ("Critical", "High")
+    action IN ("Detect", "Prevent", "Drop", "Block")
+    | eval threat_type=case(
+        product="IPS", "IPS: " + coalesce(attack_info, protection_name, "unknown"),
+        product="Anti-Bot", "Bot: " + coalesce(malware_family, protection_name, "unknown"),
+        product="Anti-Virus", "Malware: " + coalesce(malware_family, virus_name, "unknown"),
+        product="Threat Emulation", "Sandbox: " + coalesce(malware_family, "unknown"),
+        true(), product + " alert"
+      )
+    | stats count dc(src) AS unique_sources
+        values(threat_type) AS threats
+        values(src) AS sources
+        values(action) AS actions
+        BY dst, product
+    | where count > 0
+    | sort -count
+
+  throttle: dst, 600
+  notable:
+    rule_title: "Check Point Threat Alert — $threats$ targeting $dst$"
+    rule_description: >
+      $count$ $product$ alerts ($actions$) targeting $dst$ from
+      $unique_sources$ sources: $threats$.
+    recommended_actions:
+      - Investigate target host for successful compromise
+      - Check if alert action was "Prevent" or only "Detect"
+      - Correlate with endpoint EDR alerts
+      - Block source IPs if external
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: — Lateral Movement Through Check Point Zones
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_lateral_movement:
+  name: "Check Point — Cross-Zone Lateral Movement"
+  description: >
+    Detects hosts using admin protocols across Check Point security zones
+    to reach multiple targets — indicating post-compromise lateral movement.
+  mitre_attack:
+    - T1021  # Remote Services
+  severity: high
+  confidence: 80
+
+  search: |
+    index=firewall sourcetype="cp_log" product="Firewall"
+    action="Accept"
+    service IN ("ssh", "rdp", "microsoft-ds", "ms-wbt-server", "winrm")
+    | eval src_zone=coalesce(inzone, "unknown")
+    | eval dst_zone=coalesce(outzone, "unknown")
+    | where src_zone != dst_zone
+    | stats count dc(dst) AS unique_targets
+        values(dst) AS targets values(service) AS protocols
+        values(dst_zone) AS dest_zones
+        BY src, src_zone
+    | where unique_targets >= 3
+    | sort -unique_targets
+
+  throttle: src, 600
+  notable:
+    rule_title: "Lateral Movement — $src$ ($src_zone$) → $unique_targets$ targets"
+    rule_description: >
+      $src$ in zone $src_zone$ connected to $unique_targets$ hosts
+      across zones $dest_zones$ via $protocols$: $targets$.
+    recommended_actions:
+      - Isolate source host immediately
+      - Check all target hosts for compromise
+      - Review SAM (Suspicious Activity Monitoring) events
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: — Check Point Cluster / HA State Manipulation
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_cluster_manipulation:
+  name: "Check Point Cluster State Change — HA Manipulation"
+  description: >
+    Detects unexpected ClusterXL state changes or failover events that
+    could indicate an attacker forcing traffic through a compromised
+    cluster member.
+  mitre_attack:
+    - T1498  # Network Denial of Service
+  severity: high
+  confidence: 75
+
+  search: |
+    index=firewall sourcetype="cp_log"
+    (product="ClusterXL" OR product="VRRP")
+    (action IN ("Failover", "State Change", "Down", "Problem")
+     OR message="*failover*" OR message="*state change*"
+     OR message="*cluster member down*")
+    | eval event_type=case(
+        match(message, "(?i)failover"), "Cluster failover",
+        match(message, "(?i)down"), "Cluster member down",
+        match(message, "(?i)state change"), "Cluster state change",
+        true(), "Cluster event"
+      )
+    | stats count values(event_type) AS events BY origin, _time
+    | sort -_time
+
+  throttle: origin, 300
+  notable:
+    rule_title: "Check Point Cluster Event on $origin$ — $events$"
+    rule_description: >
+      Unexpected cluster event: $events$. Forced failover can redirect
+      traffic through a compromised standby member or cause service disruption.
+    recommended_actions:
+      - Verify cluster state (cphaprob stat)
+      - Check if failover was caused by hardware or admin action
+      - Compare configurations across cluster members
+      - Review recent admin access to both members

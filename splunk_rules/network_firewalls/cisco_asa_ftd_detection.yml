@@ -1,0 +1,337 @@
+# ==============================================================================
+#  Cisco ASA/FTD Firewall Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detects attack patterns, VPN exploitation, admin compromise,
+#                ACL tampering, tunnel abuse, and threat indicators from
+#                Cisco ASA (Adaptive Security Appliance) and Firepower Threat
+#                Defense (FTD) firewalls.
+#  MITRE ATT&CK: T1190, T1133, T1110, T1562, T1048, T1071, T1021
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : sourcetype=cisco:asa, cisco:ftd, cisco:fmc
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Cisco ASA/FTD syslog forwarding to Splunk:
+#       sourcetype=cisco:asa (ASA syslog messages %ASA-x-xxxxxx)
+#       sourcetype=cisco:ftd (FTD via FMC syslog)
+#
+#  2. Splunk Add-on for Cisco ASA (TA-cisco_asa) installed
+#
+#  3. Key ASA message IDs to enable:
+#       - 106001-106023: ACL deny/permit
+#       - 113004-113039: AAA authentication
+#       - 302013-302021: Connection build/teardown
+#       - 710003-710006: Management access
+#       - 502103: AnyConnect events
+#       - 722022-722051: VPN session events
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1190 — Cisco ASA/FTD Exploitation (CVE-2024-20353, CVE-2024-20359)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_asa_exploitation:
+  name: "Cisco ASA/FTD Exploitation — ArcaneDoor & Known CVEs"
+  description: >
+    Detects exploitation attempts against Cisco ASA/FTD including the
+    ArcaneDoor campaign (CVE-2024-20353 DoS, CVE-2024-20359 persistent
+    code execution), CVE-2023-20269 (VPN brute force), and webvpn
+    exploitation indicators.
+  mitre_attack:
+    - T1190  # Exploit Public-Facing Application
+  severity: critical
+  confidence: 95
+
+  search: |
+    index=firewall sourcetype="cisco:asa"
+    (
+      (message_id IN ("106023", "106100") AND
+       (dest_port=443 AND protocol="TCP")
+       AND rule="*webvpn*")
+      OR (message_id="502103" AND message="*crash*")
+      OR (message_id IN ("199017", "199018", "199019")
+          AND message="*reload*")
+      OR (message_id="111008" AND message="*boot*system*")
+      OR (message_id="718063" AND message="*invalid*cert*")
+    )
+    | eval indicator=case(
+        message_id="502103", "ASA crash (potential DoS exploit CVE-2024-20353)",
+        match(message_id, "199"), "Unexpected reload (potential code execution CVE-2024-20359)",
+        message_id="111008", "Boot config change (persistent implant indicator)",
+        true(), "WebVPN exploitation attempt"
+      )
+    | stats count values(indicator) AS indicators
+        values(src_ip) AS sources
+        BY host
+    | sort -count
+
+  throttle: host, 120
+  notable:
+    rule_title: "ASA/FTD Exploitation on $host$ — $indicators$"
+    rule_description: >
+      Cisco ASA/FTD exploitation indicators: $indicators$.
+      ArcaneDoor (UAT4356) targets ASA webvpn to install persistent
+      backdoors (Line Dancer, Line Runner). Sources: $sources$.
+    recommended_actions:
+      - Capture ASA crashinfo file for forensic analysis
+      - Check for unauthorized boot images (show boot)
+      - Verify ASA software integrity (verify /sha-512 disk0:)
+      - Upgrade to patched ASA version immediately
+      - Check for persistent webvpn modifications
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1133 — AnyConnect/VPN Brute Force & Credential Stuffing
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_vpn_brute_force:
+  name: "Cisco AnyConnect VPN Brute Force / Credential Stuffing"
+  description: >
+    Detects brute-force attacks against Cisco AnyConnect SSL VPN.
+    Monitors ASA message IDs for authentication failures and unusual
+    VPN connection patterns.
+  mitre_attack:
+    - T1133  # External Remote Services
+    - T1110  # Brute Force
+  severity: high
+  confidence: 85
+
+  search: |
+    index=firewall sourcetype="cisco:asa"
+    message_id IN ("113004", "113005", "113006", "722037", "722051")
+    | eval auth_result=case(
+        message_id IN ("113004", "722051"), "failure",
+        message_id="113005", "failure_user_not_found",
+        true(), "other"
+      )
+    | where auth_result IN ("failure", "failure_user_not_found")
+    | stats count dc(user) AS unique_users
+        values(user) AS usernames
+        min(_time) AS first max(_time) AS last
+        BY src_ip
+    | eval rate=round(count / ((last - first) / 60 + 1), 1)
+    | where count > 15
+    | sort -count
+
+  throttle: src_ip, 600
+  notable:
+    rule_title: "AnyConnect Brute Force from $src_ip$ — $count$ failures"
+    rule_description: >
+      $count$ failed VPN auth attempts from $src_ip$ targeting
+      $unique_users$ users at $rate$ attempts/min: $usernames$.
+    recommended_actions:
+      - Block source IP on outside ACL
+      - Enable dynamic access policies (DAP) with MFA
+      - Check if any VPN sessions were established after brute force
+      - Review affected accounts for compromise
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1562 — ACL/Access Rule Tampering
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_acl_tampering:
+  name: "Cisco ASA ACL Tampering — Unauthorized Rule Modification"
+  description: >
+    Detects unauthorized modifications to ASA access-lists, NAT rules,
+    or VPN group policies. Attackers with enable access modify ACLs to
+    allow C2, disable inspection, or create backdoor access.
+  mitre_attack:
+    - T1562.004  # Impair Defenses: Disable or Modify System Firewall
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=firewall sourcetype="cisco:asa"
+    message_id IN ("111008", "111009", "111010")
+    (message="*access-list*" OR message="*access-group*"
+     OR message="*nat*" OR message="*group-policy*"
+     OR message="*inspect*" OR message="*service-policy*")
+    NOT [| inputlookup approved_admin_ips | fields ip | rename ip AS src_ip]
+    | eval change_type=case(
+        match(message, "access-list"), "ACL modification",
+        match(message, "nat"), "NAT rule change",
+        match(message, "group-policy"), "VPN group policy change",
+        match(message, "inspect"), "Inspection engine change",
+        match(message, "service-policy"), "Service policy change",
+        true(), "Configuration change"
+      )
+    | stats count values(change_type) AS changes values(message) AS details
+        BY user, src_ip, host
+    | sort -count
+
+  throttle: user, 300
+  notable:
+    rule_title: "ASA ACL Tampering by $user$ from $src_ip$ on $host$"
+    rule_description: >
+      $count$ config changes by $user$ from $src_ip$: $changes$.
+      Unauthorized ACL changes can open backdoor access through the firewall.
+    recommended_actions:
+      - Compare running-config to startup-config (show run diff)
+      - Check for new "permit ip any any" entries
+      - Verify admin account legitimacy
+      - Rollback changes with "copy startup-config running-config"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1048 — Data Exfiltration via Allowed Connections
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_data_exfiltration:
+  name: "Cisco ASA — Abnormal Outbound Data Volume (Exfiltration)"
+  description: >
+    Detects internal hosts sending abnormally large data volumes outbound
+    through the ASA firewall.
+  mitre_attack:
+    - T1048  # Exfiltration Over Alternative Protocol
+  severity: high
+  confidence: 75
+
+  search: |
+    index=firewall sourcetype="cisco:asa"
+    message_id IN ("302013", "302014", "302015", "302016")
+    direction="outbound"
+    | stats sum(bytes) AS total_bytes dc(dest_ip) AS unique_dests
+        values(dest_ip) AS destinations
+        BY src_ip
+    | eval mb_out=round(total_bytes/1024/1024, 2)
+    | where mb_out > 500
+    | sort -mb_out
+
+  throttle: src_ip, 3600
+  notable:
+    rule_title: "Exfiltration Alert — $src_ip$ sent $mb_out$ MB outbound"
+    rule_description: >
+      Host $src_ip$ transferred $mb_out$ MB to $unique_dests$ external
+      destinations: $destinations$.
+    recommended_actions:
+      - Investigate source host for malware
+      - Review connection logs for destination reputation
+      - Temporarily block outbound access
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1071 — Encrypted Tunnel Abuse (VPN Tunnel Splitting)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_tunnel_abuse:
+  name: "VPN Tunnel Abuse — Suspicious AnyConnect Session Behavior"
+  description: >
+    Detects suspicious AnyConnect VPN session behaviors — connections from
+    unusual geolocations, simultaneous sessions from different IPs, or
+    sessions with abnormal data transfer patterns indicating tunnel abuse.
+  mitre_attack:
+    - T1071.001  # Application Layer Protocol: Web Protocols
+    - T1573      # Encrypted Channel
+  severity: high
+  confidence: 80
+
+  search: |
+    index=firewall sourcetype="cisco:asa"
+    message_id IN ("722022", "722023", "722028", "722033")
+    | stats count dc(src_ip) AS unique_source_ips
+        values(src_ip) AS source_ips
+        min(_time) AS first max(_time) AS last
+        BY user
+    | where unique_source_ips > 1
+    | eval concurrent_sessions="YES"
+    | sort -unique_source_ips
+
+  throttle: user, 600
+  notable:
+    rule_title: "VPN Session Anomaly — $user$ from $unique_source_ips$ IPs"
+    rule_description: >
+      User $user$ has concurrent VPN sessions from $unique_source_ips$
+      different IPs: $source_ips$. This indicates credential sharing,
+      stolen credentials, or session hijacking.
+    recommended_actions:
+      - Force disconnect all VPN sessions for the user
+      - Reset the user's credentials immediately
+      - Verify session IPs with the actual user
+      - Enable MFA if not configured
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1021 — Internal Lateral Movement Detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_lateral_movement:
+  name: "Cisco ASA — Cross-Zone Lateral Movement via Admin Protocols"
+  description: >
+    Detects hosts using administrative protocols (SSH, RDP, SMB) to reach
+    multiple targets across ASA security zones.
+  mitre_attack:
+    - T1021  # Remote Services
+  severity: high
+  confidence: 80
+
+  search: |
+    index=firewall sourcetype="cisco:asa"
+    message_id IN ("302013", "302015") action="allow"
+    dest_port IN (22, 23, 135, 139, 445, 3389, 5985, 5986)
+    | eval src_zone=if(cidrmatch("10.0.0.0/8", src_ip), "inside", "outside")
+    | eval dest_zone=if(cidrmatch("10.0.0.0/8", dest_ip), "inside", "outside")
+    | where src_zone != dest_zone OR dest_port IN (3389, 22, 445)
+    | stats count dc(dest_ip) AS unique_targets
+        values(dest_ip) AS targets values(dest_port) AS ports
+        BY src_ip
+    | where unique_targets >= 3
+    | sort -unique_targets
+
+  throttle: src_ip, 600
+  notable:
+    rule_title: "Lateral Movement from $src_ip$ → $unique_targets$ targets"
+    rule_description: >
+      $src_ip$ connected to $unique_targets$ hosts via admin protocols
+      ($ports$): $targets$.
+    recommended_actions:
+      - Isolate source host
+      - Check all target hosts for compromise
+      - Review authentication logs for the source
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: — ASA Failover / HA Manipulation
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_failover_manipulation:
+  name: "Cisco ASA Failover Manipulation — HA State Change"
+  description: >
+    Detects unexpected ASA failover events or HA state changes that could
+    indicate an attacker forcing failover to a compromised standby unit.
+  mitre_attack:
+    - T1498  # Network Denial of Service
+  severity: high
+  confidence: 75
+
+  search: |
+    index=firewall sourcetype="cisco:asa"
+    message_id IN ("104001", "104002", "104003", "104004",
+                    "105001", "105002", "105003", "105004", "105005")
+    | eval event_type=case(
+        message_id="104001", "Failover: switching to standby",
+        message_id="105003", "Failover: unit failed",
+        message_id="105004", "Failover: unit recovered",
+        true(), "Failover state change"
+      )
+    | stats count values(event_type) AS events BY host, _time
+    | sort -_time
+
+  throttle: host, 300
+  notable:
+    rule_title: "ASA Failover Event on $host$ — $events$"
+    rule_description: >
+      Unexpected ASA failover: $events$. Forced failover can redirect
+      traffic through a compromised standby unit or cause denial of service.
+    recommended_actions:
+      - Verify failover cause (hardware failure vs forced)
+      - Check standby unit configuration integrity
+      - Compare configs between active and standby units
+      - Review recent admin access to both units

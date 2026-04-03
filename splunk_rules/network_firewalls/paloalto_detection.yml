@@ -1,0 +1,415 @@
+# ==============================================================================
+#  Palo Alto Networks Firewall Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detects attack patterns, misconfigurations, and threat
+#                indicators from Palo Alto Networks PAN-OS firewalls —
+#                exploitation attempts, policy bypass, C2 traffic, data
+#                exfiltration, credential theft, and admin compromise.
+#  MITRE ATT&CK: T1190, T1071, T1048, T1133, T1562, T1021, T1595
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : sourcetype=pan:traffic, pan:threat, pan:system, pan:config
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Palo Alto Syslog forwarding to Splunk (CEF or CSV format):
+#       - Traffic logs:  sourcetype=pan:traffic
+#       - Threat logs:   sourcetype=pan:threat
+#       - System logs:   sourcetype=pan:system
+#       - Config logs:   sourcetype=pan:config
+#       - URL logs:      sourcetype=pan:url
+#       - GlobalProtect: sourcetype=pan:globalprotect
+#
+#  2. Splunk Add-on for Palo Alto Networks (TA-paloalto) installed
+#
+#  3. Lookup tables:
+#       - approved_admin_ips: Fields: ip, username, role
+#       - critical_servers: Fields: ip, hostname, classification
+#       - known_c2_domains: Fields: domain, threat_actor, confidence
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1190 — PAN-OS Management Interface Exploitation (CVE Detection)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_panos_mgmt_exploitation:
+  name: "PAN-OS Management Interface Exploitation Attempt"
+  description: >
+    Detects exploitation attempts against the PAN-OS management interface
+    including CVE-2024-0012 (auth bypass), CVE-2024-9474 (privilege
+    escalation), CVE-2024-3400 (GlobalProtect RCE). Management interface
+    exposure is the #1 Palo Alto compromise vector.
+  mitre_attack:
+    - T1190  # Exploit Public-Facing Application
+  severity: critical
+  confidence: 95
+
+  search: |
+    index=firewall sourcetype="pan:threat"
+    (threat_name="*CVE-2024-0012*" OR threat_name="*CVE-2024-9474*"
+     OR threat_name="*CVE-2024-3400*" OR threat_name="*CVE-2023-6790*"
+     OR threat_name="*PAN-OS*Management*" OR threat_name="*GlobalProtect*RCE*")
+    OR (sourcetype="pan:traffic" dest_port IN (443, 4443)
+        app="panos-management" action="allow"
+        NOT [| inputlookup approved_admin_ips | fields ip | rename ip AS src_ip])
+    | eval indicator=case(
+        isnotnull(threat_name), "Threat signature: " + threat_name,
+        true(), "Unauthorized mgmt access from " + src_ip
+      )
+    | stats count values(indicator) AS indicators
+        values(src_ip) AS sources values(severity) AS threat_severity
+        BY dest_ip
+    | sort -count
+
+  throttle: dest_ip, 120
+  notable:
+    rule_title: "PAN-OS Exploitation Attempt on $dest_ip$ from $sources$"
+    rule_description: >
+      PAN-OS management exploitation indicators: $indicators$.
+      $count$ events from $sources$. PAN-OS management interface
+      exploitation can give attackers full firewall control.
+    recommended_actions:
+      - Block source IPs at perimeter immediately
+      - Verify PAN-OS is patched to latest version
+      - Check for unauthorized admin accounts or config changes
+      - Restrict management interface to dedicated MGMT VLAN only
+      - Review GlobalProtect portal/gateway exposure
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1562 — Firewall Policy Tampering / Security Rule Modification
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_policy_tampering:
+  name: "PAN-OS Security Policy Tampering — Unauthorized Rule Changes"
+  description: >
+    Detects unauthorized modifications to PAN-OS security policies, NAT
+    rules, or decryption policies. Attackers with admin access modify
+    rules to allow C2 traffic, disable inspection, or create backdoor access.
+  mitre_attack:
+    - T1562.004  # Impair Defenses: Disable or Modify System Firewall
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=firewall sourcetype="pan:config"
+    cmd IN ("set", "delete", "edit", "move", "rename", "override")
+    path IN ("*rulebase*security*", "*rulebase*nat*", "*rulebase*decryption*",
+             "*profiles*", "*zone-protection*", "*dos-protection*")
+    NOT [| inputlookup approved_admin_ips | fields ip | rename ip AS host_ip]
+    | eval change_type=case(
+        match(path, "security"), "Security Policy",
+        match(path, "nat"), "NAT Rule",
+        match(path, "decryption"), "Decryption Policy",
+        match(path, "profiles"), "Security Profile",
+        match(path, "zone-protection"), "Zone Protection",
+        true(), "Other"
+      )
+    | stats count values(cmd) AS commands values(change_type) AS changes
+        values(path) AS rule_paths
+        BY admin, host_ip
+    | sort -count
+
+  throttle: admin, 300
+  notable:
+    rule_title: "PAN-OS Policy Tampering by $admin$ from $host_ip$"
+    rule_description: >
+      Admin $admin$ from $host_ip$ made $count$ policy changes:
+      $changes$ ($commands$). Unauthorized rule modifications can
+      create firewall bypasses, disable threat inspection, or
+      open backdoor access through the perimeter.
+    recommended_actions:
+      - Review all recent config changes in Panorama/firewall audit log
+      - Compare running config against last known-good configuration
+      - Check for new "allow any" rules or disabled security profiles
+      - Verify admin account legitimacy and revoke if unauthorized
+      - Rollback config if changes are malicious
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1071 — Command and Control via Allowed Applications
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_c2_via_allowed_apps:
+  name: "C2 Traffic via Allowed Applications — DNS/HTTPS/SSL Tunneling"
+  description: >
+    Detects command and control traffic disguised within allowed application
+    categories — DNS tunneling, HTTPS C2 beacons, SSL-wrapped C2, and
+    covert channels in cloud applications.
+  mitre_attack:
+    - T1071.001  # Application Layer Protocol: Web Protocols
+    - T1071.004  # Application Layer Protocol: DNS
+    - T1572      # Protocol Tunneling
+  severity: high
+  confidence: 80
+
+  search: |
+    index=firewall sourcetype="pan:traffic" action="allow"
+    (
+      (app="dns" bytes_sent > 5000 AND dest_port=53)
+      OR (app IN ("ssl", "web-browsing") AND
+          bytes_sent > 100000 AND session_duration > 3600
+          AND packets_sent > 1000)
+      OR (app="unknown-tcp" OR app="unknown-udp")
+    )
+    | eval c2_indicator=case(
+        app="dns" AND bytes_sent > 5000, "DNS tunneling (high outbound DNS volume)",
+        app IN ("ssl", "web-browsing") AND session_duration > 3600, "Long-lived HTTPS beacon (" + tostring(round(session_duration/3600,1)) + "h)",
+        match(app, "unknown"), "Unknown application: " + app + " on port " + tostring(dest_port),
+        true(), "Suspicious allowed traffic"
+      )
+    | stats count sum(bytes_sent) AS total_bytes_out
+        dc(dest_ip) AS unique_destinations
+        values(c2_indicator) AS indicators
+        values(dest_ip) AS destinations
+        BY src_ip
+    | eval mb_out=round(total_bytes_out/1024/1024, 2)
+    | where count > 10
+    | sort -total_bytes_out
+
+  throttle: src_ip, 600
+  notable:
+    rule_title: "Potential C2 via Allowed Apps from $src_ip$ ($mb_out$ MB out)"
+    rule_description: >
+      $c2_indicator$ from $src_ip$. $mb_out$ MB sent to $unique_destinations$
+      destinations. C2 traffic through allowed applications bypasses
+      traditional deny-based firewall rules.
+    recommended_actions:
+      - Investigate source host for malware via EDR
+      - Check DNS query logs for high-entropy subdomain queries (DNS tunneling)
+      - Review SSL decryption policy for the destination
+      - Block suspicious destinations and update threat intelligence feeds
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1048 — Data Exfiltration Through Firewall
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_data_exfiltration:
+  name: "Data Exfiltration — Abnormal Outbound Data Volume"
+  description: >
+    Detects hosts sending abnormally large volumes of data through the
+    firewall to external destinations. Compares against baseline upload
+    patterns to identify exfiltration.
+  mitre_attack:
+    - T1048  # Exfiltration Over Alternative Protocol
+    - T1567  # Exfiltration Over Web Service
+  severity: high
+  confidence: 75
+
+  search: |
+    index=firewall sourcetype="pan:traffic" action="allow"
+    direction="outbound"
+    NOT dest_ip IN ("10.*", "172.16.*", "192.168.*")
+    | bin _time span=1h
+    | stats sum(bytes_sent) AS bytes_out dc(dest_ip) AS unique_dests
+        values(app) AS apps
+        BY src_ip, _time
+    | eval mb_out=round(bytes_out/1024/1024, 2)
+    | where mb_out > 500
+    | stats sum(mb_out) AS total_mb count AS hours_active
+        max(mb_out) AS peak_mb_hour
+        values(apps) AS applications
+        avg(unique_dests) AS avg_destinations
+        BY src_ip
+    | where total_mb > 1000 OR peak_mb_hour > 500
+    | sort -total_mb
+
+  throttle: src_ip, 3600
+  notable:
+    rule_title: "Data Exfiltration Alert — $src_ip$ sent $total_mb$ MB outbound"
+    rule_description: >
+      Host $src_ip$ sent $total_mb$ MB outbound over $hours_active$ hours
+      (peak: $peak_mb_hour$ MB/hour). Applications: $applications$.
+      Average $avg_destinations$ unique external destinations per hour.
+    recommended_actions:
+      - Investigate source host immediately via EDR
+      - Check what data the host has access to (file shares, databases)
+      - Review destination IPs against threat intelligence
+      - Temporarily block outbound access for the host
+      - Capture packet samples for content analysis
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1133 — VPN/GlobalProtect Brute Force & Credential Stuffing
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_vpn_brute_force:
+  name: "GlobalProtect VPN Brute Force / Credential Stuffing"
+  description: >
+    Detects brute-force and credential stuffing attacks against Palo Alto
+    GlobalProtect VPN portal. VPN compromise is a top initial access vector.
+  mitre_attack:
+    - T1133  # External Remote Services
+    - T1110  # Brute Force
+  severity: high
+  confidence: 85
+
+  search: |
+    index=firewall sourcetype="pan:globalprotect"
+    (status="failure" OR status="failed" OR event_id="globalprotectportal-auth-failed")
+    | stats count dc(user) AS unique_users
+        values(user) AS usernames
+        min(_time) AS first max(_time) AS last
+        BY src_ip
+    | eval attempts_per_min=round(count / ((last - first) / 60 + 1), 1)
+    | where count > 10
+    | sort -count
+
+  throttle: src_ip, 600
+  notable:
+    rule_title: "GlobalProtect Brute Force from $src_ip$ — $count$ failures"
+    rule_description: >
+      $count$ failed GlobalProtect VPN login attempts from $src_ip$
+      targeting $unique_users$ user(s): $usernames$.
+      Rate: $attempts_per_min$ attempts/min.
+    recommended_actions:
+      - Block source IP at perimeter firewall
+      - Check if any accounts were successfully compromised after failures
+      - Enable MFA on GlobalProtect if not already configured
+      - Review failed accounts for password reset needs
+      - Add source IP to threat intelligence block list
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1021 — Lateral Movement Through Firewall Zones
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_lateral_movement_zones:
+  name: "Lateral Movement — Unusual Cross-Zone Traffic Patterns"
+  description: >
+    Detects hosts in one zone initiating connections to multiple hosts
+    in other zones using administrative protocols (RDP, SSH, SMB, WinRM).
+    Indicates post-compromise lateral movement across firewall boundaries.
+  mitre_attack:
+    - T1021  # Remote Services
+    - T1570  # Lateral Tool Transfer
+  severity: high
+  confidence: 80
+
+  search: |
+    index=firewall sourcetype="pan:traffic" action="allow"
+    app IN ("ms-ds-smb", "msrpc", "rdp", "ssh", "ms-wbt-server", "winrm")
+    from_zone != to_zone
+    | stats count dc(dest_ip) AS unique_targets
+        values(dest_ip) AS targets
+        values(app) AS protocols
+        values(to_zone) AS dest_zones
+        min(_time) AS first max(_time) AS last
+        BY src_ip, from_zone
+    | where unique_targets >= 3
+    | eval time_window_min=round((last - first) / 60, 0)
+    | sort -unique_targets
+
+  throttle: src_ip, 600
+  notable:
+    rule_title: "Lateral Movement from $src_ip$ ($from_zone$) → $unique_targets$ targets"
+    rule_description: >
+      Host $src_ip$ in zone $from_zone$ connected to $unique_targets$ hosts
+      across zones $dest_zones$ using $protocols$ in $time_window_min$ minutes.
+      Targets: $targets$. Cross-zone lateral movement using admin protocols
+      is a strong indicator of post-compromise activity.
+    recommended_actions:
+      - Isolate source host from the network
+      - Check all target hosts for compromise indicators
+      - Review source host EDR alerts and authentication logs
+      - Verify if the user account is authorized for cross-zone access
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1595 — External Reconnaissance / Port Scanning
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_external_recon:
+  name: "External Reconnaissance — Port Scan / Service Discovery"
+  description: >
+    Detects external hosts scanning internal services through the firewall.
+    High session count with low bytes and multiple destination ports indicates
+    active reconnaissance.
+  mitre_attack:
+    - T1595  # Active Scanning
+    - T1046  # Network Service Discovery
+  severity: medium
+  confidence: 85
+
+  search: |
+    index=firewall sourcetype="pan:traffic"
+    action IN ("deny", "drop", "reset-both", "reset-client")
+    NOT src_ip IN ("10.*", "172.16.*", "192.168.*")
+    | stats count dc(dest_port) AS unique_ports
+        dc(dest_ip) AS unique_targets
+        values(dest_port) AS ports
+        min(_time) AS first max(_time) AS last
+        BY src_ip
+    | where unique_ports >= 10 OR (unique_targets >= 5 AND count > 50)
+    | eval scan_type=case(
+        unique_ports >= 50, "Full port scan",
+        unique_ports >= 10, "Targeted service scan",
+        unique_targets >= 10, "Host sweep",
+        true(), "Reconnaissance"
+      )
+    | sort -unique_ports
+
+  throttle: src_ip, 900
+  notable:
+    rule_title: "$scan_type$ from $src_ip$ — $unique_ports$ ports, $unique_targets$ targets"
+    rule_description: >
+      External host $src_ip$ performed $scan_type$: $count$ sessions
+      targeting $unique_ports$ ports across $unique_targets$ hosts.
+    recommended_actions:
+      - Block source IP at perimeter
+      - Check if any scan probes were allowed through
+      - Review exposed services for vulnerabilities
+      - Add to threat intelligence feed
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1562 — Threat Prevention Profile Disabled or Weakened
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_threat_prevention_disabled:
+  name: "PAN-OS Threat Prevention Disabled — Security Profile Weakened"
+  description: >
+    Detects when threat prevention profiles (Antivirus, Anti-Spyware,
+    Vulnerability Protection, URL Filtering, WildFire) are disabled
+    or weakened on security rules.
+  mitre_attack:
+    - T1562.001  # Impair Defenses: Disable or Modify Tools
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=firewall sourcetype="pan:config"
+    cmd IN ("set", "delete", "edit")
+    (path="*security*rules*profile-setting*"
+     OR path="*profiles*virus*" OR path="*profiles*spyware*"
+     OR path="*profiles*vulnerability*" OR path="*profiles*url-filtering*"
+     OR path="*profiles*wildfire*")
+    | eval action_type=case(
+        cmd="delete" AND match(path, "profile-setting"), "Security profile REMOVED from rule",
+        cmd="set" AND match(path, "action") AND match(after, "allow|alert"), "Threat action weakened to allow/alert",
+        cmd="delete" AND match(path, "profiles"), "Security profile definition deleted",
+        true(), "Security profile modified"
+      )
+    | stats count values(action_type) AS changes values(path) AS affected_rules
+        BY admin, host_ip
+    | sort -count
+
+  throttle: admin, 300
+  notable:
+    rule_title: "Threat Prevention Weakened by $admin$ — $changes$"
+    rule_description: >
+      Admin $admin$ from $host_ip$ made $count$ changes weakening
+      threat prevention: $changes$. Disabling security profiles allows
+      malware, exploits, and C2 traffic to pass through the firewall.
+    recommended_actions:
+      - Verify the admin account is legitimate
+      - Re-enable security profiles on affected rules immediately
+      - Check for concurrent threat log gaps (attacks during disabled window)
+      - Review full config audit trail in Panorama

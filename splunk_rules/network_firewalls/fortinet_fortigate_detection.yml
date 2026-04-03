@@ -1,0 +1,322 @@
+# ==============================================================================
+#  Fortinet FortiGate Firewall Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detects attack patterns, VPN exploitation, admin compromise,
+#                policy bypass, and threat indicators from Fortinet FortiGate
+#                firewalls — including FortiOS CVE exploitation, SSL-VPN
+#                abuse, and FortiManager/FortiAnalyzer compromise.
+#  MITRE ATT&CK: T1190, T1133, T1110, T1562, T1048, T1071, T1078
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : sourcetype=fgt_traffic, fgt_utm, fgt_event, fgt_vpn
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. FortiGate syslog forwarding to Splunk (CEF or native format):
+#       - Traffic logs:  sourcetype=fgt_traffic (type=traffic)
+#       - UTM logs:      sourcetype=fgt_utm (type=utm)
+#       - Event logs:    sourcetype=fgt_event (type=event)
+#       - VPN logs:      sourcetype=fgt_vpn (type=event subtype=vpn)
+#
+#  2. Splunk Add-on for Fortinet FortiGate (TA-fortinet_fortigate) installed
+#
+#  3. Key FortiOS log fields:
+#       type, subtype, action, srcip, dstip, dstport, service,
+#       user, policyid, logid, msg, devname, level
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1190 — FortiOS Exploitation (CVE-2024-47575, CVE-2024-21762, etc.)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_fortios_exploitation:
+  name: "FortiOS Exploitation — Critical CVE Indicators"
+  description: >
+    Detects exploitation attempts against FortiGate including
+    CVE-2024-47575 (FortiManager RCE "FortiJump"), CVE-2024-21762
+    (SSL-VPN out-of-bounds write), CVE-2023-27997 (SSL-VPN heap overflow),
+    CVE-2022-40684 (auth bypass), and CVE-2022-42475 (SSL-VPN RCE).
+  mitre_attack:
+    - T1190  # Exploit Public-Facing Application
+  severity: critical
+  confidence: 95
+
+  search: |
+    index=firewall sourcetype IN ("fgt_utm", "fgt_event")
+    (
+      (attack="*FortiOS*" OR attack="*FortiGate*" OR attack="*FortiManager*"
+       OR attack="*CVE-2024-47575*" OR attack="*CVE-2024-21762*"
+       OR attack="*CVE-2023-27997*" OR attack="*CVE-2022-40684*"
+       OR attack="*CVE-2022-42475*")
+      OR (subtype="system" AND
+          (msg="*Admin login failed*" AND dstport IN (443, 8443, 541)
+           AND logid="0100032001") AND
+          [| stats count BY srcip | where count > 20 | fields srcip])
+      OR (subtype="system" AND msg="*super_admin*created*")
+    )
+    | eval indicator=case(
+        match(attack, "CVE"), "CVE exploit: " + attack,
+        match(msg, "super_admin.*created"), "Unauthorized admin account created",
+        match(msg, "Admin login failed"), "Management brute force",
+        true(), "FortiOS exploitation indicator"
+      )
+    | stats count values(indicator) AS indicators
+        values(srcip) AS sources
+        BY devname
+    | sort -count
+
+  throttle: devname, 120
+  notable:
+    rule_title: "FortiOS Exploitation on $devname$ — $indicators$"
+    rule_description: >
+      FortiGate exploitation indicators: $indicators$.
+      Sources: $sources$. FortiOS exploitation can give full firewall
+      control and persistent backdoor access.
+    recommended_actions:
+      - Verify FortiOS is patched to latest build
+      - Check for unauthorized admin accounts (get system admin)
+      - Review SSL-VPN configuration for tampering
+      - Check FortiManager for unauthorized device registrations
+      - Search for web shells in /migadmin/ or /remote/ directories
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1133 — SSL-VPN Brute Force & Credential Stuffing
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_sslvpn_brute_force:
+  name: "FortiGate SSL-VPN Brute Force / Credential Stuffing"
+  description: >
+    Detects brute-force attacks against FortiGate SSL-VPN portal.
+    FortiGate SSL-VPN is one of the most targeted VPN services globally.
+  mitre_attack:
+    - T1133  # External Remote Services
+    - T1110  # Brute Force
+  severity: high
+  confidence: 85
+
+  search: |
+    index=firewall sourcetype IN ("fgt_event", "fgt_vpn")
+    subtype="vpn" action="tunnel-down"
+    (msg="*SSL VPN login fail*" OR msg="*authentication failed*"
+     OR logid="0101039426" OR logid="0101039943")
+    | stats count dc(user) AS unique_users
+        values(user) AS usernames
+        min(_time) AS first max(_time) AS last
+        BY srcip
+    | eval rate=round(count / ((last - first) / 60 + 1), 1)
+    | where count > 10
+    | sort -count
+
+  throttle: srcip, 600
+  notable:
+    rule_title: "SSL-VPN Brute Force from $srcip$ — $count$ failures"
+    rule_description: >
+      $count$ failed SSL-VPN attempts from $srcip$ targeting
+      $unique_users$ user(s) at $rate$/min: $usernames$.
+    recommended_actions:
+      - Block source IP via local-in policy
+      - Enable FortiToken MFA for SSL-VPN
+      - Check for successful logins after brute force period
+      - Enable SSL-VPN login attempt limiting
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1562 — Firewall Policy Tampering
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_policy_tampering:
+  name: "FortiGate Policy Tampering — Unauthorized Configuration Changes"
+  description: >
+    Detects unauthorized modifications to FortiGate firewall policies,
+    VPN configurations, security profiles, or admin settings.
+  mitre_attack:
+    - T1562.004  # Impair Defenses: Disable or Modify System Firewall
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=firewall sourcetype="fgt_event" subtype="system"
+    logid IN ("0100032102", "0100044546", "0100032003")
+    (msg="*policy*" OR msg="*security-profile*" OR msg="*vpn*"
+     OR msg="*admin*" OR msg="*ips*sensor*" OR msg="*antivirus*"
+     OR msg="*webfilter*" OR msg="*ssl-vpn*")
+    NOT [| inputlookup approved_admin_ips | fields ip | rename ip AS srcip]
+    | eval change_type=case(
+        match(msg, "(?i)policy"), "Firewall policy",
+        match(msg, "(?i)security.profile|ips|antivirus|webfilter"), "Security profile",
+        match(msg, "(?i)vpn|ssl-vpn"), "VPN configuration",
+        match(msg, "(?i)admin"), "Admin settings",
+        true(), "Configuration change"
+      )
+    | stats count values(change_type) AS changes values(msg) AS details
+        BY user, srcip, devname
+    | sort -count
+
+  throttle: user, 300
+  notable:
+    rule_title: "FortiGate Policy Tampering by $user$ from $srcip$"
+    rule_description: >
+      $count$ config changes by $user$ from $srcip$ on $devname$:
+      $changes$. Unauthorized policy changes can disable protection
+      or create backdoor access rules.
+    recommended_actions:
+      - Compare config against FortiManager revision history
+      - Check for new "accept all" policies or disabled UTM profiles
+      - Verify admin account legitimacy
+      - Restore config from FortiManager/backup if unauthorized
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1078 — Compromised Admin Account / Impossible Travel
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_admin_compromise:
+  name: "FortiGate Admin Compromise — Impossible Travel / Unusual Login"
+  description: >
+    Detects admin logins to FortiGate from unusual IPs, at unusual times,
+    or from geographically impossible locations.
+  mitre_attack:
+    - T1078  # Valid Accounts
+  severity: high
+  confidence: 80
+
+  search: |
+    index=firewall sourcetype="fgt_event" subtype="system"
+    logid="0100032001" action="login" status="success"
+    | iplocation srcip
+    | stats count dc(srcip) AS unique_ips
+        values(srcip) AS login_ips
+        values(Country) AS countries
+        values(City) AS cities
+        min(_time) AS first max(_time) AS last
+        BY user, devname
+    | where unique_ips > 1 OR NOT match(login_ips, "10\.|172\.16\.|192\.168\.")
+    | sort -unique_ips
+
+  throttle: user, 600
+  notable:
+    rule_title: "Suspicious Admin Login — $user$ from $unique_ips$ IPs ($countries$)"
+    rule_description: >
+      Admin $user$ logged into $devname$ from $unique_ips$ different
+      IPs: $login_ips$ ($countries$, $cities$). Multiple source IPs
+      or external origins indicate credential compromise.
+    recommended_actions:
+      - Verify login with the actual admin
+      - Change admin password and enable FortiToken MFA
+      - Review all config changes during the session
+      - Check for new admin accounts or VPN users created
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1048 — Data Exfiltration Through FortiGate
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_data_exfiltration:
+  name: "FortiGate — Abnormal Outbound Data Volume (Exfiltration)"
+  description: >
+    Detects hosts sending abnormally large data volumes outbound through
+    FortiGate.
+  mitre_attack:
+    - T1048  # Exfiltration Over Alternative Protocol
+  severity: high
+  confidence: 75
+
+  search: |
+    index=firewall sourcetype="fgt_traffic" action="accept"
+    NOT (dstip="10.*" OR dstip="172.16.*" OR dstip="192.168.*")
+    | stats sum(sentbyte) AS bytes_out dc(dstip) AS unique_dests
+        values(service) AS services
+        BY srcip
+    | eval mb_out=round(bytes_out/1024/1024, 2)
+    | where mb_out > 500
+    | sort -mb_out
+
+  throttle: srcip, 3600
+  notable:
+    rule_title: "Exfiltration — $srcip$ sent $mb_out$ MB via $services$"
+    rule_description: >
+      $srcip$ sent $mb_out$ MB to $unique_dests$ external destinations
+      via $services$.
+    recommended_actions:
+      - Investigate source host for compromise
+      - Review DLP logs for sensitive data transfer
+      - Block outbound access temporarily
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: — UTM/IPS Bypass Detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_utm_bypass:
+  name: "FortiGate UTM/IPS Bypass — Security Profile Disabled"
+  description: >
+    Detects traffic matching firewall policies where IPS, antivirus,
+    web filter, or application control profiles are disabled or missing.
+  mitre_attack:
+    - T1562.001  # Impair Defenses: Disable or Modify Tools
+  severity: high
+  confidence: 80
+
+  search: |
+    index=firewall sourcetype="fgt_traffic" action="accept"
+    (utmaction="allow" OR utmaction="" OR isnull(utmaction))
+    NOT (service IN ("DNS", "NTP", "ICMP"))
+    policyid != 0
+    | stats count dc(srcip) AS unique_sources dc(dstip) AS unique_dests
+        values(service) AS services
+        BY policyid
+    | where count > 100
+    | sort -count
+
+  throttle: policyid, 3600
+  notable:
+    rule_title: "Policy $policyid$ passing traffic without UTM inspection"
+    rule_description: >
+      Firewall policy $policyid$ allowed $count$ sessions from
+      $unique_sources$ sources to $unique_dests$ destinations
+      without UTM/IPS inspection. Services: $services$.
+    recommended_actions:
+      - Add IPS, AV, and web filter profiles to policy $policyid$
+      - Review if UTM bypass is intentional
+      - Check for newly created bypass policies
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: — FortiGate External Recon / Port Scanning
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_external_recon:
+  name: "FortiGate — External Port Scan / Reconnaissance"
+  description: >
+    Detects external hosts scanning services through the FortiGate firewall.
+  mitre_attack:
+    - T1595  # Active Scanning
+  severity: medium
+  confidence: 85
+
+  search: |
+    index=firewall sourcetype="fgt_traffic" action IN ("deny", "drop", "close")
+    NOT (srcip="10.*" OR srcip="172.16.*" OR srcip="192.168.*")
+    | stats count dc(dstport) AS unique_ports dc(dstip) AS unique_targets
+        values(dstport) AS ports
+        BY srcip
+    | where unique_ports >= 10 OR (unique_targets >= 5 AND count > 50)
+    | sort -unique_ports
+
+  throttle: srcip, 900
+  notable:
+    rule_title: "Port Scan from $srcip$ — $unique_ports$ ports, $unique_targets$ hosts"
+    rule_description: >
+      External host $srcip$ scanned $unique_ports$ ports across
+      $unique_targets$ internal hosts. $count$ total sessions blocked.
+    recommended_actions:
+      - Block source at perimeter
+      - Verify no probes were allowed through
+      - Add to threat intelligence block list
