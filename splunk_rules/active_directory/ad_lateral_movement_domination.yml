@@ -1,0 +1,348 @@
+# ==============================================================================
+#  Active Directory Lateral Movement & Domain Domination Detection
+# ==============================================================================
+#  Description : Detects AD lateral movement and domain dominance techniques
+#                — overpass-the-hash, pass-the-certificate, DPAPI abuse,
+#                group policy abuse for code execution, SCCM/MECM lateral
+#                movement, trust abuse, and forest-level compromise.
+#  MITRE ATT&CK: T1550, T1021, T1484, T1558, T1003, T1649
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1550.002 — Overpass-the-Hash / Pass-the-Key
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_overpass_the_hash:
+  name: "Overpass-the-Hash — NTLM Hash Used for Kerberos TGT Request"
+  description: >
+    Detects overpass-the-hash attacks where an attacker uses a stolen NTLM
+    hash to request a Kerberos TGT (instead of a password). Characterized
+    by Event 4768 with RC4 encryption from a workstation that has no prior
+    interactive logon for that account.
+  mitre_attack:
+    - T1550.002  # Use Alternate Authentication Material: Pass the Hash
+  severity: high
+  confidence: 80
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security" EventCode=4768
+    TicketEncryptionType="0x17" Status="0x0"
+    | eval src_host=IpAddress
+    | join type=left TargetUserName src_host
+      [search index=dc_logs EventCode=4624 LogonType IN (2, 10, 11)
+       earliest=-24h
+       | dedup TargetUserName, IpAddress
+       | rename IpAddress AS src_host
+       | table TargetUserName, src_host]
+    | where isnull(LogonType)
+    | stats count values(IpAddress) AS source_ips
+        values(TargetUserName) AS accounts
+        BY TargetUserName, IpAddress
+    | sort -count
+
+  throttle: IpAddress, 600
+  notable:
+    rule_title: "Overpass-the-Hash — $TargetUserName$ TGT via RC4 from $IpAddress$"
+    rule_description: >
+      $TargetUserName$ obtained a Kerberos TGT with RC4 encryption from
+      $IpAddress$ without a prior interactive logon on that host. This
+      is consistent with overpass-the-hash (Rubeus asktgt /rc4:hash).
+    recommended_actions:
+      - Investigate source host for credential dumping tools
+      - Reset the affected account password
+      - Check for lateral movement from the source host
+      - Enforce AES-only Kerberos encryption via GPO
+    remediation_cmd: "Set-ADUser <account> -KerberosEncryptionType AES256"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1649 — Pass-the-Certificate / PKINIT Abuse
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_pass_the_certificate:
+  name: "Pass-the-Certificate — PKINIT Authentication from Unusual Source"
+  description: >
+    Detects certificate-based Kerberos authentication (PKINIT) from
+    workstations that don't normally use smart cards or certificates.
+    Attackers use stolen certificates from AD CS exploitation (ESC1-ESC8)
+    or Shadow Credentials for persistence.
+  mitre_attack:
+    - T1649  # Steal or Forge Authentication Certificates
+  severity: high
+  confidence: 80
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security" EventCode=4768
+    PreAuthType="16" Status="0x0"
+    NOT TargetUserName IN [| inputlookup smartcard_users | fields samaccountname]
+    | lookup ot_asset_inventory ip AS IpAddress OUTPUT hostname
+    | stats count values(IpAddress) AS source_ips
+        values(TargetUserName) AS accounts
+        values(CertIssuerName) AS issuers
+        BY TargetUserName
+    | sort -count
+
+  throttle: TargetUserName, 600
+  notable:
+    rule_title: "PKINIT Auth for $TargetUserName$ from $source_ips$ (no smart card)"
+    rule_description: >
+      $TargetUserName$ authenticated via PKINIT (certificate) from
+      $source_ips$. This account is not in the smart card users list.
+      Certificate issuer: $issuers$. May indicate AD CS exploitation
+      or Shadow Credentials abuse.
+    recommended_actions:
+      - Check AD CS issued certificates for the account
+      - Clear msDS-KeyCredentialLink if Shadow Credentials suspected
+      - Revoke suspicious certificates
+      - Investigate source host for Certipy/Rubeus artifacts
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1003.004 — DPAPI Domain Backup Key Extraction
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_dpapi_backup_key:
+  name: "DPAPI Domain Backup Key Extraction — LSA Secret Access"
+  description: >
+    Detects extraction of the DPAPI domain backup key from domain
+    controllers. With this key, an attacker can decrypt all DPAPI-protected
+    secrets (saved passwords, certificates, credentials) for every user
+    in the domain.
+  mitre_attack:
+    - T1003.004  # OS Credential Dumping: LSA Secrets
+  severity: critical
+  confidence: 85
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security"
+    (
+      (EventCode=4662 AND
+       Properties="*BCKUPKEY*" OR Properties="*G$BCKUPKEY*")
+      OR (EventCode=4692)
+    )
+    | eval indicator=case(
+        EventCode=4662, "DPAPI backup key accessed via LDAP",
+        EventCode=4692, "DPAPI master key backup attempted"
+      )
+    | stats count values(indicator) AS indicators
+        values(SubjectUserName) AS actors
+        values(ClientAddress) AS sources
+        BY Computer
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "DPAPI Backup Key Extraction on $Computer$ by $actors$"
+    rule_description: >
+      $indicators$ by $actors$ from $sources$. The DPAPI domain
+      backup key allows decryption of ALL DPAPI-protected secrets
+      for every domain user — saved passwords, certificates,
+      encryption keys, browser credentials.
+    recommended_actions:
+      - Investigate actor account for DA compromise
+      - Check for Mimikatz DPAPI module usage
+      - All domain user credentials should be considered compromised
+      - Force enterprise-wide password reset if confirmed
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1484.001 — GPO Abuse for Code Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_gpo_code_execution:
+  name: "GPO Abuse — Immediate Scheduled Task / Startup Script Injection"
+  description: >
+    Detects Group Policy modification to deploy immediate scheduled tasks
+    or startup scripts for code execution across the domain. Attackers with
+    GPO edit rights can achieve domain-wide code execution.
+  mitre_attack:
+    - T1484.001  # Domain Policy Modification: Group Policy Modification
+    - T1053.005  # Scheduled Task
+  severity: critical
+  confidence: 85
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security"
+    (
+      (EventCode=5136 AND
+       ObjectClass="groupPolicyContainer" AND
+       (AttributeLDAPDisplayName="gPCFileSysPath"
+        OR AttributeLDAPDisplayName="versionNumber"))
+      OR (EventCode=5145 AND ShareName="\\\\*\\SYSVOL" AND
+          RelativeTargetName IN ("*ScheduledTasks.xml*", "*Scripts*",
+                                  "*Preferences*Groups*", "*Registry.xml*"))
+    )
+    | eval gpo_abuse_type=case(
+        match(RelativeTargetName, "ScheduledTasks"), "Immediate scheduled task injection",
+        match(RelativeTargetName, "Scripts"), "Startup/logon script injection",
+        match(RelativeTargetName, "Groups"), "Restricted groups modification",
+        match(RelativeTargetName, "Registry"), "Registry GPP modification",
+        EventCode=5136, "GPO object modification",
+        true(), "SYSVOL modification"
+      )
+    | stats count values(gpo_abuse_type) AS abuse_types
+        values(SubjectUserName) AS actors
+        values(RelativeTargetName) AS modified_files
+        BY Computer
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "GPO Code Execution — $abuse_types$ by $actors$"
+    rule_description: >
+      GPO modified for code execution: $abuse_types$. Actor: $actors$.
+      Files: $modified_files$. GPO-based code execution affects all
+      computers/users in the GPO's scope — potentially domain-wide.
+    recommended_actions:
+      - Identify which GPO was modified and its linked OUs
+      - Remove malicious scheduled tasks/scripts from SYSVOL
+      - Force GPO refresh to clean up (gpupdate /force)
+      - Revoke GPO edit permissions from compromised account
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1021 — WMI/WinRM/DCOM Lateral Movement Burst
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_wmi_lateral_movement:
+  name: "WMI/WinRM/DCOM Lateral Movement — Multi-Host Execution"
+  description: >
+    Detects a single account executing commands on multiple hosts via WMI,
+    WinRM, or DCOM in a short timeframe — characteristic of tools like
+    CrackMapExec, wmiexec, psexec, evil-winrm, and SharpRDP.
+  mitre_attack:
+    - T1021.003  # Remote Services: DCOM
+    - T1021.006  # Remote Services: WinRM
+    - T1047      # WMI
+  severity: high
+  confidence: 85
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security"
+    EventCode=4624 LogonType=3
+    LogonProcessName IN ("NtLmSsp", "Kerberos")
+    | bin _time span=10m
+    | stats dc(Computer) AS unique_targets count
+        values(Computer) AS targets
+        values(LogonProcessName) AS auth_methods
+        BY TargetUserName, IpAddress, _time
+    | where unique_targets >= 5
+    | sort -unique_targets
+
+  throttle: TargetUserName, 600
+  notable:
+    rule_title: "Lateral Movement — $TargetUserName$ → $unique_targets$ hosts in 10 min"
+    rule_description: >
+      $TargetUserName$ from $IpAddress$ authenticated to
+      $unique_targets$ hosts in 10 minutes: $targets$.
+      Auth methods: $auth_methods$. Consistent with automated
+      lateral movement tools (CrackMapExec, PsExec, wmiexec).
+    recommended_actions:
+      - Isolate source host $IpAddress$ immediately
+      - Disable the compromised account
+      - Check all target hosts for persistence mechanisms
+      - Review authentication logs for credential reuse
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1550 — Cross-Forest Trust Abuse / SID History Across Trusts
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_trust_abuse:
+  name: "Cross-Forest Trust Abuse — Inter-Forest Authentication Anomaly"
+  description: >
+    Detects suspicious cross-forest authentication patterns including
+    TGT requests for foreign forest principals, SID History abuse across
+    trusts, and excessive cross-forest Kerberos referrals.
+  mitre_attack:
+    - T1550  # Use Alternate Authentication Material
+    - T1134.005  # SID-History Injection
+  severity: high
+  confidence: 80
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security"
+    (
+      (EventCode=4768 AND TargetDomainName != "$DOMAIN$"
+       AND Status="0x0")
+      OR (EventCode=4769 AND ServiceName="krbtgt/*"
+          AND TargetDomainName != "$DOMAIN$")
+      OR (EventCode=4624 AND LogonType=3
+          AND TargetDomainName != "$DOMAIN$"
+          AND SidHistory != "-")
+    )
+    | eval trust_indicator=case(
+        EventCode=4768, "Cross-forest TGT request for " + TargetUserName,
+        EventCode=4769, "Cross-forest TGS referral to " + TargetDomainName,
+        EventCode=4624, "Cross-forest logon with SID History"
+      )
+    | stats count values(trust_indicator) AS indicators
+        values(TargetUserName) AS accounts
+        values(TargetDomainName) AS foreign_domains
+        values(IpAddress) AS sources
+        BY Computer
+    | where count > 5
+    | sort -count
+
+  throttle: Computer, 600
+  notable:
+    rule_title: "Cross-Forest Trust Abuse — $foreign_domains$ ($count$ events)"
+    rule_description: >
+      Cross-forest authentication anomalies: $indicators$.
+      Foreign domains: $foreign_domains$. Accounts: $accounts$.
+      Trust abuse can escalate from child domain to forest root
+      or across trusted forests.
+    recommended_actions:
+      - Verify SID Filtering is enabled on forest trusts
+      - Check for SID History on cross-forest accounts
+      - Review trust configuration (selective auth, trust direction)
+      - Monitor krbtgt referral tickets for abuse
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: — Domain Controller Logon Anomaly (Non-DA Remote Access)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_dc_logon_anomaly:
+  name: "Domain Controller Remote Logon — Non-Admin Account"
+  description: >
+    Detects non-admin accounts logging into domain controllers via
+    network logon (type 3, 10). Only Domain Admins and specific service
+    accounts should authenticate to DCs remotely.
+  mitre_attack:
+    - T1078  # Valid Accounts
+    - T1021  # Remote Services
+  severity: high
+  confidence: 80
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security" EventCode=4624
+    LogonType IN (3, 10)
+    Computer IN [| inputlookup domain_controllers | fields hostname]
+    NOT TargetUserName IN [| inputlookup domain_admin_accounts | fields samaccountname]
+    NOT TargetUserName="*$"
+    NOT TargetUserName IN ("ANONYMOUS LOGON", "LOCAL SERVICE", "NETWORK SERVICE")
+    | stats count values(IpAddress) AS source_ips
+        values(LogonType) AS logon_types
+        BY TargetUserName, Computer
+    | where count > 0
+    | sort -count
+
+  throttle: TargetUserName, 600
+  notable:
+    rule_title: "Non-Admin DC Logon — $TargetUserName$ on $Computer$"
+    rule_description: >
+      Non-admin account $TargetUserName$ logged into DC $Computer$
+      from $source_ips$ (logon types: $logon_types$). Only Domain
+      Admins should have remote access to domain controllers.
+    recommended_actions:
+      - Investigate why a non-admin is accessing the DC
+      - Check if the account has been escalated to admin
+      - Review DC GPO for logon right assignments
+      - Restrict DC logon via "Allow log on through Remote Desktop Services" GPO

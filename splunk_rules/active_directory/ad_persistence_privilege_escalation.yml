@@ -1,0 +1,372 @@
+# ==============================================================================
+#  Active Directory Persistence & Privilege Escalation Detection
+# ==============================================================================
+#  Description : Detects AD persistence mechanisms and privilege escalation
+#                — Silver Ticket, Diamond Ticket, Skeleton Key, AdminSDHolder
+#                abuse, SID History injection, DCShadow, Shadow Credentials,
+#                RBCD abuse, and DPAPI secret extraction.
+#  MITRE ATT&CK: T1098, T1134, T1207, T1484, T1550, T1558
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1558.002 — Silver Ticket Forged Service Ticket Detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_silver_ticket:
+  name: "Silver Ticket — Forged Kerberos Service Ticket"
+  description: >
+    Detects Silver Ticket attacks where an attacker forges TGS tickets
+    using a service account's NTLM hash. Silver Tickets bypass the KDC
+    entirely — no TGT is requested (Event 4768 absent) but service access
+    is logged (Event 4624 type 3 with Kerberos auth).
+  mitre_attack:
+    - T1558.002  # Steal or Forge Kerberos Tickets: Silver Ticket
+  severity: critical
+  confidence: 80
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security"
+    EventCode=4624 LogonType=3 AuthenticationPackageName="Kerberos"
+    | eval svc_ticket_user=TargetUserName
+    | join type=left TargetUserName
+      [search index=dc_logs EventCode=4768 earliest=-30m
+       | stats count AS tgt_count BY TargetUserName]
+    | where isnull(tgt_count) OR tgt_count=0
+    | eval is_machine=if(match(TargetUserName, "\\$$"), "yes", "no")
+    | where is_machine="no"
+    | stats count values(IpAddress) AS source_ips
+        values(TargetUserName) AS accounts
+        values(WorkstationName) AS workstations
+        BY LogonProcessName
+    | where count > 0
+    | sort -count
+
+  throttle: TargetUserName, 600
+  notable:
+    rule_title: "Silver Ticket — Kerberos logon without TGT for $accounts$"
+    rule_description: >
+      Kerberos service authentication for $accounts$ from $source_ips$
+      without a prior TGT request. This is consistent with a Silver
+      Ticket attack — the attacker forged a TGS using the service
+      account's NTLM hash, bypassing KDC validation.
+    recommended_actions:
+      - Reset the service account password immediately
+      - Investigate source hosts ($workstations$) for compromise
+      - Check if the service account's NTLM hash was extracted
+      - Add service accounts to Protected Users group
+      - Migrate to gMSA to prevent hash theft
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1207 — DCShadow Attack (Rogue Domain Controller)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_dcshadow:
+  name: "DCShadow — Rogue Domain Controller Registration"
+  description: >
+    Detects DCShadow attacks where an attacker temporarily registers a
+    workstation as a domain controller to push malicious AD changes via
+    replication. Detection via new nTDSDSA object creation and SPN
+    changes indicating DC registration.
+  mitre_attack:
+    - T1207  # Rogue Domain Controller
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security"
+    (
+      (EventCode=4742 AND
+       ServicePrincipalNames="*GC/*" OR ServicePrincipalNames="*E3514235*")
+      OR (EventCode=5137 AND ObjectClass="nTDSDSA")
+      OR (EventCode=4929)
+    )
+    | eval indicator=case(
+        EventCode=5137, "nTDSDSA object created (DC registration)",
+        EventCode=4742, "DC-related SPNs added to computer: " + TargetUserName,
+        EventCode=4929, "Source replica removed (cleanup after DCShadow)"
+      )
+    | stats count values(indicator) AS indicators
+        values(SubjectUserName) AS actors
+        values(TargetUserName) AS targets
+        BY Computer
+    | sort -count
+
+  throttle: Computer, 120
+  notable:
+    rule_title: "DCShadow Attack Detected on $Computer$ — $indicators$"
+    rule_description: >
+      CRITICAL — DCShadow indicators: $indicators$. Actor: $actors$.
+      DCShadow allows attackers to push any AD change (add admins,
+      modify passwords, inject SID history) via replication without
+      leaving standard audit logs on legitimate DCs.
+    recommended_actions:
+      - Check for unauthorized objects in CN=Sites,CN=Configuration
+      - Verify all DC registrations (Get-ADDomainController -Filter *)
+      - Remove rogue nTDSDSA objects immediately
+      - Reset krbtgt password twice to invalidate any forged tickets
+      - Full AD integrity verification
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1134.005 — SID History Injection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_sid_history_injection:
+  name: "SID History Injection — Privilege Escalation via SIDHistory"
+  description: >
+    Detects injection of SID History attributes on user or computer
+    accounts. Attackers inject the SID of Domain Admins or Enterprise
+    Admins into a regular account's SID History for stealth privilege
+    escalation that survives password changes.
+  mitre_attack:
+    - T1134.005  # Access Token Manipulation: SID-History Injection
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security"
+    (EventCode=4765 OR EventCode=4766)
+    | lookup privileged_sids sid AS SidHistory OUTPUT group_name
+    | eval is_privileged=if(isnotnull(group_name), "YES — " + group_name, "no")
+    | stats count values(SidHistory) AS injected_sids
+        values(is_privileged) AS privilege_match
+        values(SubjectUserName) AS actors
+        BY TargetUserName, Computer
+    | sort -count
+
+  throttle: TargetUserName, 300
+  notable:
+    rule_title: "SID History Injection on $TargetUserName$ — $injected_sids$"
+    rule_description: >
+      SID History injected into $TargetUserName$: $injected_sids$.
+      Privilege match: $privilege_match$. Actor: $actors$.
+      SID History injection grants the target account the privileges
+      of the injected SID without being a member of any admin group.
+    recommended_actions:
+      - Remove SID History from affected account immediately
+      - Check if injected SID matches privileged groups
+      - Investigate the actor account for compromise
+      - Enable SID Filtering on domain trusts
+    remediation_cmd: "Set-ADUser <account> -Remove @{SIDHistory=<injected_SID>}"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1098 — Shadow Credentials (msDS-KeyCredentialLink Abuse)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_shadow_credentials:
+  name: "Shadow Credentials — msDS-KeyCredentialLink Modification"
+  description: >
+    Detects Shadow Credentials attacks where an attacker with write access
+    to a computer or user object sets msDS-KeyCredentialLink to add a
+    rogue certificate for PKINIT authentication — allowing TGT retrieval
+    without knowing the password.
+  mitre_attack:
+    - T1098  # Account Manipulation
+  severity: critical
+  confidence: 85
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security" EventCode=5136
+    AttributeLDAPDisplayName="msDS-KeyCredentialLink"
+    | eval target_type=if(match(ObjectDN, "CN=Computers"), "Computer", "User")
+    | stats count values(SubjectUserName) AS modified_by
+        values(ObjectDN) AS targets
+        values(target_type) AS target_types
+        BY SubjectUserName
+    | sort -count
+
+  throttle: SubjectUserName, 300
+  notable:
+    rule_title: "Shadow Credentials Set by $SubjectUserName$ on $targets$"
+    rule_description: >
+      $SubjectUserName$ modified msDS-KeyCredentialLink on $targets$
+      ($target_types$). Shadow Credentials allow the attacker to
+      authenticate as the target using PKINIT without the password.
+      Tools: Whisker, pywhisker, Certipy.
+    recommended_actions:
+      - Clear msDS-KeyCredentialLink on affected objects
+      - Investigate who has write access to the target object
+      - Check for follow-up PKINIT authentication from unusual sources
+      - Review AD CS certificate issuance logs
+    remediation_cmd: "Set-ADObject <target_dn> -Clear msDS-KeyCredentialLink"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1098 — Resource-Based Constrained Delegation (RBCD) Abuse
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_rbcd_abuse:
+  name: "RBCD Abuse — msDS-AllowedToActOnBehalfOfOtherIdentity Modified"
+  description: >
+    Detects modification of the msDS-AllowedToActOnBehalfOfOtherIdentity
+    attribute, used in Resource-Based Constrained Delegation attacks.
+    Attackers with write access to a computer object can configure RBCD
+    to impersonate any user to that service.
+  mitre_attack:
+    - T1098  # Account Manipulation
+    - T1550.003  # Use Alternate Authentication Material: Pass the Ticket
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security" EventCode=5136
+    AttributeLDAPDisplayName="msDS-AllowedToActOnBehalfOfOtherIdentity"
+    | stats count values(SubjectUserName) AS modified_by
+        values(ObjectDN) AS targets
+        values(AttributeValue) AS delegated_principals
+        min(_time) AS first max(_time) AS last
+        BY SubjectUserName
+    | sort -count
+
+  throttle: SubjectUserName, 300
+  notable:
+    rule_title: "RBCD Configured by $SubjectUserName$ on $targets$"
+    rule_description: >
+      $SubjectUserName$ set RBCD on $targets$ allowing $delegated_principals$
+      to impersonate any user to the target service. This enables
+      privilege escalation via S4U2Self + S4U2Proxy protocol extensions.
+    recommended_actions:
+      - Clear msDS-AllowedToActOnBehalfOfOtherIdentity on target
+      - Investigate who has write access to the computer object
+      - Check for S4U2Self/S4U2Proxy ticket requests (Event 4769)
+      - Review machine account quota (should be 0)
+    remediation_cmd: "Set-ADComputer <target> -PrincipalsAllowedToDelegateToAccount $null"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1484.001 — AdminSDHolder ACL Backdoor
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_adminsdholder_backdoor:
+  name: "AdminSDHolder ACL Backdoor — Persistent Privilege Escalation"
+  description: >
+    Detects modifications to the AdminSDHolder container's ACL. Every 60
+    minutes, the SDProp process copies AdminSDHolder's ACL to all protected
+    groups (Domain Admins, etc.). Backdooring AdminSDHolder grants persistent
+    privileged access that survives manual ACL fixes.
+  mitre_attack:
+    - T1484.001  # Domain Policy Modification: Group Policy Modification
+  severity: critical
+  confidence: 95
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security" EventCode=5136
+    ObjectDN="*CN=AdminSDHolder,CN=System*"
+    AttributeLDAPDisplayName="nTSecurityDescriptor"
+    | stats count values(SubjectUserName) AS modified_by
+        values(OperationType) AS operations
+        min(_time) AS first max(_time) AS last
+        BY Computer
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "AdminSDHolder ACL Modified by $modified_by$"
+    rule_description: >
+      CRITICAL — AdminSDHolder security descriptor modified by
+      $modified_by$. This ACL is propagated to ALL protected admin
+      groups every 60 minutes by SDProp. An attacker can grant themselves
+      persistent admin-equivalent access that is automatically restored.
+    recommended_actions:
+      - Reset AdminSDHolder ACL to default immediately
+      - Run SDProp manually (Start-ADSyncSDProp)
+      - Investigate the actor — likely has DA or Schema Admin rights
+      - Check all protected groups for unauthorized ACEs
+    remediation_cmd: "dsacls 'CN=AdminSDHolder,CN=System,DC=corp,DC=com' /resetDefaultDACL"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1098 — Skeleton Key Attack on Domain Controller
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_skeleton_key:
+  name: "Skeleton Key — Master Password Implant on Domain Controller"
+  description: >
+    Detects Skeleton Key attack indicators where an attacker patches
+    LSASS memory on a DC to accept a master password for any account.
+    Detection via LSASS memory access patterns and auth anomalies.
+  mitre_attack:
+    - T1556.001  # Modify Authentication Process: Domain Controller Auth
+  severity: critical
+  confidence: 80
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=10 TargetImage="*lsass.exe"
+    GrantedAccess IN ("0x1FFFFF", "0x1F3FFF", "0x143A")
+    NOT SourceImage IN ("*csrss.exe", "*wininit.exe", "*lsm.exe",
+                         "*services.exe", "*svchost.exe", "*MsMpEng.exe",
+                         "*CrowdStrike*", "*SentinelAgent*")
+    | stats count values(SourceImage) AS access_sources
+        values(GrantedAccess) AS access_masks
+        BY Computer
+    | where count > 0
+    | sort -count
+
+  throttle: Computer, 120
+  notable:
+    rule_title: "LSASS Memory Access on DC $Computer$ — Skeleton Key Indicator"
+    rule_description: >
+      LSASS process on DC $Computer$ accessed by $access_sources$
+      with access masks $access_masks$. This pattern is consistent
+      with Skeleton Key (Mimikatz misc::skeleton) or similar LSASS
+      patching attacks that inject a master password.
+    recommended_actions:
+      - Reboot the affected DC immediately (Skeleton Key doesn't persist)
+      - Run AV/EDR scan on the DC
+      - Check for Mimikatz artifacts (misc::skeleton logs)
+      - Reset krbtgt password twice after reboot
+      - Review all DC logons during the compromise window
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1558.001 — Diamond Ticket / Sapphire Ticket Detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_diamond_ticket:
+  name: "Diamond/Sapphire Ticket — Modified Legitimate TGT"
+  description: >
+    Detects Diamond Ticket attacks where an attacker requests a legitimate
+    TGT and then modifies the PAC to add privileged group memberships.
+    Unlike Golden Tickets, Diamond Tickets use a real TGT so Event 4768
+    exists — but the PAC claims don't match actual group membership.
+  mitre_attack:
+    - T1558.001  # Steal or Forge Kerberos Tickets: Golden Ticket
+  severity: critical
+  confidence: 75
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security" EventCode=4769
+    | lookup domain_admins samaccountname AS ServiceName OUTPUT is_da
+    | where TargetUserName != ServiceName
+    | eval ticket_flags=TicketOptions
+    | search TicketOptions="0x40810000" OR TicketOptions="0x50800000"
+    | lookup privileged_users samaccountname AS TargetUserName OUTPUT is_privileged
+    | where isnull(is_privileged)
+    | stats count values(ServiceName) AS services
+        values(IpAddress) AS source_ips
+        BY TargetUserName
+    | where count > 0
+    | sort -count
+
+  throttle: TargetUserName, 600
+  notable:
+    rule_title: "Possible Diamond Ticket — $TargetUserName$ accessing $services$"
+    rule_description: >
+      Non-privileged user $TargetUserName$ obtained service tickets to
+      $services$ with suspicious ticket options. If this user shouldn't
+      have access to these services, this may indicate a Diamond Ticket
+      (modified PAC in a legitimate TGT).
+    recommended_actions:
+      - Verify the user's actual group memberships
+      - Check Event 4768 for the initial TGT request
+      - Compare PAC contents against actual AD group membership
+      - Reset krbtgt password twice if confirmed

@@ -1,0 +1,392 @@
+# ==============================================================================
+#  Active Directory Initial Access & Reconnaissance Detection
+# ==============================================================================
+#  Description : Detects AD reconnaissance and initial access attack patterns
+#                — LDAP enumeration, BloodHound/SharpHound collection,
+#                AS-REP roasting, password spraying via Kerberos, ADIDNS
+#                poisoning, and coerced authentication (PetitPotam/PrinterBug).
+#  MITRE ATT&CK: T1087, T1069, T1018, T1557, T1187, T1110, T1558
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Domain Controller logs forwarded to Splunk:
+#       - Windows Security Event Log (4624, 4625, 4768, 4769, 4771, 4662)
+#       - Sysmon on DCs (Event 1, 3, 17, 18)
+#       - DNS Server Debug Log or DNS Analytical Log
+#       - LDAP Diagnostics (Field Engineering logging level 5)
+#
+#  2. Sourcetypes:
+#       sourcetype=XmlWinEventLog:Security
+#       sourcetype=XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+#       sourcetype=XmlWinEventLog:DNS-Server
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1087 — BloodHound/SharpHound AD Enumeration
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_bloodhound_collection:
+  name: "BloodHound/SharpHound Active Directory Collection"
+  description: >
+    Detects SharpHound or BloodHound collectors querying AD via LDAP for
+    group memberships, session data, ACLs, trusts, and SPNs. SharpHound
+    performs distinctive high-volume LDAP queries in a short timeframe.
+  mitre_attack:
+    - T1087.002  # Account Discovery: Domain Account
+    - T1069.002  # Permission Groups Discovery: Domain Groups
+  severity: high
+  confidence: 85
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security" EventCode=4662
+    | eval access_guid=mvindex(Properties, 0)
+    | where access_guid IN (
+        "{bf967a86-0de6-11d0-a285-00aa003049e2}",
+        "{bf967aba-0de6-11d0-a285-00aa003049e2}",
+        "{19195a5a-6da0-11d0-afd3-00c04fd930c9}"
+      )
+    | bin _time span=5m
+    | stats count dc(ObjectName) AS unique_objects BY SubjectUserName, SubjectDomainName, _time
+    | where count > 500 AND unique_objects > 100
+    | sort -count
+
+  throttle: SubjectUserName, 600
+  notable:
+    rule_title: "BloodHound Collection by $SubjectUserName$ — $count$ LDAP queries"
+    rule_description: >
+      $SubjectUserName$@$SubjectDomainName$ performed $count$ LDAP
+      queries touching $unique_objects$ AD objects in 5 minutes.
+      This volume and pattern is consistent with SharpHound/BloodHound
+      collection runs for attack path analysis.
+    recommended_actions:
+      - Investigate the source workstation immediately
+      - Check for SharpHound.exe, Invoke-BloodHound, or azurehound
+      - Review the user account for compromise indicators
+      - Check if the account is a service account being abused
+      - Block further LDAP queries from the source
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1558.004 — AS-REP Roasting (Pre-Auth Disabled Accounts)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_asrep_roasting:
+  name: "AS-REP Roasting — Kerberos Pre-Auth Disabled Account Abuse"
+  description: >
+    Detects AS-REP roasting attacks where an attacker requests TGTs for
+    accounts with Kerberos pre-authentication disabled (Event 4768 with
+    result code 0x0 and encryption type RC4 from non-standard sources).
+  mitre_attack:
+    - T1558.004  # Steal or Forge Kerberos Tickets: AS-REP Roasting
+  severity: high
+  confidence: 85
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security" EventCode=4768
+    Status="0x0" TicketEncryptionType="0x17"
+    | lookup asrep_vulnerable_accounts samaccountname AS TargetUserName OUTPUT is_asrep
+    | where is_asrep="true" OR PreAuthType="0"
+    | bin _time span=10m
+    | stats count dc(TargetUserName) AS unique_targets
+        values(TargetUserName) AS targeted_accounts
+        values(IpAddress) AS source_ips
+        BY IpAddress, _time
+    | where unique_targets >= 3
+    | sort -unique_targets
+
+  throttle: IpAddress, 600
+  notable:
+    rule_title: "AS-REP Roasting from $IpAddress$ — $unique_targets$ accounts"
+    rule_description: >
+      $IpAddress$ requested RC4-encrypted TGTs for $unique_targets$
+      accounts with pre-auth disabled: $targeted_accounts$.
+      AS-REP roasting allows offline password cracking without
+      any authentication.
+    recommended_actions:
+      - Enable Kerberos pre-authentication on all flagged accounts
+      - Reset passwords for targeted accounts
+      - Investigate source host for attack tooling (Rubeus, GetNPUsers)
+      - Add affected accounts to Protected Users group
+    remediation_cmd: "Set-ADAccountControl -Identity <account> -DoesNotRequirePreAuth $false"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1557.001 — LLMNR/NBT-NS Poisoning (Responder Detection)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_responder_poisoning:
+  name: "LLMNR/NBT-NS/mDNS Poisoning — Responder Detection"
+  description: >
+    Detects Responder or similar tools performing LLMNR, NBT-NS, and mDNS
+    poisoning to capture NTLMv2 hashes on the network. Detection via
+    network traffic patterns and NTLM authentication anomalies.
+  mitre_attack:
+    - T1557.001  # Adversary-in-the-Middle: LLMNR/NBT-NS Poisoning
+  severity: high
+  confidence: 80
+
+  search: |
+    index=network sourcetype IN ("zeek:conn", "suricata:eve")
+    (
+      (dest_port=5355 AND proto="udp")
+      OR (dest_port=137 AND proto="udp")
+      OR (dest_port=5353 AND proto="udp")
+    )
+    | stats count dc(dest_ip) AS unique_targets
+        values(dest_port) AS protocols
+        BY src_ip
+    | where count > 50 AND unique_targets > 10
+    | eval poisoning_type=case(
+        match(protocols, "5355"), "LLMNR",
+        match(protocols, "137"), "NBT-NS",
+        match(protocols, "5353"), "mDNS",
+        true(), "Mixed"
+      )
+    | sort -count
+
+  throttle: src_ip, 600
+  notable:
+    rule_title: "$poisoning_type$ Poisoning from $src_ip$ — $unique_targets$ targets"
+    rule_description: >
+      Host $src_ip$ is sending $poisoning_type$ responses to
+      $unique_targets$ hosts ($count$ packets). This is consistent
+      with Responder or similar MITM tools capturing NTLMv2 hashes.
+    recommended_actions:
+      - Isolate source host immediately
+      - Disable LLMNR via GPO (Computer > Admin Templates > Network > DNS Client)
+      - Disable NBT-NS on all interfaces
+      - Check captured hashes — affected users need password resets
+    remediation_cmd: "Disable LLMNR: Set GPO 'Turn OFF Multicast Name Resolution' = Enabled"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1187 — Coerced Authentication (PetitPotam / PrinterBug / DFSCoerce)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_coerced_authentication:
+  name: "Coerced Authentication — PetitPotam / PrinterBug / DFSCoerce"
+  description: >
+    Detects coerced authentication attacks where a DC is forced to
+    authenticate to an attacker-controlled host via EfsRpcOpenFileRaw
+    (PetitPotam), SpoolService RPC (PrinterBug), or DFS RPC (DFSCoerce).
+  mitre_attack:
+    - T1187  # Forced Authentication
+    - T1557  # Adversary-in-the-Middle
+  severity: critical
+  confidence: 85
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security"
+    (
+      (EventCode=4624 LogonType=3
+       TargetUserName="*$" AuthenticationPackageName="NTLM"
+       IpAddress NOT IN [| inputlookup domain_controllers | fields ip])
+      OR (EventCode=5145 ShareName="\\\\*\\IPC$"
+          RelativeTargetName IN ("efsrpc", "lsarpc", "spoolss",
+                                  "netdfs", "samr", "drsuapi"))
+    )
+    | eval coercion_type=case(
+        RelativeTargetName="efsrpc", "PetitPotam (EFS RPC)",
+        RelativeTargetName="lsarpc", "PetitPotam (LSARPC)",
+        RelativeTargetName="spoolss", "PrinterBug (Spooler)",
+        RelativeTargetName="netdfs", "DFSCoerce",
+        match(TargetUserName, "\\$$") AND AuthenticationPackageName="NTLM",
+          "DC NTLM auth to non-DC (coercion indicator)",
+        true(), "Potential coerced auth"
+      )
+    | stats count values(coercion_type) AS attack_types
+        values(IpAddress) AS attacker_ips
+        values(TargetUserName) AS dc_accounts
+        BY Computer
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "Coerced Authentication on $Computer$ — $attack_types$"
+    rule_description: >
+      Domain Controller $Computer$ was coerced to authenticate via
+      $attack_types$. DC accounts: $dc_accounts$, attacker IPs:
+      $attacker_ips$. Coerced DC authentication enables NTLM relay
+      to AD CS for domain compromise.
+    recommended_actions:
+      - Block inbound SMB/RPC from non-DC hosts to DCs
+      - Disable NTLM authentication on DCs (GPO: Restrict NTLM)
+      - Enable EPA (Extended Protection for Authentication) on AD CS
+      - Disable Print Spooler on all DCs
+      - Apply PetitPotam mitigations (KB5005413)
+    remediation_cmd: "Stop-Service Spooler; Set-Service Spooler -StartupType Disabled"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1018 — Bulk LDAP Enumeration / AD Reconnaissance Tools
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_ldap_recon:
+  name: "Bulk LDAP Enumeration — AD Reconnaissance"
+  description: >
+    Detects tools performing bulk LDAP queries for AD objects —
+    ADExplorer, ADRecon, PowerView, ldapdomaindump, and similar.
+    Characterized by high-volume LDAP searches for users, groups,
+    computers, OUs, GPOs, and trusts in rapid succession.
+  mitre_attack:
+    - T1018  # Remote System Discovery
+    - T1087  # Account Discovery
+  severity: medium
+  confidence: 80
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security" EventCode=4662
+    | bin _time span=2m
+    | stats count dc(ObjectType) AS unique_object_types
+        values(ObjectType) AS object_types
+        BY SubjectUserName, ClientAddress, _time
+    | where count > 200 AND unique_object_types >= 3
+    | sort -count
+
+  throttle: SubjectUserName, 600
+  notable:
+    rule_title: "LDAP Recon by $SubjectUserName$ — $count$ queries, $unique_object_types$ object types"
+    rule_description: >
+      $SubjectUserName$ from $ClientAddress$ queried $count$ AD objects
+      across $unique_object_types$ types ($object_types$) in 2 minutes.
+      Consistent with AD enumeration tools (PowerView, ADRecon, ldapdomaindump).
+    recommended_actions:
+      - Investigate source host for recon tooling
+      - Check if the account is compromised
+      - Review LDAP query logs for sensitive attribute access
+      - Consider implementing LDAP query rate limiting
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1557 — ADIDNS Record Injection / Poisoning
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_adidns_poisoning:
+  name: "ADIDNS Record Injection — DNS Wildcard / Poisoning"
+  description: >
+    Detects creation of wildcard DNS records (*) or suspicious DNS records
+    in AD-integrated DNS zones by non-admin users. Attackers inject DNS
+    records to redirect traffic for MITM and credential capture.
+  mitre_attack:
+    - T1557  # Adversary-in-the-Middle
+  severity: high
+  confidence: 85
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security" EventCode=5137
+    ObjectClass="dnsNode"
+    | eval is_wildcard=if(match(ObjectDN, "\\*"), "YES", "NO")
+    | eval is_suspicious=if(
+        match(ObjectDN, "\\*") OR match(ObjectDN, "wpad") OR match(ObjectDN, "isatap"),
+        "YES", "NO"
+      )
+    | where is_suspicious="YES"
+    | stats count values(ObjectDN) AS dns_records
+        values(SubjectUserName) AS created_by
+        BY SubjectUserName, SubjectDomainName
+    | sort -count
+
+  throttle: SubjectUserName, 600
+  notable:
+    rule_title: "ADIDNS Injection by $SubjectUserName$ — $dns_records$"
+    rule_description: >
+      $SubjectUserName$ created suspicious DNS records: $dns_records$.
+      Wildcard or WPAD DNS injection enables MITM attacks and
+      credential capture across the domain.
+    recommended_actions:
+      - Delete the injected DNS records immediately
+      - Review who has CreateChild permissions on DNS zones
+      - Block WPAD via DNS global query block list
+      - Investigate source account for compromise
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1110.003 — Kerberos Password Spraying (Event 4771)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_kerberos_password_spray:
+  name: "Kerberos Password Spraying — Distributed Pre-Auth Failures"
+  description: >
+    Detects password spraying via Kerberos (Event 4771) where a single
+    source tries one password against many accounts — distinct from
+    brute force where many passwords target one account.
+  mitre_attack:
+    - T1110.003  # Brute Force: Password Spraying
+  severity: high
+  confidence: 85
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security" EventCode=4771
+    Status="0x18"
+    | bin _time span=10m
+    | stats dc(TargetUserName) AS unique_accounts
+        count AS total_failures
+        values(TargetUserName) AS accounts
+        BY IpAddress, _time
+    | where unique_accounts >= 10 AND total_failures >= 10
+    | eval spray_ratio=round(unique_accounts / total_failures, 2)
+    | where spray_ratio > 0.5
+    | sort -unique_accounts
+
+  throttle: IpAddress, 600
+  notable:
+    rule_title: "Kerberos Password Spray from $IpAddress$ — $unique_accounts$ accounts"
+    rule_description: >
+      $IpAddress$ attempted authentication against $unique_accounts$
+      unique accounts with $total_failures$ total failures in 10 min.
+      Spray ratio: $spray_ratio$ (>0.5 = spray pattern).
+      Accounts targeted: $accounts$.
+    recommended_actions:
+      - Block source IP at network level
+      - Identify and lock any successfully compromised accounts
+      - Check Event 4768 (success) from same source IP
+      - Enable smart lockout or Azure AD Password Protection
+    remediation_cmd: "Set-ADDefaultDomainPasswordPolicy -LockoutThreshold 5"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1069 — Sensitive Group Enumeration via RPC/SAMR
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_group_enumeration:
+  name: "Sensitive AD Group Enumeration via SAMR/RPC"
+  description: >
+    Detects enumeration of privileged AD groups (Domain Admins, Enterprise
+    Admins, Schema Admins, etc.) via SAMR RPC calls. Tools like net.exe,
+    PowerView, and CrackMapExec enumerate these groups for target selection.
+  mitre_attack:
+    - T1069.002  # Permission Groups Discovery: Domain Groups
+  severity: medium
+  confidence: 75
+
+  search: |
+    index=dc_logs sourcetype="XmlWinEventLog:Security" EventCode=4799
+    TargetUserName IN ("Domain Admins", "Enterprise Admins", "Schema Admins",
+                        "Administrators", "Account Operators", "Backup Operators",
+                        "Server Operators", "Domain Controllers")
+    | bin _time span=5m
+    | stats count dc(TargetUserName) AS groups_enumerated
+        values(TargetUserName) AS groups
+        BY SubjectUserName, CallerProcessName, _time
+    | where groups_enumerated >= 3
+    | sort -groups_enumerated
+
+  throttle: SubjectUserName, 600
+  notable:
+    rule_title: "Privileged Group Enumeration by $SubjectUserName$ — $groups$"
+    rule_description: >
+      $SubjectUserName$ enumerated $groups_enumerated$ privileged
+      groups: $groups$ via $CallerProcessName$. Attackers enumerate
+      admin groups to identify high-value targets for credential theft.
+    recommended_actions:
+      - Investigate the user account and source process
+      - Check for follow-up Kerberoasting or credential dumping
+      - Review if this is legitimate admin activity
