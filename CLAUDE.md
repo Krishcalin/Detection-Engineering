@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Splunk SIEM detection rules for SOC attack detection and incident response. **132 detection rules** across 10 categories covering Windows, Active Directory, RHEL Linux, Apache, ICS/OT, network firewalls (Palo Alto, Cisco, Fortinet, Check Point), EDR platforms (CrowdStrike, Microsoft Defender, Trend Micro), credential access attacks, and recent threat campaigns.
+Splunk SIEM detection rules for SOC attack detection and incident response. **164 detection rules** across 12 categories covering Windows, Active Directory, RHEL Linux, Apache, ICS/OT, network firewalls (Palo Alto, Cisco, Fortinet, Check Point), EDR platforms (CrowdStrike, Microsoft Defender, Trend Micro), credential access attacks, network security threats, and recent threat campaigns.
 
 Every rule includes SPL search queries, MITRE ATT&CK mapping, severity/confidence scoring, throttle configuration, notable event generation, and recommended response actions.
 
@@ -16,7 +16,7 @@ Every rule includes SPL search queries, MITRE ATT&CK mapping, severity/confidenc
 
 | Category | Directory | Files | Rules | Focus Areas |
 |----------|-----------|------:|------:|-------------|
-| **Windows** | `splunk_rules/windows/` | 9 | 74 | Execution, persistence, priv esc, defense evasion, discovery, lateral movement, C2, collection, exfiltration, impact |
+| **Windows** | `splunk_rules/windows/` | 12 | 100 | Execution, persistence, priv esc, defense evasion, discovery, lateral movement, C2, collection, exfiltration, impact, LOLBin proxy execution, account manipulation, anti-forensics |
 | **Active Directory** | `splunk_rules/active_directory/` | 3 | 23 | BloodHound, AS-REP roasting, PetitPotam, ADIDNS, Silver/Diamond Ticket, DCShadow, SID History, Shadow Credentials, RBCD, AdminSDHolder, Skeleton Key, overpass-the-hash, DPAPI, GPO abuse |
 | **Credential Access** | `splunk_rules/credential_access/` | 11 | 75 | Kerberoasting, Golden Ticket, DCSync, LSASS dumping, PtH, NTLM relay, AD CS attacks, GPO modification, NTDS.dit, password spraying |
 | **RHEL Linux** | `splunk_rules/rhel_linux/` | 8 | 63 | Execution, persistence, priv esc, defense evasion, discovery, lateral movement, credential access, exfiltration |
@@ -24,9 +24,10 @@ Every rule includes SPL search queries, MITRE ATT&CK mapping, severity/confidenc
 | **ICS/OT** | `splunk_rules/ics_ot/` | 3 | 20 | IT-to-OT zone breach, Modbus/DNP3/S7comm/OPC UA, TRITON, Industroyer, PIPEDREAM, safety bypass, rogue devices, process anomalies, alarm manipulation |
 | **Network Firewalls** | `splunk_rules/network_firewalls/` | 4 | 30 | Palo Alto (PAN-OS CVEs, GlobalProtect), Cisco ASA/FTD (ArcaneDoor), Fortinet (FortiJump, SSL-VPN), Check Point (SmartConsole, blades) |
 | **EDR Detection** | `splunk_rules/edr_detection/` | 3 | 24 | CrowdStrike Falcon (sensor tamper, C2, ransomware), Microsoft Defender (AMSI, ASR, macros), Trend Micro (agent tamper, IPS, integrity monitoring) |
+| **Network Security** | `splunk_rules/network_security/` | 1 | 6 | TOR traffic, rogue DNS, large uploads/exfiltration, unencrypted sensitive traffic, network share removal, recurring malware |
 | **Recent Attacks** | `splunk_rules/recent_attacks/` | 1 | 12 | CVE-2026-21509, APT28 Operation NeuSploit |
 
-**Total: 48 files, 132+ rules, ~38,000 lines of YAML**
+**Total: 52 files, 164+ rules, ~42,000 lines of YAML**
 
 ### ICS/OT Protocol Coverage
 
@@ -273,7 +274,11 @@ Detection-Engineering/
 │   │   ├── rhel_lateral_movement_detection.yml
 │   │   ├── rhel_persistence_detection.yml
 │   │   └── rhel_privilege_escalation_detection.yml
-│   └── windows/                   # Windows detection (74 rules)
+│   ├── network_security/             # Network threat detection (6 rules)
+│   │   └── network_threat_detection.yml
+│   └── windows/                   # Windows detection (100 rules)
+│       ├── windows_account_manipulation_detection.yml
+│       ├── windows_anti_forensics_detection.yml
 │       ├── windows_collection_exfiltration_detection.yml
 │       ├── windows_command_control_detection.yml
 │       ├── windows_defense_evasion_detection.yml
@@ -281,6 +286,7 @@ Detection-Engineering/
 │       ├── windows_execution_detection.yml
 │       ├── windows_impact_detection.yml
 │       ├── windows_lateral_movement_detection.yml
+│       ├── windows_lolbin_proxy_execution_detection.yml
 │       ├── windows_persistence_detection.yml
 │       └── windows_privilege_escalation_detection.yml
 ├── Recent_Attacks/                # Threat analysis documentation

@@ -1,0 +1,328 @@
+# ==============================================================================
+#  Windows Anti-Forensics & Evidence Destruction Detection
+# ==============================================================================
+#  Description : Detects anti-forensics techniques — PowerShell history
+#                clearing, wevtutil log clearing, minifilter driver unloading
+#                (Sysmon bypass), unusually long command lines, processes
+#                from irregular parents, COM object hijacking, screensaver
+#                registry abuse, and boot/logon script persistence.
+#  MITRE ATT&CK: T1070, T1562, T1546, T1547, T1112
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1070.001 — Windows Event Log Clearing via wevtutil
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_wevtutil_log_clear:
+  name: "Windows Log Clearing via wevtutil — Evidence Destruction"
+  description: >
+    Detects wevtutil.exe being used to clear Windows event logs (Security,
+    System, Application, Setup). Attackers clear logs to remove evidence
+    of their activities.
+  mitre_attack:
+    - T1070.001  # Indicator Removal: Clear Windows Event Logs
+  severity: critical
+  confidence: 95
+
+  search: |
+    index=sysmon EventCode=1 Image="*\\wevtutil*"
+    CommandLine="*cl*"
+    (CommandLine="*System*" OR CommandLine="*Security*"
+     OR CommandLine="*Setup*" OR CommandLine="*Application*"
+     OR CommandLine="*Sysmon*" OR CommandLine="*PowerShell*")
+    | stats count values(CommandLine) AS commands BY Computer, User
+    | sort -count
+
+  throttle: Computer, 120
+  notable:
+    rule_title: "Event Log Cleared via wevtutil on $Computer$ by $User$"
+    rule_description: >
+      CRITICAL — Event logs cleared: $commands$. This is a strong
+      indicator of active compromise with evidence destruction.
+      Attacker is covering tracks.
+    recommended_actions:
+      - Capture remaining logs immediately (memory forensics)
+      - Check backup log copies on SIEM/log collector
+      - Investigate what happened BEFORE the log clearing
+      - Full incident response — assume active compromise
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1070 — PowerShell Console History Clearing
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_powershell_history_clear:
+  name: "PowerShell History Clearing — Anti-Forensics"
+  description: >
+    Detects attempts to clear PowerShell console command history by
+    deleting the history file, setting HistorySaveStyle to SaveNothing,
+    or using Remove-Item on the PSReadline history path.
+  mitre_attack:
+    - T1070.003  # Indicator Removal: Clear Command History
+  severity: high
+  confidence: 90
+
+  search: |
+    index=sysmon EventCode=1
+    (CommandLine="*rm*PSReadlineOption*HistorySavePath*"
+     OR CommandLine="*del*PSReadlineOption*HistorySavePath*"
+     OR CommandLine="*Set-PSReadlineOption*HistorySaveStyle*SaveNothing*"
+     OR CommandLine="*Remove-Item*PSReadlineOption*HistorySavePath*"
+     OR CommandLine="*del*PSReadline*ConsoleHost_history*")
+    | stats count values(CommandLine) AS commands BY Computer, User
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "PowerShell History Cleared on $Computer$ by $User$"
+    rule_description: >
+      PowerShell command history deleted or disabled: $commands$.
+      Attackers clear PS history to hide the commands they executed.
+    recommended_actions:
+      - Check PowerShell script block logs (Event 4104) for what was run
+      - Review transcription logs if enabled
+      - Investigate what the attacker was doing before clearing history
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1562 — Minifilter Driver Unload (Sysmon/EDR Bypass)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_driver_unload:
+  name: "Minifilter Driver Unload — Sysmon/EDR Sensor Bypass"
+  description: >
+    Detects fltMC.exe being used to unload minifilter drivers. Sysmon and
+    many EDR products use minifilter drivers for monitoring — unloading
+    them blinds the security stack.
+  mitre_attack:
+    - T1562.001  # Impair Defenses: Disable or Modify Tools
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=sysmon EventCode=1
+    (Image="*\\fltMC.exe" OR Image="*\\fltmc.exe")
+    CommandLine="*unload*"
+    | stats count values(CommandLine) AS commands BY Computer, User
+    | sort -count
+
+  throttle: Computer, 120
+  notable:
+    rule_title: "Minifilter Driver Unloaded on $Computer$ by $User$"
+    rule_description: >
+      CRITICAL — fltMC used to unload minifilter driver: $commands$.
+      This can disable Sysmon, EDR, and other security monitoring.
+    recommended_actions:
+      - Verify which driver was unloaded
+      - Re-enable the security driver immediately
+      - Investigate what happened during the blind spot
+      - Check for concurrent malware execution
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1059 — Unusually Long Command Line Strings
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_long_command_line:
+  name: "Unusually Long Command Line — Obfuscated/Encoded Payload"
+  description: >
+    Detects command lines that are significantly longer than the host's
+    average, indicating encoded payloads, obfuscated commands, or
+    complex malware execution chains.
+  mitre_attack:
+    - T1027  # Obfuscated Files or Information
+    - T1059  # Command and Scripting Interpreter
+  severity: medium
+  confidence: 75
+
+  search: |
+    index=sysmon EventCode=1
+    | eval cmd_len=len(CommandLine)
+    | eventstats avg(cmd_len) AS avg_len stdev(cmd_len) AS std_len BY Computer
+    | where cmd_len > (avg_len + std_len * 3) AND cmd_len > 500
+    | eval ratio=round(cmd_len / avg_len, 1)
+    | table _time, Computer, User, Image, cmd_len, avg_len, ratio, CommandLine
+    | sort -cmd_len
+
+  throttle: Computer, 600
+  notable:
+    rule_title: "Long Command Line on $Computer$ — $cmd_len$ chars ($ratio$x average)"
+    rule_description: >
+      Command line length $cmd_len$ characters is $ratio$x the host
+      average ($avg_len$). Extremely long commands typically contain
+      base64-encoded payloads or heavily obfuscated malware.
+    recommended_actions:
+      - Decode/deobfuscate the command line
+      - Check for base64 (-enc, -EncodedCommand) patterns
+      - Investigate the parent process
+      - Submit to sandbox for dynamic analysis
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1036 — Processes Started from Irregular Parent
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_irregular_parent:
+  name: "Process from Irregular Parent — Process Hollowing Indicator"
+  description: >
+    Detects Windows system processes (lsass, csrss, services, smss,
+    winlogon, etc.) started from unexpected parent processes. Legitimate
+    system processes have strict parent-child relationships.
+  mitre_attack:
+    - T1055.012  # Process Injection: Process Hollowing
+    - T1036.005  # Masquerading: Match Legitimate Name
+  severity: high
+  confidence: 85
+
+  search: |
+    index=sysmon EventCode=1
+    (
+      (Image="*\\smss.exe" AND ParentImage!="*\\smss.exe"
+       AND ParentImage!="System")
+      OR (Image="*\\csrss.exe" AND ParentImage!="*\\smss.exe"
+          AND ParentImage!="*\\svchost.exe")
+      OR (Image="*\\wininit.exe" AND ParentImage!="*\\smss.exe")
+      OR (Image="*\\winlogon.exe" AND ParentImage!="*\\smss.exe")
+      OR (Image="*\\lsass.exe" AND ParentImage!="*\\wininit.exe")
+      OR (Image="*\\services.exe" AND ParentImage!="*\\wininit.exe")
+      OR (Image="*\\svchost.exe" AND ParentImage!="*\\services.exe")
+      OR (Image="*\\spoolsv.exe" AND ParentImage!="*\\services.exe")
+    )
+    ParentImage!="*SplunkUniversalForwarder*"
+    | eval anomaly=Image + " started by " + ParentImage + " (unexpected)"
+    | stats count values(anomaly) AS anomalies BY Computer
+    | sort -count
+
+  throttle: Computer, 600
+  notable:
+    rule_title: "Irregular Parent-Child Process on $Computer$ — $anomalies$"
+    rule_description: >
+      System process started from unexpected parent: $anomalies$.
+      This indicates process hollowing, injection, or masquerading.
+    recommended_actions:
+      - Check the parent process for malicious activity
+      - Verify the child process image hash against Microsoft catalog
+      - Memory forensics may be needed to detect hollowing
+      - Kill the suspicious process tree
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1546.015 — COM Object Hijacking (Registry Persistence)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_com_hijacking:
+  name: "COM Object Hijacking — CLSID Registry Persistence"
+  description: >
+    Detects modifications to COM object registry keys under
+    HKCU\Software\Classes\CLSID or HKLM\SOFTWARE\Classes\CLSID.
+    Attackers hijack COM objects to execute malicious DLLs when
+    legitimate applications load the COM object.
+  mitre_attack:
+    - T1546.015  # Event Triggered Execution: COM Object Hijacking
+  severity: high
+  confidence: 80
+
+  search: |
+    index=sysmon EventCode IN (12, 13, 14)
+    TargetObject="*\\Software\\Classes\\CLSID\\*"
+    | stats count values(TargetObject) AS registry_keys
+        values(EventCode) AS event_types
+        BY Computer, User, Image
+    | sort -count
+
+  throttle: Computer, 600
+  notable:
+    rule_title: "COM Hijacking on $Computer$ — CLSID registry modified"
+    rule_description: >
+      COM object registry keys modified: $registry_keys$.
+      Event types: $event_types$. Modified by: $Image$.
+      COM hijacking provides persistence that executes when
+      any application loads the hijacked COM object.
+    recommended_actions:
+      - Compare modified CLSID entries against known-good baseline
+      - Check what DLL the CLSID now points to
+      - Remove malicious CLSID entries
+      - Check for scheduled tasks or startup items triggering the COM object
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1547.001 — Boot/Logon Script Persistence (UserInitMprLogonScript)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_logon_script_persistence:
+  name: "Logon Script Persistence — UserInitMprLogonScript Registry"
+  description: >
+    Detects creation or modification of the UserInitMprLogonScript
+    registry key, which executes a script every time the user logs in.
+    This is a stealthy persistence mechanism rarely used legitimately.
+  mitre_attack:
+    - T1547.001  # Boot or Logon Autostart Execution: Registry Run Keys
+  severity: high
+  confidence: 90
+
+  search: |
+    (index=sysmon EventCode=1 Image="*\\reg.exe"
+     CommandLine="*add*\\Environment*UserInitMprLogonScript*")
+    OR (index=sysmon EventCode IN (12, 13, 14)
+        TargetObject="*\\Environment*UserInitMprLogonScript*")
+    | stats count values(CommandLine) AS commands
+        values(TargetObject) AS keys
+        BY Computer, User
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "Logon Script Persistence on $Computer$ — UserInitMprLogonScript"
+    rule_description: >
+      UserInitMprLogonScript registry key modified: $commands$ / $keys$.
+      This key runs a script at every user logon — a stealthy
+      persistence mechanism rarely used by legitimate software.
+    recommended_actions:
+      - Remove the registry key immediately
+      - Identify and quarantine the script being referenced
+      - Check for similar persistence across other hosts
+      - Investigate how the attacker gained registry write access
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1059 — Executables with Same Hash but Different Names
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_renamed_executables:
+  name: "Renamed Executable — Same Hash, Different Name"
+  description: >
+    Detects executables where the same file hash appears under multiple
+    names. Attackers copy and rename tools (Mimikatz, PsExec, etc.) to
+    blend in with the environment and evade name-based detections.
+  mitre_attack:
+    - T1036.005  # Masquerading: Match Legitimate Name or Location
+  severity: medium
+  confidence: 75
+
+  search: |
+    index=sysmon EventCode=1
+    | stats dc(Image) AS name_count values(Image) AS file_names
+        values(CommandLine) AS commands
+        count
+        BY Hashes
+    | where name_count > 1 AND count > 1
+    | sort -name_count
+
+  throttle: Hashes, 3600
+  notable:
+    rule_title: "Renamed Executable — $name_count$ names for same hash"
+    rule_description: >
+      File hash $Hashes$ appears under $name_count$ different names:
+      $file_names$. Renamed executables indicate attacker tool
+      masquerading to evade filename-based detections.
+    recommended_actions:
+      - Check if the hash matches known attacker tools
+      - Submit hash to VirusTotal
+      - Investigate all hosts where this hash appeared
+      - Block the hash via EDR/AppLocker

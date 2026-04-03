@@ -1,0 +1,345 @@
+# ==============================================================================
+#  Windows Account Manipulation & Insider Threat Detection
+# ==============================================================================
+#  Description : Detects suspicious account activity — new local admin creation,
+#                service account interactive login, unusual access patterns,
+#                credential searching in registry, privilege escalation via
+#                accessibility features, and process anomalies indicating abuse.
+#  MITRE ATT&CK: T1078, T1098, T1136, T1546.008, T1552, T1543
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1136 — New Local Admin Account Creation (net.exe)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_new_local_admin:
+  name: "New Local Admin Account Created via net.exe"
+  description: >
+    Detects creation of a new user account followed by elevation to
+    local Administrators group using net.exe/net1.exe. Attackers create
+    backdoor admin accounts for persistent access.
+  mitre_attack:
+    - T1136.001  # Create Account: Local Account
+    - T1098      # Account Manipulation
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=windows sourcetype="XmlWinEventLog:Security"
+    EventCode=4720 OR (EventCode=4732
+     TargetUserName="Administrators")
+    | transaction Security_ID maxspan=180m
+    | search EventCode=4720 EventCode=4732
+    | table _time, Computer, EventCode, Security_ID, SamAccountName, TargetUserName
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "New Local Admin Created on $Computer$ — $SamAccountName$"
+    rule_description: >
+      User $SamAccountName$ created and added to Administrators
+      group on $Computer$ within 3 hours. Backdoor admin accounts
+      are a common persistence mechanism.
+    recommended_actions:
+      - Verify the account creation was authorized
+      - Disable the account if unauthorized
+      - Check who initiated the creation (source account/process)
+      - Review for concurrent lateral movement
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1078 — Service Account Interactive Login
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_service_account_interactive:
+  name: "Service Account Interactive Login — Credential Misuse"
+  description: >
+    Detects service accounts (svc_*, _sa, _svc) logging in interactively
+    (logon type 2, 10, 11). Service accounts should only authenticate
+    via service logon (type 5) or network logon (type 3).
+  mitre_attack:
+    - T1078.003  # Valid Accounts: Local Accounts
+  severity: high
+  confidence: 85
+
+  search: |
+    index=windows sourcetype="XmlWinEventLog:Security" EventCode=4624
+    LogonType IN (2, 10, 11)
+    (TargetUserName="svc_*" OR TargetUserName="*_sa" OR TargetUserName="*_svc"
+     OR TargetUserName="*service*")
+    | stats count min(_time) AS first max(_time) AS last
+        values(LogonType) AS logon_types
+        values(IpAddress) AS source_ips
+        BY TargetUserName, Computer
+    | sort -count
+
+  throttle: TargetUserName, 600
+  notable:
+    rule_title: "Service Account $TargetUserName$ Interactive Login on $Computer$"
+    rule_description: >
+      Service account $TargetUserName$ logged in interactively
+      (type $logon_types$) from $source_ips$. Service accounts
+      should never have interactive sessions — indicates credential theft.
+    recommended_actions:
+      - Investigate who is using the service account interactively
+      - Reset the service account password
+      - Configure "Deny log on locally" and "Deny log on through RDP" for service accounts
+      - Check for data access or lateral movement during the session
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1078 — Unusual Access: Failed Then Success Pattern
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_unusual_access_pattern:
+  name: "Unusual Access — Multiple Failures Followed by Success"
+  description: >
+    Detects accounts with multiple failed login attempts followed by a
+    successful login — indicating credential guessing, brute force success,
+    or credential stuffing that eventually succeeded.
+  mitre_attack:
+    - T1078  # Valid Accounts
+    - T1110  # Brute Force
+  severity: high
+  confidence: 80
+
+  search: |
+    index=windows sourcetype="XmlWinEventLog:Security"
+    EventCode IN (4624, 4625)
+    | eval action=if(EventCode=4624, "success", "failure")
+    | stats list(action) AS attempts
+        count(eval(action="failure")) AS failed
+        count(eval(action="success")) AS succeeded
+        values(IpAddress) AS source_ips
+        BY TargetUserName, Computer
+    | where succeeded > 0 AND failed >= 5
+    | sort -failed
+
+  throttle: TargetUserName, 600
+  notable:
+    rule_title: "Credential Compromise — $TargetUserName$ ($failed$ failures then success)"
+    rule_description: >
+      $TargetUserName$ had $failed$ failed logins followed by
+      $succeeded$ successful login(s) on $Computer$ from $source_ips$.
+      This pattern indicates successful credential guessing.
+    recommended_actions:
+      - Reset the user's password immediately
+      - Check for lateral movement post-success
+      - Investigate source IPs for known threat infrastructure
+      - Enable MFA for the affected account
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1552 — Credential Search in Registry / Files
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_credential_search:
+  name: "Credential Hunting — Registry/File Password Search"
+  description: >
+    Detects use of reg.exe to search registry for stored passwords, or
+    PowerSploit modules that extract credentials from IIS, unattended
+    install files, cached GPP passwords, and auto-logon settings.
+  mitre_attack:
+    - T1552.001  # Unsecured Credentials: Credentials In Files
+    - T1552.002  # Unsecured Credentials: Credentials in Registry
+  severity: high
+  confidence: 85
+
+  search: |
+    index=sysmon EventCode=1
+    (
+      (CommandLine="*reg*query*HKLM*password*" OR CommandLine="*reg*query*HKCU*password*")
+      OR CommandLine="*Get-UnattendedInstallFile*"
+      OR CommandLine="*Get-Webconfig*"
+      OR CommandLine="*Get-ApplicationHost*"
+      OR CommandLine="*Get-SiteListPassword*"
+      OR CommandLine="*Get-CachedGPPPassword*"
+      OR CommandLine="*Get-RegistryAutoLogon*"
+    )
+    | eval technique=case(
+        match(CommandLine, "(?i)reg.*query.*password"), "Registry password search",
+        match(CommandLine, "(?i)unattended"), "Unattend.xml credential extraction",
+        match(CommandLine, "(?i)webconfig|applicationhost"), "IIS credential extraction",
+        match(CommandLine, "(?i)GPPPassword"), "Group Policy Preferences password",
+        match(CommandLine, "(?i)autologon"), "Auto-logon credential extraction",
+        true(), "Credential hunting"
+      )
+    | stats count values(technique) AS techniques values(CommandLine) AS commands
+        BY Computer, User
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "Credential Hunting on $Computer$ — $techniques$"
+    rule_description: >
+      Credential search activity: $techniques$. Commands: $commands$.
+      Attackers search registry and config files for stored passwords
+      after gaining initial access.
+    recommended_actions:
+      - Investigate the user account for compromise
+      - Check if any credentials were successfully extracted
+      - Remove stored passwords from registry and config files
+      - Rotate any credentials that may have been exposed
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1546.008 — Accessibility Feature Backdoor (sethc, utilman)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_accessibility_backdoor:
+  name: "Accessibility Feature Backdoor — WinLogon Command Shell"
+  description: >
+    Detects cmd.exe or PowerShell launched from winlogon.exe, indicating
+    abuse of accessibility features (StickyKeys, Utilman) to gain SYSTEM
+    access from the login screen.
+  mitre_attack:
+    - T1546.008  # Event Triggered Execution: Accessibility Features
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=sysmon EventCode=1
+    ParentImage="*\\winlogon.exe"
+    (Image="*\\cmd.exe" OR Image="*\\powershell.exe")
+    | stats count values(CommandLine) AS commands values(Image) AS shells
+        BY Computer, User
+    | sort -count
+
+  throttle: Computer, 120
+  notable:
+    rule_title: "Accessibility Backdoor on $Computer$ — winlogon → $shells$"
+    rule_description: >
+      CRITICAL — Command shell launched from winlogon.exe: $shells$.
+      This indicates StickyKeys/Utilman backdoor — attacker has SYSTEM
+      access from the login screen without credentials.
+    recommended_actions:
+      - Check for debugger registry keys on accessibility executables
+      - Remove: reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\sethc.exe"
+      - Full forensic investigation — attacker has SYSTEM
+      - Enable NLA (Network Level Authentication) for RDP
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1543 — Suspicious Service Creation in Non-Standard Path
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_suspicious_service:
+  name: "Suspicious Service Created — Non-Standard File Path"
+  description: >
+    Detects creation of Windows services where the service binary is
+    located outside standard directories (C:\Windows, C:\Program Files).
+    Attackers create services pointing to malware in temp/user directories.
+  mitre_attack:
+    - T1543.003  # Create or Modify System Process: Windows Service
+  severity: high
+  confidence: 85
+
+  search: |
+    index=windows sourcetype="XmlWinEventLog:System" EventCode=7045
+    Service_File_Name="*\\.exe"
+    NOT (Service_File_Name IN ("C:\\Windows\\*", "C:\\Program File*",
+                                "C:\\ProgramData\\*", "%systemroot%\\*"))
+    Service_Type="user mode service"
+    | stats count values(Service_File_Name) AS service_paths
+        values(Service_Name) AS service_names
+        values(Service_Start_Type) AS start_types
+        BY Computer
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "Suspicious Service on $Computer$ — $service_names$"
+    rule_description: >
+      Service created with binary in non-standard path:
+      $service_names$ → $service_paths$ (start: $start_types$).
+      Services in temp/user directories are almost always malicious.
+    recommended_actions:
+      - Stop and delete the suspicious service
+      - Quarantine the service binary
+      - Check for privilege escalation (services run as SYSTEM)
+      - Submit binary hash to VirusTotal
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1078 — Unusual Login Activity (Anomaly Detection)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_unusual_login:
+  name: "Unusual Login Activity — Rare Account Logon"
+  description: >
+    Detects logon events from accounts not in the top 30 most active
+    accounts. Rare account activity may indicate dormant account abuse,
+    compromised accounts, or newly created backdoor accounts.
+  mitre_attack:
+    - T1078  # Valid Accounts
+  severity: medium
+  confidence: 70
+
+  search: |
+    index=windows sourcetype="XmlWinEventLog:Security" EventCode=4624
+    | search NOT
+        [search index=windows EventCode=4624
+         | top 30 TargetUserName
+         | table TargetUserName]
+    | stats count values(LogonType) AS logon_types
+        values(IpAddress) AS source_ips
+        min(_time) AS first max(_time) AS last
+        BY TargetUserName, Computer
+    | where count > 0
+    | sort -count
+
+  throttle: TargetUserName, 3600
+  notable:
+    rule_title: "Unusual Account Login — $TargetUserName$ on $Computer$"
+    rule_description: >
+      Rare account $TargetUserName$ logged in $count$ times on
+      $Computer$ from $source_ips$ (types: $logon_types$). This
+      account is not in the top 30 most active — investigate.
+    recommended_actions:
+      - Verify the account is still needed and authorized
+      - Check if the account was recently created or reactivated
+      - Review what the account accessed during the session
+      - Disable dormant accounts proactively
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1078 — Services.exe Launching cmd.exe (Service Abuse)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_services_launching_cmd:
+  name: "Services.exe Launching cmd.exe — Service-Based Execution"
+  description: >
+    Detects services.exe spawning cmd.exe, indicating a service was created
+    to execute commands via cmd /c. Attackers use this for persistence and
+    SYSTEM-level execution. The service intentionally times out while cmd
+    runs the payload.
+  mitre_attack:
+    - T1543.003  # Windows Service
+    - T1569.002  # System Services: Service Execution
+  severity: high
+  confidence: 85
+
+  search: |
+    index=sysmon EventCode=1
+    Image="*\\cmd.exe"
+    ParentImage="*\\services.exe"
+    | stats count values(CommandLine) AS commands BY Computer, User
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "Service Execution — services.exe → cmd.exe on $Computer$"
+    rule_description: >
+      services.exe spawned cmd.exe: $commands$. Services launching
+      cmd.exe with /c is a common technique for SYSTEM-level persistence
+      and execution (PsExec, sc create, Cobalt Strike).
+    recommended_actions:
+      - Identify which service triggered the execution
+      - Check for recently created services (Event 7045)
+      - Review the command being executed
+      - Remove malicious service

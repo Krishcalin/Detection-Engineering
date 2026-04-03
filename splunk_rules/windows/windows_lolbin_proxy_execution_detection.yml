@@ -1,0 +1,407 @@
+# ==============================================================================
+#  Windows LOLBin / Living-off-the-Land Proxy Execution Detection
+# ==============================================================================
+#  Description : Detects abuse of legitimate Windows binaries (LOLBins) for
+#                code execution, download, and defense evasion — CertUtil,
+#                BITSAdmin, MSBuild, CMSTP, Regsvr32, Mavinject, MSHTA,
+#                compiled HTML, NTFS Alternate Data Streams, and DDE exploits.
+#  MITRE ATT&CK: T1218, T1197, T1127, T1559, T1096, T1564.004
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#  1. Sysmon deployed (Event 1: Process Creation, Event 3: Network, Event 11: FileCreate)
+#  2. Windows Security Audit (Event 4688 with command-line logging)
+#  3. sourcetype=XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1218 — CertUtil Download with URLCache/Split
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_certutil_download:
+  name: "CertUtil Download — URLCache/VerifyCtl File Download"
+  description: >
+    Detects certutil.exe being used to download files from remote URLs using
+    -urlcache -split or -verifyctl -split arguments. CertUtil is a legitimate
+    Windows certificate utility frequently abused as a download cradle.
+  mitre_attack:
+    - T1218  # System Binary Proxy Execution
+    - T1105  # Ingress Tool Transfer
+  severity: high
+  confidence: 85
+
+  search: |
+    index=sysmon sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=1 Image="*\\certutil.exe"
+    (CommandLine="*urlcache*" OR CommandLine="*verifyctl*")
+    (CommandLine="*split*" OR CommandLine="*-f*")
+    | stats count values(CommandLine) AS commands
+        values(ParentImage) AS parents
+        BY Computer, User, _time
+    | sort -_time
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "CertUtil Download on $Computer$ by $User$"
+    rule_description: >
+      CertUtil used to download remote file: $commands$.
+      Parent: $parents$. CertUtil download bypasses proxy and
+      application whitelisting controls.
+    recommended_actions:
+      - Identify downloaded file and quarantine
+      - Check destination URL reputation
+      - Investigate parent process for initial access vector
+      - Block certutil network access via AppLocker/WDAC
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1218 — CertUtil Decode/Encode (Base64 Payload Delivery)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_certutil_decode:
+  name: "CertUtil Decode — Base64 Payload Delivery"
+  description: >
+    Detects certutil.exe being used to decode base64-encoded files. Attackers
+    use certutil -decode to convert downloaded base64 payloads back to
+    executable form, evading content inspection.
+  mitre_attack:
+    - T1140  # Deobfuscate/Decode Files or Information
+  severity: high
+  confidence: 85
+
+  search: |
+    index=sysmon EventCode=1 Image="*\\certutil.exe"
+    (CommandLine="*-decode*" OR CommandLine="*-decodehex*"
+     OR CommandLine="*-encode*" OR CommandLine="*-encodehex*")
+    | stats count values(CommandLine) AS commands values(ParentImage) AS parents
+        BY Computer, User
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "CertUtil Decode on $Computer$ — potential payload delivery"
+    rule_description: >
+      CertUtil used to decode/encode files: $commands$. This technique
+      converts base64-encoded malware to executable form.
+    recommended_actions:
+      - Identify the decoded output file and submit to sandbox
+      - Check for follow-up execution of the decoded file
+      - Review certutil usage patterns on this host
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1218 — CertUtil Certificate Extraction (ADFS Token Signing)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_certutil_export:
+  name: "CertUtil Certificate Extraction — Token Signing Key Theft"
+  description: >
+    Detects certutil.exe extracting PFX certificates which can be used to
+    sign SAML tokens in federated environments like ADFS (Golden SAML attack).
+  mitre_attack:
+    - T1552.004  # Unsecured Credentials: Private Keys
+    - T1649      # Steal or Forge Authentication Certificates
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=sysmon EventCode=1 Image="*\\certutil.exe"
+    CommandLine="*-exportPFX*"
+    | stats count values(CommandLine) AS commands values(ParentImage) AS parents
+        BY Computer, User
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "CertUtil PFX Export on $Computer$ — possible Golden SAML"
+    rule_description: >
+      Certificate exported via certutil -exportPFX: $commands$.
+      Stolen signing certificates enable Golden SAML attacks.
+    recommended_actions:
+      - Determine which certificate was exported
+      - Check if ADFS token signing certificate was targeted
+      - Rotate affected certificates immediately
+      - Investigate for lateral movement to federation servers
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1197 — BITSAdmin Persistence and Download
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_bitsadmin_abuse:
+  name: "BITSAdmin Abuse — Persistence or Remote File Download"
+  description: >
+    Detects bitsadmin.exe creating BITS jobs for persistence (create,
+    setnotifycmdline, resume) or downloading remote files (transfer).
+    BITS jobs survive reboots and run as SYSTEM.
+  mitre_attack:
+    - T1197  # BITS Jobs
+    - T1105  # Ingress Tool Transfer
+  severity: high
+  confidence: 85
+
+  search: |
+    index=sysmon EventCode=1 Image="*\\bitsadmin.exe"
+    (CommandLine="*create*" OR CommandLine="*addfile*"
+     OR CommandLine="*setnotifycmdline*" OR CommandLine="*setnotifyflags*"
+     OR CommandLine="*setminretrydelay*" OR CommandLine="*resume*"
+     OR CommandLine="*transfer*" OR CommandLine="*download*"
+     OR CommandLine="*upload*")
+    | eval abuse_type=case(
+        match(CommandLine, "(?i)transfer|download|upload"), "File transfer",
+        match(CommandLine, "(?i)setnotifycmdline"), "Persistence (notify command)",
+        match(CommandLine, "(?i)create.*addfile.*resume"), "Job creation + execution",
+        true(), "BITS job manipulation"
+      )
+    | stats count values(abuse_type) AS types values(CommandLine) AS commands
+        BY Computer, User
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "BITSAdmin Abuse on $Computer$ — $types$"
+    rule_description: >
+      BITS job abuse: $types$. Commands: $commands$. BITS jobs run as
+      SYSTEM and survive reboots — ideal for persistence and download.
+    recommended_actions:
+      - List active BITS jobs: bitsadmin /list /verbose
+      - Cancel malicious jobs: bitsadmin /cancel <job>
+      - Check notify command for malware execution
+      - Review downloaded files
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1127 — MSBuild / msxsl Proxy Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_msbuild_execution:
+  name: "MSBuild/msxsl Proxy Execution — Inline Task Code Execution"
+  description: >
+    Detects MSBuild.exe or msxsl.exe executing code. MSBuild can compile
+    and run C# code from XML files, bypassing application whitelisting.
+    msxsl processes XSL transformations that can execute scripts.
+  mitre_attack:
+    - T1127.001  # Trusted Developer Utilities Proxy Execution: MSBuild
+    - T1220      # XSL Script Processing
+  severity: high
+  confidence: 85
+
+  search: |
+    index=sysmon EventCode=1
+    (Image="*\\MSBuild.exe" OR Image="*\\msbuild.exe" OR Image="*\\msxsl.exe")
+    ParentImage!="*\\devenv.exe"
+    ParentImage!="*\\MSBuild.exe"
+    | stats count values(CommandLine) AS commands values(ParentImage) AS parents
+        BY Computer, User
+    | sort -count
+
+  throttle: Computer, 600
+  notable:
+    rule_title: "MSBuild/msxsl Proxy Execution on $Computer$"
+    rule_description: >
+      MSBuild or msxsl executed outside Visual Studio: $commands$.
+      Parent: $parents$. MSBuild compiles inline C# from XML,
+      bypassing AppLocker and WDAC.
+    recommended_actions:
+      - Identify the XML/XSL file being processed
+      - Check for inline task code (<Task> elements)
+      - Block MSBuild execution via AppLocker for non-developers
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T1218.003 — CMSTP UAC Bypass / Proxy Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_cmstp_execution:
+  name: "CMSTP Proxy Execution — UAC Bypass / Remote Code Load"
+  description: >
+    Detects CMSTP.exe (Connection Manager Profile Installer) executing with
+    suspicious arguments or making external network connections, indicating
+    abuse for UAC bypass or remote code execution.
+  mitre_attack:
+    - T1218.003  # System Binary Proxy Execution: CMSTP
+  severity: high
+  confidence: 85
+
+  search: |
+    (index=sysmon EventCode=1 Image="*\\CMSTP.exe"
+     (CommandLine="*/s*" OR CommandLine="*/au*"))
+    OR (index=sysmon EventCode=3 Image="*\\CMSTP.exe"
+        | where NOT cidrmatch("10.0.0.0/8", DestinationIp)
+          AND NOT cidrmatch("192.168.0.0/16", DestinationIp)
+          AND NOT cidrmatch("172.16.0.0/12", DestinationIp))
+    | stats count values(CommandLine) AS commands
+        values(DestinationIp) AS external_ips
+        BY Computer, User
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "CMSTP Proxy Execution on $Computer$"
+    rule_description: >
+      CMSTP.exe executed with suspicious args: $commands$.
+      External connections: $external_ips$. CMSTP can bypass
+      UAC and load remote INF-based payloads.
+    recommended_actions:
+      - Identify the INF file being loaded
+      - Block CMSTP execution via AppLocker for non-admin users
+      - Check for UAC bypass indicators
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T1218.010 — Regsvr32 Squiblydoo / Remote COM Scriptlet
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_regsvr32_squiblydoo:
+  name: "Regsvr32 Squiblydoo — Remote COM Scriptlet Execution"
+  description: >
+    Detects regsvr32.exe loading scrobj.dll (COM scriptlet) or executing
+    remote content via /i:http. Squiblydoo bypasses AppLocker by loading
+    COM scriptlets directly from the internet.
+  mitre_attack:
+    - T1218.010  # System Binary Proxy Execution: Regsvr32
+  severity: high
+  confidence: 90
+
+  search: |
+    index=sysmon EventCode=1 Image="*\\regsvr32.exe"
+    (CommandLine="*scrobj*" OR CommandLine="*/i:http*"
+     OR CommandLine="*/i:ftp*")
+    | stats count values(CommandLine) AS commands values(ParentImage) AS parents
+        BY Computer, User
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "Regsvr32 Squiblydoo on $Computer$ — remote scriptlet"
+    rule_description: >
+      Regsvr32 loading remote COM scriptlet: $commands$.
+      Squiblydoo bypasses application whitelisting entirely.
+    recommended_actions:
+      - Block the remote URL/domain at proxy
+      - Investigate parent process for delivery mechanism
+      - Block regsvr32 network access via firewall rule
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T1218.011 — Mavinject DLL Injection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_mavinject_injection:
+  name: "Mavinject DLL Injection — Signed Binary DLL Injection"
+  description: >
+    Detects mavinject.exe or the INJECTRUNNING argument being used to
+    inject DLLs into running processes. Mavinject is a signed Microsoft
+    binary that simplifies DLL injection.
+  mitre_attack:
+    - T1218.013  # System Binary Proxy Execution: Mavinject
+    - T1055.001  # Process Injection: DLL Injection
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=sysmon EventCode=1
+    (Image="*\\mavinject.exe" OR CommandLine="*INJECTRUNNING*")
+    | stats count values(CommandLine) AS commands values(ParentImage) AS parents
+        BY Computer, User
+    | sort -count
+
+  throttle: Computer, 120
+  notable:
+    rule_title: "Mavinject DLL Injection on $Computer$"
+    rule_description: >
+      DLL injection via mavinject.exe: $commands$.
+      Mavinject is a signed Microsoft binary — injection via
+      this tool bypasses most EDR process injection detections.
+    recommended_actions:
+      - Identify the injected DLL and target process
+      - Network-contain the host
+      - Check for LSASS targeting (credential theft)
+      - Block mavinject via AppLocker/WDAC
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 9: T1559.002 — DDE Exploit / Office Child Process
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_9_dde_exploit:
+  name: "DDE Exploit — Office Application Spawning Suspicious Child"
+  description: >
+    Detects Office applications (Word, Excel, Outlook) spawning executable
+    child processes via DDE (Dynamic Data Exchange). DDE allows Office docs
+    to execute arbitrary commands without macros.
+  mitre_attack:
+    - T1559.002  # Inter-Process Communication: DDE
+    - T1204.002  # User Execution: Malicious File
+  severity: high
+  confidence: 85
+
+  search: |
+    index=sysmon EventCode=1
+    ParentImage IN ("*\\WINWORD.EXE", "*\\EXCEL.EXE", "*\\OUTLOOK.EXE",
+                     "*\\POWERPNT.EXE", "*\\MSACCESS.EXE")
+    Image="*.exe"
+    Image NOT IN ("*\\splwow64.exe", "*\\WINWORD.EXE", "*\\EXCEL.EXE")
+    | eval chain=ParentImage + " → " + Image
+    | stats count values(chain) AS chains values(CommandLine) AS commands
+        BY Computer, User
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "DDE Exploit — Office spawned $chains$ on $Computer$"
+    rule_description: >
+      Office application spawned suspicious child: $chains$.
+      Commands: $commands$. DDE exploitation requires no macros
+      and bypasses macro-blocking policies.
+    recommended_actions:
+      - Quarantine the source document
+      - Disable DDE in Office via registry/GPO
+      - Check user's email for the malicious document
+      - Block the child process command line at EDR
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 10: T1564.004 — NTFS Alternate Data Stream Execution
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_10_ntfs_ads_execution:
+  name: "NTFS Alternate Data Stream Execution — Hidden Payload"
+  description: >
+    Detects execution of content from NTFS Alternate Data Streams via
+    PowerShell, wmic, rundll32, wscript, cscript, cmd, ftp, bash, or
+    bitsadmin. ADS can hide malicious content in file metadata.
+  mitre_attack:
+    - T1564.004  # Hide Artifacts: NTFS File Attributes
+  severity: high
+  confidence: 80
+
+  search: |
+    index=sysmon EventCode=1
+    (Image="*\\powershell.exe" OR Image="*\\wmic.exe" OR Image="*\\rundll32.exe"
+     OR Image="*\\wscript.exe" OR Image="*\\cscript.exe" OR Image="*\\cmd.exe"
+     OR Image="*\\ftp.exe" OR Image="*\\bash.exe" OR Image="*\\bitsadmin.exe"
+     OR Image="*\\mavinject.exe")
+    | regex CommandLine="\w+(\.\w+)?:\w+(\.\w+)?"
+    | stats count values(CommandLine) AS commands values(Image) AS executors
+        BY Computer, User
+    | sort -count
+
+  throttle: Computer, 300
+  notable:
+    rule_title: "NTFS ADS Execution on $Computer$ via $executors$"
+    rule_description: >
+      NTFS Alternate Data Stream execution: $commands$.
+      ADS hides malicious content in file metadata, evading
+      file-based security tools and casual inspection.
+    recommended_actions:
+      - Scan the source file for alternate data streams (dir /r)
+      - Remove malicious ADS content
+      - Check for persistence mechanisms using ADS

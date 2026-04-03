@@ -1,0 +1,253 @@
+# ==============================================================================
+#  Network Threat Indicator Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detects network-level threat indicators — TOR traffic,
+#                rogue DNS queries, unencrypted sensitive communications,
+#                large data uploads (exfiltration), and network share
+#                manipulation for anti-forensics.
+#  MITRE ATT&CK: T1048, T1071, T1090, T1048, T1070, T1571
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T1090.003 — TOR Traffic Detection
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_tor_traffic:
+  name: "TOR Traffic Detected — Anonymous Network Communication"
+  description: >
+    Detects TOR traffic identified by firewall application ID or known
+    TOR exit node connections. TOR is used for anonymization by both
+    attackers (C2, exfiltration) and insiders (policy bypass).
+  mitre_attack:
+    - T1090.003  # Proxy: Multi-hop Proxy
+    - T1573      # Encrypted Channel
+  severity: high
+  confidence: 85
+
+  search: |
+    index=network sourcetype=firewall_data
+    (app="tor" OR app="tor-ssl" OR dest_port IN (9001, 9030, 9050, 9051, 9150))
+    src_ip="*"
+    | stats count sum(bytes) AS total_bytes
+        dc(dest_ip) AS unique_dests
+        values(dest_ip) AS tor_nodes
+        values(dest_port) AS ports
+        min(_time) AS first max(_time) AS last
+        BY src_ip
+    | eval mb_transferred=round(total_bytes/1024/1024, 2)
+    | sort -count
+
+  throttle: src_ip, 600
+  notable:
+    rule_title: "TOR Traffic from $src_ip$ — $count$ connections, $mb_transferred$ MB"
+    rule_description: >
+      Host $src_ip$ connected to $unique_dests$ TOR nodes via
+      ports $ports$. $mb_transferred$ MB transferred. TOR usage
+      from corporate endpoints indicates policy violation or
+      active data exfiltration attempt.
+    recommended_actions:
+      - Investigate the source host and user
+      - Block TOR exit nodes at firewall (use TOR exit node list)
+      - Check for data exfiltration during TOR sessions
+      - Review DLP logs for sensitive data transfer
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T1071.004 — Rogue DNS Detection (Unauthorized DNS Server)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_rogue_dns:
+  name: "Rogue DNS — Queries to Unauthorized DNS Servers"
+  description: >
+    Detects DNS queries (port 53) not destined for the authorized
+    corporate DNS servers. Rogue DNS allows attackers to bypass DNS-based
+    security controls, resolve C2 domains, and perform DNS tunneling.
+  mitre_attack:
+    - T1071.004  # Application Layer Protocol: DNS
+    - T1568      # Dynamic Resolution
+  severity: high
+  confidence: 85
+
+  search: |
+    index=network sourcetype=firewall_data
+    dest_port=53 action!="drop"
+    NOT [| inputlookup authorized_dns_servers | fields ip | rename ip AS dest_ip]
+    | where cidrmatch("10.0.0.0/8", src_ip) OR cidrmatch("192.168.0.0/16", src_ip)
+        OR cidrmatch("172.16.0.0/12", src_ip)
+    | stats count dc(dest_ip) AS rogue_servers
+        values(dest_ip) AS dns_destinations
+        BY src_ip
+    | where count > 5
+    | sort -count
+
+  throttle: src_ip, 600
+  notable:
+    rule_title: "Rogue DNS from $src_ip$ → $dns_destinations$"
+    rule_description: >
+      Host $src_ip$ sent $count$ DNS queries to unauthorized DNS
+      server(s): $dns_destinations$ ($rogue_servers$ unique).
+      Rogue DNS bypasses corporate DNS security and filtering.
+    recommended_actions:
+      - Block outbound DNS (port 53) except to authorized servers
+      - Investigate source host for malware configuring custom DNS
+      - Check if DNS-over-HTTPS is being used to bypass controls
+      - Force all DNS through corporate resolvers via GPO
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T1048 — Large Web Upload / Data Exfiltration
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_large_web_upload:
+  name: "Large Web Upload — Potential Data Exfiltration"
+  description: >
+    Detects outbound web uploads exceeding 35 MB through the web proxy.
+    Large uploads to external destinations may indicate data exfiltration
+    via web applications, cloud storage, or attacker-controlled servers.
+  mitre_attack:
+    - T1048  # Exfiltration Over Alternative Protocol
+    - T1567  # Exfiltration Over Web Service
+  severity: high
+  confidence: 75
+
+  search: |
+    index=proxy sourcetype=websense* OR sourcetype=bluecoat* OR sourcetype=squid*
+    | where bytes_out > 35000000
+    | eval mb_out=round(bytes_out/1024/1024, 2)
+    | lookup user_department user OUTPUT department
+    | table _time, src_ip, user, department, mb_out, uri, dest_ip, http_method
+    | sort -mb_out
+
+  throttle: src_ip, 3600
+  notable:
+    rule_title: "Large Upload — $src_ip$ ($user$) uploaded $mb_out$ MB"
+    rule_description: >
+      $user$ ($src_ip$) uploaded $mb_out$ MB to $uri$.
+      Large uploads require investigation for data exfiltration.
+    recommended_actions:
+      - Identify what data was uploaded
+      - Check the destination URL/domain reputation
+      - Review DLP logs for sensitive content
+      - Interview the user if needed
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T1071 — Unencrypted Sensitive Application Traffic
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_unencrypted_traffic:
+  name: "Unencrypted Sensitive Application Traffic"
+  description: >
+    Detects sensitive business applications communicating over HTTP instead
+    of HTTPS (port 443). Unencrypted traffic can be intercepted for
+    credential theft and data exposure.
+  mitre_attack:
+    - T1071.001  # Application Layer Protocol: Web Protocols
+    - T1557      # Adversary-in-the-Middle
+  severity: medium
+  confidence: 80
+
+  search: |
+    index=network sourcetype=firewall_data
+    dest_port!=443
+    app IN ("workday*", "salesforce*", "servicenow*", "sap*",
+            "oracle*", "sharepoint*", "confluence*", "jira*")
+    | stats count values(app) AS applications
+        dc(src_ip) AS unique_sources
+        values(src_ip) AS sources
+        BY dest_ip, dest_port
+    | sort -count
+
+  throttle: dest_ip, 3600
+  notable:
+    rule_title: "Unencrypted Traffic to $applications$ on port $dest_port$"
+    rule_description: >
+      $unique_sources$ hosts accessing $applications$ on non-HTTPS
+      port $dest_port$. Unencrypted sensitive traffic exposes
+      credentials and business data to interception.
+    recommended_actions:
+      - Force HTTPS for all sensitive applications
+      - Check for SSL/TLS stripping attacks
+      - Update application configurations to require encryption
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T1070.005 — Network Share Removal (Anti-Forensics)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_share_removal:
+  name: "Network Share Removal — Post-Exfiltration Cleanup"
+  description: >
+    Detects removal of network shares via net.exe, Remove-SmbShare, or
+    Remove-FileShare. Attackers remove shares after exfiltrating data
+    to cover their tracks.
+  mitre_attack:
+    - T1070.005  # Indicator Removal: Network Share Connection Removal
+  severity: medium
+  confidence: 80
+
+  search: |
+    index=sysmon EventCode=1
+    ((Image="*\\net.exe" AND CommandLine="*delete*")
+     OR CommandLine="*Remove-SmbShare*"
+     OR CommandLine="*Remove-FileShare*")
+    | stats count values(CommandLine) AS commands values(ParentImage) AS parents
+        BY Computer, User
+    | sort -count
+
+  throttle: Computer, 600
+  notable:
+    rule_title: "Network Share Removal on $Computer$ by $User$"
+    rule_description: >
+      Network shares removed: $commands$. Share removal after
+      data access indicates post-exfiltration cleanup activity.
+    recommended_actions:
+      - Check what shares existed before removal
+      - Review file access logs for the removed shares
+      - Investigate if data was copied/exfiltrated before removal
+      - Check for concurrent lateral movement
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: — Recurring Malware Detection (AV Evasion Failure)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_recurring_malware:
+  name: "Recurring Malware — Persistent Infection After Remediation"
+  description: >
+    Detects malware that recurs on a host after being removed — indicating
+    a persistence mechanism that antivirus is not fully cleaning.
+  mitre_attack:
+    - T1547  # Boot or Logon Autostart Execution
+  severity: high
+  confidence: 85
+
+  search: |
+    index=av sourcetype=symantec:* OR sourcetype=sep:*
+      OR sourcetype=mcafee:* OR sourcetype=defender:*
+    | stats count range(_time) AS time_range
+        values(action) AS actions
+        BY Risk_Name, Computer_Name
+    | where time_range > 1800 AND count > 1
+    | eval hours=round(time_range/3600, 1)
+    | eval days=round(time_range/86400, 1)
+    | sort -count
+
+  throttle: Computer_Name, 3600
+  notable:
+    rule_title: "Recurring Malware — $Risk_Name$ on $Computer_Name$ ($days$ days)"
+    rule_description: >
+      Malware $Risk_Name$ detected $count$ times on $Computer_Name$
+      over $hours$ hours ($days$ days). Actions taken: $actions$.
+      Recurring detection indicates a persistence mechanism.
+    recommended_actions:
+      - Do not rely on AV alone — full forensic investigation needed
+      - Check for persistence mechanisms (services, scheduled tasks, registry)
+      - Re-image the host if persistence cannot be identified
+      - Block the malware hash across the enterprise
