@@ -1,0 +1,435 @@
+# ==============================================================================
+#  ICS/OT Network Anomaly Detection — Splunk Correlation Rules
+# ==============================================================================
+#  Description : Detects anomalous network traffic patterns in ICS/OT
+#                environments — unauthorized protocol usage, unusual traffic
+#                between IT/OT zones, rogue device connections, protocol-level
+#                anomalies in Modbus, DNP3, EtherNet/IP, S7comm, and OPC UA.
+#  MITRE ATT&CK: T0801, T0830, T0855, T0826, T0846, T0886
+#  ICS Kill Chain: Reconnaissance, Lateral Movement, Collection
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. OT network traffic mirrored to Splunk via SPAN/TAP:
+#       - Modbus TCP (port 502)
+#       - DNP3 (port 20000)
+#       - EtherNet/IP (port 44818)
+#       - S7comm (port 102)
+#       - OPC UA (port 4840)
+#       - BACnet (port 47808)
+#       - PROFINET (ethertype 0x8892)
+#
+#  2. Zeek/Bro or Suricata with ICS protocol parsers deployed on OT network:
+#       sourcetype=zeek:conn, zeek:modbus, zeek:dnp3, zeek:s7comm
+#       sourcetype=suricata:eve
+#
+#  3. Firewall logs from IT/OT boundary devices:
+#       sourcetype=pan:traffic, cisco:asa, fortinet:traffic
+#
+#  4. Asset inventory indexed in Splunk (lookup: ot_asset_inventory):
+#       Fields: ip, hostname, device_type, vendor, zone, criticality
+#
+#  5. Baseline ICS traffic patterns (lookup: ics_traffic_baseline):
+#       Fields: src_ip, dst_ip, protocol, port, expected_direction, freq
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T0846 — IT-to-OT Zone Breach: Unauthorized Cross-Zone Traffic
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_it_to_ot_zone_breach:
+  name: "IT-to-OT Zone Breach — Unauthorized Cross-Zone Traffic"
+  description: >
+    Detects network traffic from IT zone hosts attempting to reach OT/ICS
+    zone devices that are not in the approved cross-zone access list.
+    This is the most critical early indicator of an IT-to-OT pivot.
+  mitre_attack:
+    - T0846  # Remote System Discovery
+    - T0886  # Remote Services
+  severity: critical
+  confidence: 90
+  risk_score: 95
+
+  search: |
+    index=firewall sourcetype IN ("pan:traffic", "cisco:asa", "fortinet:traffic")
+    action IN ("allowed", "accept", "pass")
+    [| inputlookup ot_asset_inventory WHERE zone="OT" | fields ip | rename ip AS dest_ip]
+    NOT [| inputlookup approved_crosszone_access | fields src_ip, dest_ip]
+    | eval src_zone=case(
+        cidrmatch("10.0.0.0/16", src_ip), "IT",
+        cidrmatch("172.16.0.0/16", src_ip), "OT",
+        cidrmatch("192.168.0.0/16", src_ip), "DMZ",
+        true(), "UNKNOWN"
+      )
+    | where src_zone="IT"
+    | stats count min(_time) AS first_seen max(_time) AS last_seen
+        dc(dest_ip) AS unique_ot_targets
+        values(dest_ip) AS ot_targets
+        values(dest_port) AS ports
+        BY src_ip
+    | where count > 3
+    | sort -count
+
+  throttle: src_ip, 300
+  notable:
+    rule_title: "IT-to-OT Zone Breach from $src_ip$"
+    rule_description: >
+      Host $src_ip$ in the IT zone made $count$ connections to
+      $unique_ot_targets$ OT devices: $ot_targets$. This violates
+      IT/OT segmentation and may indicate lateral movement into
+      the industrial control network.
+    drilldown_search: |
+      index=firewall src_ip="$src_ip$" dest_ip IN ($ot_targets$)
+      | table _time src_ip dest_ip dest_port action bytes_sent bytes_received
+    recommended_actions:
+      - Immediately block source IP at IT/OT boundary firewall
+      - Isolate the source host from the network
+      - Review host for compromise indicators (EDR alerts, C2 beacons)
+      - Check if source IP is a jump server or approved admin workstation
+      - Engage ICS incident response team
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T0801 — Unauthorized Modbus TCP Traffic
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_unauthorized_modbus_traffic:
+  name: "Unauthorized Modbus TCP Traffic — Rogue Controller Communication"
+  description: >
+    Detects Modbus TCP (port 502) traffic from sources not in the authorized
+    HMI/SCADA controller list. Modbus has no authentication — any device
+    that can reach port 502 can read/write PLC registers.
+  mitre_attack:
+    - T0801  # Monitor Process State
+    - T0855  # Unauthorized Command Message
+  severity: critical
+  confidence: 85
+
+  search: |
+    index=zeek sourcetype="zeek:conn" id.resp_p=502
+    NOT [| inputlookup authorized_modbus_clients | fields src_ip | rename src_ip AS id.orig_h]
+    | lookup ot_asset_inventory ip AS id.resp_h OUTPUT hostname AS dest_device device_type criticality
+    | stats count min(_time) AS first_seen max(_time) AS last_seen
+        values(dest_device) AS target_devices
+        dc(id.resp_h) AS unique_targets
+        BY id.orig_h
+    | where count > 0
+    | rename id.orig_h AS src_ip
+    | sort -count
+
+  throttle: src_ip, 600
+  notable:
+    rule_title: "Unauthorized Modbus Client $src_ip$ → $unique_targets$ PLC(s)"
+    rule_description: >
+      Host $src_ip$ sent Modbus TCP traffic to $unique_targets$ PLC(s):
+      $target_devices$. This source is NOT in the authorized HMI/SCADA
+      controller list. Modbus has no authentication — this host could
+      read sensor data or write commands to PLCs.
+    recommended_actions:
+      - Block source at OT firewall immediately
+      - Investigate source host identity and purpose
+      - Check PLC registers for unauthorized writes (holding registers 40001+)
+      - Review OT firewall rules for Modbus port 502 access
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T0855 — Modbus Write to Critical Registers (Coils/Holdings)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_modbus_write_operations:
+  name: "Modbus Write to Critical Registers — Potential Process Manipulation"
+  description: >
+    Detects Modbus function codes 5 (Write Single Coil), 6 (Write Single Register),
+    15 (Write Multiple Coils), 16 (Write Multiple Registers) targeting PLC registers.
+    Write operations outside maintenance windows or from unauthorized sources
+    could indicate process manipulation attacks (e.g., TRITON, Industroyer).
+  mitre_attack:
+    - T0855  # Unauthorized Command Message
+    - T0831  # Manipulation of Control
+  severity: high
+  confidence: 80
+
+  search: |
+    index=zeek sourcetype="zeek:modbus"
+    func IN ("WRITE_SINGLE_COIL", "WRITE_SINGLE_REGISTER",
+             "WRITE_MULTIPLE_COILS", "WRITE_MULTIPLE_REGISTERS",
+             "FORCE_LISTEN_ONLY_MODE")
+    | lookup ot_asset_inventory ip AS id.resp_h
+        OUTPUT hostname AS plc_name device_type criticality
+    | lookup authorized_modbus_clients src_ip AS id.orig_h
+        OUTPUT role AS client_role
+    | eval is_maintenance=if(
+        date_hour >= 2 AND date_hour <= 5 AND date_wday IN ("saturday","sunday"),
+        "yes", "no"
+      )
+    | where is_maintenance="no" OR isnull(client_role)
+    | stats count min(_time) AS first_seen max(_time) AS last_seen
+        values(func) AS write_functions
+        values(plc_name) AS target_plcs
+        BY id.orig_h, id.resp_h
+    | rename id.orig_h AS src_ip id.resp_h AS dest_ip
+    | sort -count
+
+  throttle: src_ip, 300
+  notable:
+    rule_title: "Modbus Write Operations from $src_ip$ to PLC $target_plcs$"
+    rule_description: >
+      $count$ Modbus write operations ($write_functions$) detected from
+      $src_ip$ to PLC $target_plcs$ ($dest_ip$) outside maintenance window.
+      This could indicate unauthorized process manipulation.
+    recommended_actions:
+      - Verify with OT operator if writes are authorized
+      - Check PLC logic for unexpected changes
+      - Capture full Modbus register state for forensic comparison
+      - Block source if unauthorized
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T0830 — DNP3 Unauthorized Control Commands
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_dnp3_control_commands:
+  name: "DNP3 Unauthorized Control Commands — RTU/FRTU Manipulation"
+  description: >
+    Detects DNP3 control relay output block (CROB) commands and analog output
+    commands sent to RTUs/FRTUs from unauthorized sources. DNP3 is commonly
+    used in power grid, water treatment, and oil/gas SCADA systems.
+  mitre_attack:
+    - T0830  # Man in the Middle (ICS)
+    - T0855  # Unauthorized Command Message
+  severity: critical
+  confidence: 85
+
+  search: |
+    index=zeek sourcetype="zeek:dnp3"
+    fc IN ("DIRECT_OPERATE", "SELECT", "OPERATE",
+           "DIRECT_OPERATE_NO_ACK", "COLD_RESTART", "WARM_RESTART")
+    NOT [| inputlookup authorized_dnp3_masters | fields master_ip | rename master_ip AS id.orig_h]
+    | lookup ot_asset_inventory ip AS id.resp_h
+        OUTPUT hostname AS rtu_name device_type
+    | stats count min(_time) AS first_seen max(_time) AS last_seen
+        values(fc) AS commands
+        values(rtu_name) AS target_rtus
+        BY id.orig_h, id.resp_h
+    | rename id.orig_h AS src_ip id.resp_h AS dest_ip
+    | sort -count
+
+  throttle: src_ip, 300
+  notable:
+    rule_title: "DNP3 Control Commands from Unauthorized Source $src_ip$"
+    rule_description: >
+      $count$ DNP3 control commands ($commands$) sent from unauthorized
+      source $src_ip$ to RTU(s) $target_rtus$. Commands include operate,
+      select, or restart functions that can manipulate physical processes.
+    recommended_actions:
+      - Immediately isolate source from OT network
+      - Verify RTU state and physical process integrity
+      - Capture DNP3 packet captures for forensic analysis
+      - Check for cold/warm restart commands (indicates attempted DoS)
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T0855 — S7comm Unauthorized PLC Programming (Siemens)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_s7comm_plc_programming:
+  name: "S7comm Unauthorized PLC Programming — Siemens Controller"
+  description: >
+    Detects S7comm protocol operations indicating PLC programming activity
+    (download block, upload block, delete block, PLC stop/start) from
+    unauthorized engineering workstations. Targets Siemens S7-300/400/1200/1500 PLCs.
+  mitre_attack:
+    - T0843  # Program Download (ICS)
+    - T0889  # Modify Program
+  severity: critical
+  confidence: 90
+
+  search: |
+    index=zeek sourcetype="zeek:s7comm" OR
+    index=ids sourcetype="suricata:eve" alert.signature_id IN (2024800..2024899)
+    [| search index=network dest_port=102
+       NOT [| inputlookup authorized_engineering_workstations | fields ip | rename ip AS src_ip]]
+    | eval operation=case(
+        match(s7comm_function, "(?i)download"), "DOWNLOAD_BLOCK",
+        match(s7comm_function, "(?i)upload"), "UPLOAD_BLOCK",
+        match(s7comm_function, "(?i)delete"), "DELETE_BLOCK",
+        match(s7comm_function, "(?i)stop"), "PLC_STOP",
+        match(s7comm_function, "(?i)start"), "PLC_START",
+        match(s7comm_function, "(?i)program"), "PROGRAM_MODIFY",
+        true(), s7comm_function
+      )
+    | where operation IN ("DOWNLOAD_BLOCK", "DELETE_BLOCK", "PLC_STOP",
+                          "PLC_START", "PROGRAM_MODIFY")
+    | lookup ot_asset_inventory ip AS dest_ip OUTPUT hostname AS plc_name
+    | stats count min(_time) AS first_seen max(_time) AS last_seen
+        values(operation) AS operations
+        values(plc_name) AS target_plcs
+        BY src_ip, dest_ip
+    | sort -count
+
+  throttle: src_ip, 120
+  notable:
+    rule_title: "S7comm PLC Programming from $src_ip$ → $target_plcs$"
+    rule_description: >
+      $count$ S7comm programming operations ($operations$) from $src_ip$
+      to Siemens PLC(s) $target_plcs$. Source is NOT an authorized
+      engineering workstation. PLC logic modifications can cause
+      physical process disruption or safety system bypass.
+    recommended_actions:
+      - CRITICAL — Isolate source immediately
+      - Compare current PLC program against known-good backup
+      - Check for PLC stop/start commands (process disruption)
+      - Engage Siemens support for program integrity verification
+      - Activate ICS incident response plan
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T0826 — OPC UA Unauthorized Data Access
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_opcua_unauthorized_access:
+  name: "OPC UA Unauthorized Data Access — Process Data Exfiltration"
+  description: >
+    Detects OPC UA (port 4840) connections from unauthorized clients reading
+    process data. OPC UA is the modern standard for ICS data exchange and
+    provides access to real-time process values, historian data, and alarms.
+  mitre_attack:
+    - T0801  # Monitor Process State
+    - T0802  # Automated Collection
+  severity: high
+  confidence: 80
+
+  search: |
+    index=network dest_port=4840
+    NOT [| inputlookup authorized_opcua_clients | fields ip | rename ip AS src_ip]
+    | lookup ot_asset_inventory ip AS dest_ip
+        OUTPUT hostname AS server_name device_type zone
+    | where zone="OT"
+    | stats count min(_time) AS first_seen max(_time) AS last_seen
+        dc(dest_ip) AS unique_servers
+        values(server_name) AS opcua_servers
+        sum(bytes_out) AS data_volume
+        BY src_ip
+    | eval data_volume_mb=round(data_volume/1024/1024, 2)
+    | where count > 5
+    | sort -count
+
+  throttle: src_ip, 600
+  notable:
+    rule_title: "OPC UA Unauthorized Access from $src_ip$ ($data_volume_mb$ MB)"
+    rule_description: >
+      Unauthorized client $src_ip$ connected to $unique_servers$ OPC UA
+      server(s): $opcua_servers$. Transferred $data_volume_mb$ MB of
+      process data. This may indicate reconnaissance or data exfiltration
+      from the industrial control system.
+    recommended_actions:
+      - Block source at OT firewall
+      - Review OPC UA server audit logs for accessed nodes/tags
+      - Check if source is a compromised HMI or historian
+      - Verify OPC UA server authentication is enabled (certificate-based)
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: T0846 — Rogue Device on OT Network (MAC Address Anomaly)
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_7_rogue_device_detection:
+  name: "Rogue Device on OT Network — Unknown MAC/IP Address"
+  description: >
+    Detects new MAC addresses or IP addresses appearing on the OT network
+    that are not in the asset inventory. Rogue devices in OT networks are
+    a critical threat — a single laptop or Raspberry Pi can bridge air gaps.
+  mitre_attack:
+    - T0846  # Remote System Discovery
+    - T0886  # Remote Services
+  severity: high
+  confidence: 85
+
+  search: |
+    index=network sourcetype IN ("zeek:conn", "zeek:dhcp", "pan:traffic")
+    [| inputlookup ot_network_subnets | fields subnet | rename subnet AS src_subnet]
+    NOT [| inputlookup ot_asset_inventory | fields ip | rename ip AS src_ip]
+    NOT [| inputlookup ot_asset_inventory | fields mac | rename mac AS src_mac]
+    | where isnotnull(src_mac) OR isnotnull(src_ip)
+    | stats count min(_time) AS first_seen max(_time) AS last_seen
+        values(src_mac) AS mac_addresses
+        values(dest_ip) AS contacted_hosts
+        values(dest_port) AS ports
+        dc(dest_ip) AS unique_targets
+        BY src_ip
+    | sort -count
+
+  throttle: src_ip, 900
+  notable:
+    rule_title: "Rogue Device Detected in OT Network: $src_ip$"
+    rule_description: >
+      Unknown device $src_ip$ (MAC: $mac_addresses$) appeared on the OT
+      network and contacted $unique_targets$ host(s). This device is NOT
+      in the OT asset inventory. Rogue devices in OT can bypass air gaps
+      and enable remote access for attackers.
+    recommended_actions:
+      - Physically locate and disconnect the device immediately
+      - Trace the switch port via MAC address table
+      - Check if the device was authorized by OT operations
+      - Scan the device for malware before any reconnection
+      - Update OT asset inventory if device is legitimate
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: T0855 — ICS Protocol Scan / Fingerprinting
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_8_ics_protocol_scanning:
+  name: "ICS Protocol Scanning — Multi-Protocol Fingerprinting"
+  description: >
+    Detects a single source scanning multiple ICS protocol ports (Modbus 502,
+    DNP3 20000, EtherNet/IP 44818, S7comm 102, BACnet 47808, OPC UA 4840).
+    This is a strong indicator of ICS reconnaissance, commonly seen in
+    TRITON, Industroyer, and PIPEDREAM attack frameworks.
+  mitre_attack:
+    - T0846  # Remote System Discovery
+    - T0888  # Remote System Information Discovery
+  severity: critical
+  confidence: 95
+
+  search: |
+    index=network dest_port IN (102, 502, 2222, 4840, 4843, 20000, 44818, 47808)
+    | eval ics_protocol=case(
+        dest_port=102, "S7comm",
+        dest_port=502, "Modbus",
+        dest_port=2222, "EtherNet/IP-Explicit",
+        dest_port=4840 OR dest_port=4843, "OPC-UA",
+        dest_port=20000, "DNP3",
+        dest_port=44818, "EtherNet/IP",
+        dest_port=47808, "BACnet"
+      )
+    | stats count dc(dest_port) AS unique_protocols
+        dc(dest_ip) AS unique_targets
+        values(ics_protocol) AS protocols_scanned
+        values(dest_ip) AS targets
+        min(_time) AS first_seen max(_time) AS last_seen
+        BY src_ip
+    | where unique_protocols >= 2
+    | sort -unique_protocols -count
+
+  throttle: src_ip, 300
+  notable:
+    rule_title: "ICS Protocol Scan from $src_ip$ — $unique_protocols$ protocols"
+    rule_description: >
+      Host $src_ip$ scanned $unique_protocols$ ICS protocols ($protocols_scanned$)
+      across $unique_targets$ targets. Multi-protocol ICS scanning is a hallmark
+      of advanced ICS attack frameworks (PIPEDREAM, Industroyer, TRITON).
+    recommended_actions:
+      - CRITICAL — Isolate source from OT network immediately
+      - Block source at all IT/OT boundary firewalls
+      - Full forensic investigation of source host
+      - Check all scanned PLCs/RTUs for unauthorized changes
+      - Activate ICS-CERT incident response procedures

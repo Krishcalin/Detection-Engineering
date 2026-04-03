@@ -1,0 +1,317 @@
+# ==============================================================================
+#  ICS/OT Process Anomaly & Operational Impact Detection — Splunk Rules
+# ==============================================================================
+#  Description : Detects anomalous operational behaviors in ICS/OT environments
+#                — abnormal setpoint changes, sensor spoofing, historian
+#                tampering, denial of control/view, and operator impersonation.
+#  MITRE ATT&CK: T0806, T0813, T0814, T0815, T0826, T0827, T0829, T0831
+#  ICS Kill Chain: Impact, Inhibit Response Function, Impair Process Control
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-03
+#  License      : MIT
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Process historian data indexed in Splunk:
+#       sourcetype=ot:historian (PI, Honeywell PHD, Wonderware, OSIsoft)
+#       Fields: tag_name, value, quality, timestamp, source_device
+#
+#  2. OT alarm/event data:
+#       sourcetype=ot:alarms
+#       Fields: alarm_id, alarm_text, priority, area, acknowledged
+#
+#  3. Operator authentication logs:
+#       sourcetype=ot:auth (HMI login, SCADA auth)
+#
+#  4. Process baseline thresholds (lookup: process_baselines):
+#       Fields: tag_name, min_value, max_value, rate_of_change_max, unit
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: T0806 — Abnormal Setpoint Change Beyond Safe Limits
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_1_abnormal_setpoint_change:
+  name: "Abnormal Setpoint Change — Process Value Beyond Safe Operating Limits"
+  description: >
+    Detects process setpoint changes that push values outside known safe
+    operating limits. Attackers manipulating setpoints can cause equipment
+    damage, environmental releases, or production quality issues.
+  mitre_attack:
+    - T0806  # Brute Force I/O
+    - T0836  # Modify Parameter
+  severity: critical
+  confidence: 85
+
+  search: |
+    index=ot_historian sourcetype="ot:historian"
+    tag_type="setpoint"
+    | lookup process_baselines tag_name OUTPUT min_value max_value unit
+    | where isnotnull(min_value) AND (value < min_value OR value > max_value)
+    | eval deviation=case(
+        value < min_value, round(((min_value - value) / min_value) * 100, 1),
+        value > max_value, round(((value - max_value) / max_value) * 100, 1)
+      )
+    | eval direction=if(value < min_value, "BELOW minimum", "ABOVE maximum")
+    | lookup ot_asset_inventory ip AS source_device OUTPUT hostname zone
+    | stats count min(_time) AS first max(_time) AS last
+        values(tag_name) AS affected_tags
+        max(deviation) AS max_deviation_pct
+        values(direction) AS directions
+        BY source_device, hostname
+    | where count > 0
+    | sort -max_deviation_pct
+
+  throttle: source_device, 300
+  notable:
+    rule_title: "Abnormal Setpoint: $affected_tags$ $directions$ ($max_deviation_pct$% deviation)"
+    rule_description: >
+      Process setpoints on $hostname$ ($source_device$) have been pushed
+      $directions$ safe operating limits by $max_deviation_pct$%.
+      Affected tags: $affected_tags$. This may indicate an attack
+      attempting to cause physical process disruption.
+    recommended_actions:
+      - Verify setpoint changes with control room operator
+      - Check if changes were made via authorized HMI or remotely
+      - Revert setpoints to safe values immediately if unauthorized
+      - Review recent PLC program changes and operator login activity
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: T0813 — Denial of View: HMI/SCADA Display Manipulation
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_2_denial_of_view:
+  name: "Denial of View — HMI/SCADA Display Anomaly"
+  description: >
+    Detects conditions where HMI/SCADA operators may be seeing manipulated
+    or stale data — sensor values frozen, quality flags changed, or
+    historian data gaps. Attackers use denial of view to hide ongoing
+    process manipulation from operators.
+  mitre_attack:
+    - T0813  # Denial of View
+    - T0829  # Loss of View
+  severity: high
+  confidence: 75
+
+  search: |
+    index=ot_historian sourcetype="ot:historian"
+    | streamstats count AS event_count range(value) AS value_range
+        window=20 BY tag_name
+    | where value_range=0 AND event_count >= 20
+    | stats count min(_time) AS frozen_since
+        values(tag_name) AS frozen_tags
+        values(value) AS stuck_values
+        BY source_device
+    | lookup ot_asset_inventory ip AS source_device OUTPUT hostname device_type
+    | where count > 0
+    | eval frozen_minutes=round((now() - frozen_since) / 60, 0)
+    | where frozen_minutes > 15
+    | sort -frozen_minutes
+
+  throttle: source_device, 900
+  notable:
+    rule_title: "Denial of View — $frozen_tags$ frozen for $frozen_minutes$ min"
+    rule_description: >
+      Sensor values from $hostname$ ($source_device$) have been frozen
+      at $stuck_values$ for $frozen_minutes$ minutes. Tags: $frozen_tags$.
+      Frozen sensor data may indicate replay attacks or sensor spoofing
+      to hide ongoing process manipulation from operators.
+    recommended_actions:
+      - Physically verify sensor readings at the field device
+      - Check communication path between sensor and historian
+      - Compare HMI display values with actual field device readings
+      - Look for concurrent Modbus/DNP3 write operations (process manipulation)
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: T0827 — Loss of Communication with ICS Devices
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_3_loss_of_communication:
+  name: "Loss of Communication — PLC/RTU Offline Detection"
+  description: >
+    Detects when PLCs, RTUs, or safety controllers stop communicating.
+    Loss of communication can indicate device crash (from exploit),
+    network segmentation attack, or physical disconnection as part of
+    a multi-stage ICS attack.
+  mitre_attack:
+    - T0827  # Loss of Communication
+    - T0814  # Denial of Service
+  severity: high
+  confidence: 80
+
+  search: |
+    | inputlookup ot_asset_inventory WHERE device_type IN ("PLC", "RTU", "SIS", "ESD")
+    | fields ip hostname device_type criticality zone
+    | join type=left ip
+      [search index=network sourcetype="zeek:conn" earliest=-15m
+       | stats max(_time) AS last_seen BY id.resp_h
+       | rename id.resp_h AS ip]
+    | eval minutes_since_seen=round((now() - last_seen) / 60, 0)
+    | where isnull(last_seen) OR minutes_since_seen > 10
+    | eval status=if(isnull(last_seen), "NEVER SEEN", "OFFLINE " + minutes_since_seen + " min")
+    | sort -criticality
+    | table hostname ip device_type criticality zone status minutes_since_seen
+
+  throttle: ip, 600
+  notable:
+    rule_title: "ICS Device Offline — $hostname$ ($device_type$)"
+    rule_description: >
+      $device_type$ $hostname$ ($ip$) in zone $zone$ has not
+      communicated for $minutes_since_seen$ minutes. Criticality: $criticality$.
+      Unexpected device offline events during an active attack
+      indicate denial of control or device compromise.
+    recommended_actions:
+      - Check physical device status (power, network link)
+      - Verify network path (switches, firewalls, cables)
+      - If device was recently accessed remotely, investigate for exploitation
+      - For SIS/ESD devices, activate manual safety procedures
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: T0826 — Unauthorized Operator Action / Impersonation
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_4_operator_impersonation:
+  name: "Unauthorized Operator Action — Credential Misuse or Impersonation"
+  description: >
+    Detects operator accounts logging into HMI/SCADA systems from unusual
+    locations, at unusual times, or performing actions inconsistent with
+    their role. In ICS environments, operators often share credentials —
+    making impersonation detection critical.
+  mitre_attack:
+    - T0826  # Loss of Availability
+    - T0859  # Valid Accounts
+  severity: high
+  confidence: 75
+
+  search: |
+    index=ot_auth sourcetype="ot:auth" action="login"
+    | lookup ot_operator_baselines username
+        OUTPUT usual_hours usual_stations usual_zone
+    | eval is_unusual_time=if(
+        NOT match(date_hour, usual_hours), "yes", "no"
+      )
+    | eval is_unusual_station=if(
+        NOT match(src_host, usual_stations), "yes", "no"
+      )
+    | where is_unusual_time="yes" OR is_unusual_station="yes"
+    | stats count min(_time) AS first max(_time) AS last
+        values(src_host) AS login_stations
+        values(src_ip) AS login_ips
+        BY username
+    | sort -count
+
+  throttle: username, 600
+  notable:
+    rule_title: "Unusual Operator Login — $username$ from $login_stations$"
+    rule_description: >
+      Operator $username$ logged in from unusual station(s) $login_stations$
+      ($login_ips$) or at an unusual time. $count$ anomalous logins detected.
+      In ICS environments, operator impersonation can mask unauthorized
+      process changes.
+    recommended_actions:
+      - Verify with the operator if the login was legitimate
+      - Check for concurrent logins (same account, multiple stations)
+      - Review any process changes made during this session
+      - If unauthorized, immediately lock the account and investigate
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: T0815 — Alarm Suppression / Flood Attack
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_5_alarm_suppression_flood:
+  name: "Alarm Suppression or Flood — Operator Awareness Attack"
+  description: >
+    Detects alarm suppression (critical alarms being inhibited/shelved en masse)
+    or alarm flooding (thousands of alarms generated to overwhelm operators).
+    Both techniques are used to impair operator situational awareness
+    during ICS attacks.
+  mitre_attack:
+    - T0815  # Denial of View
+    - T0878  # Alarm Suppression
+  severity: high
+  confidence: 80
+
+  search: |
+    index=ot_alarms sourcetype="ot:alarms"
+    | bucket _time span=5m
+    | stats count dc(alarm_id) AS unique_alarms
+        sum(eval(if(action="suppress" OR action="inhibit" OR action="shelve", 1, 0)))
+          AS suppressed_count
+        sum(eval(if(priority IN ("critical", "high"), 1, 0))) AS critical_alarms
+        BY _time, area
+    | eval alarm_rate=unique_alarms
+    | eval is_flood=if(alarm_rate > 50, "yes", "no")
+    | eval is_suppression=if(suppressed_count > 5, "yes", "no")
+    | where is_flood="yes" OR is_suppression="yes"
+    | eval attack_type=case(
+        is_flood="yes" AND is_suppression="yes", "COMBINED flood + suppression",
+        is_flood="yes", "Alarm FLOOD (" + tostring(alarm_rate) + " alarms/5min)",
+        is_suppression="yes", "Alarm SUPPRESSION (" + tostring(suppressed_count) + " alarms silenced)"
+      )
+    | sort -alarm_rate
+
+  throttle: area, 600
+  notable:
+    rule_title: "Alarm Attack in $area$ — $attack_type$"
+    rule_description: >
+      $attack_type$ detected in area $area$. $critical_alarms$ critical/high
+      alarms in the window. Alarm attacks impair operator awareness and
+      are used as cover for concurrent process manipulation.
+    recommended_actions:
+      - Alert control room operators to potential alarm manipulation
+      - Manually verify all critical process parameters
+      - Check for concurrent setpoint changes or safety bypasses
+      - Review alarm management system for unauthorized configuration changes
+      - Restore suppressed alarms immediately
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: T0882 — Historian Data Tampering / Deletion
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_6_historian_tampering:
+  name: "Historian Data Tampering — Process History Manipulation"
+  description: >
+    Detects unauthorized modifications or deletions of process historian
+    data. Attackers tamper with historian data to cover tracks, hide process
+    anomalies, or manipulate regulatory compliance records.
+  mitre_attack:
+    - T0882  # Theft of Operational Information
+    - T0809  # Data Destruction
+  severity: high
+  confidence: 85
+
+  search: |
+    index=ot_historian sourcetype="ot:historian:audit"
+    action IN ("delete", "modify", "backfill", "overwrite", "purge")
+    NOT [| inputlookup authorized_historian_admins | fields username]
+    | stats count values(action) AS actions
+        dc(tag_name) AS tags_affected
+        values(tag_name) AS tag_list
+        min(_time) AS first max(_time) AS last
+        BY username, src_ip
+    | sort -count
+
+  throttle: username, 300
+  notable:
+    rule_title: "Historian Tampering by $username$ — $tags_affected$ tags affected"
+    rule_description: >
+      Unauthorized historian data modification by $username$ from $src_ip$.
+      Actions: $actions$. Tags affected: $tags_affected$ ($tag_list$).
+      Historian tampering can hide evidence of process manipulation and
+      affect regulatory compliance records.
+    recommended_actions:
+      - Revoke historian access for the account immediately
+      - Compare modified tags with backup historian data
+      - Check if modifications correlate with process anomalies
+      - Preserve audit logs for forensic investigation
+      - Notify compliance/regulatory team if process records affected
