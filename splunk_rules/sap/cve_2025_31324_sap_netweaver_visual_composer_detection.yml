@@ -1,0 +1,667 @@
+# ==============================================================================
+#  CVE-2025-31324 — SAP NetWeaver Visual Composer Metadata Uploader RCE
+#  Splunk Detection Rules
+# ==============================================================================
+#  Description : Multi-layered detection for CVE-2025-31324, a missing-authorization
+#                / unrestricted file upload vulnerability (CVSS 10.0) in the SAP
+#                NetWeaver Visual Composer Metadata Uploader component. The
+#                vulnerable endpoint `/developmentserver/metadatauploader` allows
+#                unauthenticated HTTP POST requests to upload arbitrary files
+#                (typically JSP webshells) to the j2ee application server web
+#                root, resulting in full remote code execution as the SAP admin
+#                user (<SID>adm) on the underlying host.
+#
+#                First publicly reported active zero-day exploitation against an
+#                SAP system. Tracked in-the-wild since January 2025 by multiple
+#                threat actors including Chaya_004, UNC5221, UNC5174, and
+#                subsequently Ransomware affiliates (BianLian, RansomEXX).
+#                SAP issued emergency out-of-band patch on 24 April 2025.
+#                CISA added to KEV catalog on 29 April 2025.
+#
+#                Typical exploit chain:
+#                  1. Unauthenticated POST to /developmentserver/metadatauploader
+#                     with multipart form data containing a JSP payload
+#                  2. JSP webshell written to j2ee/cluster/apps/sap.com/irj/
+#                     servlet_jsp/irj/root/ (served via /irj/ context)
+#                  3. HTTP GET/POST to webshell triggers command execution via
+#                     Runtime.getRuntime().exec() as <SID>adm
+#                  4. Follow-on: credential access (secstore.properties,
+#                     SecStore.key), lateral movement, ransomware deployment
+#
+#                Known webshell filenames observed in the wild:
+#                  helper.jsp, cache.jsp, rrx.jsp, forwardsap.jsp, coreasp.jsp,
+#                  ssonkl.jsp, rpn.jsp, jsh.jsp, 404.jsp, com.jsp, error.jsp,
+#                  reconnect.jsp, session.jsp
+#
+#  MITRE ATT&CK: T1190 (Exploit Public-Facing Application),
+#                T1505.003 (Server Software Component: Web Shell),
+#                T1059.003 (Command and Scripting Interpreter: Windows Command Shell),
+#                T1059.004 (Unix Shell),
+#                T1071.001 (Application Layer Protocol: Web Protocols),
+#                T1003 (OS Credential Dumping),
+#                T1486 (Data Encrypted for Impact)
+#  Kill Chain   : Initial Access → Execution → Persistence → Credential Access → Impact
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : SAP J2EE HTTP access logs, Apache/IIS reverse proxy logs,
+#                 WAF logs, XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+#                 (Windows SAP hosts), linux:audit / syslog (Linux SAP hosts),
+#                 Zeek HTTP/files logs, NetWeaver default trace logs
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-15
+#  License      : MIT
+#
+#  References:
+#    - https://nvd.nist.gov/vuln/detail/CVE-2025-31324
+#    - https://support.sap.com/en/my-support/knowledge-base/security-notes-news/april-2025.html
+#    - https://www.cisa.gov/news-events/alerts/2025/04/29/cisa-adds-one-known-exploited-vulnerability-catalog
+#    - https://onapsis.com/blog/active-exploitation-of-sap-zero-day-vulnerability-cve-2025-31324/
+#    - https://www.rapid7.com/blog/post/2025/04/25/etr-cve-2025-31324-sap-netweaver-visual-composer-unauthenticated-file-upload/
+#    - https://redrays.io/blog/cve-2025-31324-sap-netweaver-visual-composer-unauthenticated-file-upload/
+#    - https://www.reliaquest.com/blog/threat-spotlight-cve-2025-31324-sap-netweaver-exploitation/
+#    - https://cloud.google.com/blog/topics/threat-intelligence/china-nexus-exploiting-sap-cve-2025-31324
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. SAP NetWeaver J2EE HTTP access logs ingested into Splunk:
+#     - Path: /usr/sap/<SID>/J<##>/j2ee/cluster/server0/log/system/httpaccess/
+#     - File: responses_*.trc or access.log
+#     - Sourcetype: sap:j2ee:httpaccess (create in props.conf)
+#
+#  2. Reverse proxy / WAF logs (if SAP behind NGINX, Apache, F5, Cloudflare):
+#     - Apache: apache:access
+#     - NGINX:  nginx:plus:kv
+#     - F5:     f5:bigip:asm:syslog
+#
+#  3. Sysmon (Windows SAP hosts) with Events 1, 3, 11 enabled, OR
+#     auditd (Linux SAP hosts) with execve, open, openat syscalls logged
+#
+#  4. File integrity monitoring on SAP web root directories:
+#     - Windows: \usr\sap\<SID>\J<##>\j2ee\cluster\apps\sap.com\irj\servlet_jsp\irj\root\
+#     - Linux:   /usr/sap/<SID>/J<##>/j2ee/cluster/apps/sap.com/irj/servlet_jsp/irj/root/
+#
+#  5. Lookup tables required:
+#     - sap_servers.csv               (ip, hostname, sid, environment, criticality)
+#     - sap_known_webshells.csv       (filename, sha256, campaign)
+#     - approved_sap_admin_ips.csv    (ip, username, role)
+#
+# ==============================================================================
+#
+#  IOC REFERENCE — Known CVE-2025-31324 Exploitation Artifacts
+#
+#  Webshell Filenames (observed in /irj/ web root):
+#    helper.jsp         cache.jsp          rrx.jsp
+#    forwardsap.jsp     coreasp.jsp        ssonkl.jsp
+#    rpn.jsp            jsh.jsp            404.jsp
+#    com.jsp            error.jsp          reconnect.jsp
+#    session.jsp        logon.jsp          index2.jsp
+#
+#  Webshell SHA256 Hashes (publicly disclosed):
+#    1f72bd2643995fab4ecf7150b6367fa1b3fab17afd2abed30a98f075e4913087  helper.jsp
+#    794cb0a92f51e1387a6b316b8b5ff83d33a51ecf9bf7cbe0e8bf3dbef4c4d499  cache.jsp
+#    b2a6cf0cc1c2c68b1e77cc9d12d43d3b6c7d1e24e6e6b80c8bfe1a5c5c2d91e7  rrx.jsp
+#
+#  Threat Actor Infrastructure (Chaya_004 / China-nexus):
+#    47.97.42[.]177     43.247.135[.]53     103.97.98[.]131
+#    47.109.199[.]187   47.96.19[.]49       8.210.65[.]56
+#    47.99.144[.]100    123.57.164[.]70
+#
+#  Post-exploit command patterns:
+#    whoami                                  — user enumeration
+#    cat /etc/passwd                         — Linux account enum
+#    net user                                — Windows account enum
+#    <SID>adm                                — SAP admin identity check
+#    secstore.properties, SecStore.key       — SAP credential store
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: CVE-2025-31324 — Unauthenticated POST to Metadata Uploader Endpoint
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Primary exploit detection. Any HTTP POST to /developmentserver/metadatauploader
+#  is suspicious because this endpoint should only be invoked during Visual
+#  Composer design-time activities by authenticated developers. Unauthenticated
+#  or anonymous POSTs, especially with multipart/form-data or large bodies, are
+#  strong indicators of CVE-2025-31324 exploitation attempts.
+#
+#  Confidence  : CRITICAL
+#  Severity    : CRITICAL
+#  FP Rate     : Very low — endpoint rarely used in production
+
+rule_1_metadata_uploader_exploit_attempt:
+  name: "CVE-2025-31324 — Unauthenticated POST to SAP NetWeaver Metadata Uploader"
+  description: >
+    Detects HTTP POST requests to the vulnerable SAP NetWeaver Visual Composer
+    endpoint /developmentserver/metadatauploader. This endpoint is the entry
+    point for CVE-2025-31324 exploitation. In production environments, this
+    URI is rarely if ever invoked; any POST activity (particularly from
+    external IPs or without authentication) should be treated as an active
+    exploitation attempt. Legitimate Visual Composer design-time activity
+    originates from a known, small set of developer workstations.
+  mitre:
+    tactic: "Initial Access"
+    technique: "T1190"
+    technique_name: "Exploit Public-Facing Application"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 98
+  search: >
+    (index=sap OR index=web OR index=proxy)
+    (sourcetype="sap:j2ee:httpaccess" OR sourcetype="apache:access"
+     OR sourcetype="nginx:plus:kv" OR sourcetype="iis" OR sourcetype="f5:bigip:asm:syslog")
+    uri_path="*/developmentserver/metadatauploader*" method=POST
+    | eval exploit_indicator=case(
+        status>=200 AND status<300, "SUCCESS_POSSIBLE_WEBSHELL_DROP",
+        status=401 OR status=403, "AUTH_REJECTED",
+        status>=400 AND status<500, "CLIENT_ERROR",
+        status>=500, "SERVER_ERROR",
+        true(), "UNKNOWN")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(status) as http_status
+      values(http_user_agent) as user_agents
+      values(uri_query) as uri_queries
+      values(bytes_in) as request_sizes
+      values(exploit_indicator) as indicators
+      by src_ip dest_host uri_path
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table src_ip dest_host uri_path http_status indicators
+      user_agents request_sizes first_seen last_seen count
+  schedule:
+    cron: "*/2 * * * *"
+    window: "-3m@m"
+  throttle:
+    field: "src_ip,dest_host"
+    period: "10m"
+  actions:
+    notable:
+      rule_title: "CVE-2025-31324: Exploit attempt against SAP Metadata Uploader on $dest_host$ from $src_ip$"
+      severity: critical
+      drilldown_search: >
+        (index=sap OR index=web) dest_host="$dest_host$" src_ip="$src_ip$"
+        earliest=-1h
+      recommended_actions:
+        - Immediately isolate the SAP application server from the network
+        - Verify patch level — confirm SAP Security Note 3594142 is applied
+        - Inspect /irj/ web root for unauthorized JSP files (helper.jsp, cache.jsp, rrx.jsp, etc.)
+        - Collect <SID>adm command history and audit logs on the SAP host
+        - Block source IP at perimeter firewall and WAF
+        - Escalate to IR team; begin chain-of-custody evidence collection
+    risk:
+      score: 98
+      object_type: "system"
+      object_field: "dest_host"
+  false_positives:
+    - "Legitimate Visual Composer developer activity from approved workstations — filter by src_ip lookup"
+    - "SAP vulnerability scanners (Onapsis, SecurityBridge) — add scanner source IPs to allowlist"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: CVE-2025-31324 — Known Webshell Access in SAP /irj/ Web Root
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Direct IOC match. After successful file upload via metadatauploader, the
+#  attacker requests the JSP webshell via /irj/ to execute commands. This rule
+#  matches the observed webshell filenames published in Onapsis, Mandiant, and
+#  ReliaQuest advisories.
+#
+#  Confidence  : CRITICAL
+#  Severity    : CRITICAL
+#  FP Rate     : Near-zero — these filenames are not part of standard SAP content
+
+rule_2_sap_webshell_access:
+  name: "CVE-2025-31324 — Access to Known SAP JSP Webshell"
+  description: >
+    Detects HTTP requests to known CVE-2025-31324 webshell filenames hosted
+    under the SAP NetWeaver /irj/ web root. Filenames are drawn from published
+    intelligence reports documenting in-the-wild exploitation by Chaya_004,
+    UNC5221, UNC5174, and ransomware affiliates. Any request to these paths
+    indicates an active webshell session — the attacker typically passes
+    commands via URL parameter or POST body and parses output from the JSP
+    response.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1505.003"
+    technique_name: "Server Software Component: Web Shell"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 99
+  search: >
+    (index=sap OR index=web OR index=proxy)
+    (sourcetype="sap:j2ee:httpaccess" OR sourcetype="apache:access"
+     OR sourcetype="nginx:plus:kv" OR sourcetype="iis")
+    (uri_path="*/irj/helper.jsp" OR uri_path="*/irj/cache.jsp"
+     OR uri_path="*/irj/rrx.jsp" OR uri_path="*/irj/forwardsap.jsp"
+     OR uri_path="*/irj/coreasp.jsp" OR uri_path="*/irj/ssonkl.jsp"
+     OR uri_path="*/irj/rpn.jsp" OR uri_path="*/irj/jsh.jsp"
+     OR uri_path="*/irj/404.jsp" OR uri_path="*/irj/com.jsp"
+     OR uri_path="*/irj/error.jsp" OR uri_path="*/irj/reconnect.jsp"
+     OR uri_path="*/irj/session.jsp" OR uri_path="*/irj/logon.jsp"
+     OR uri_path="*/irj/index2.jsp")
+    | eval webshell_name=mvindex(split(uri_path, "/"), -1)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(method) as methods
+      values(status) as http_status
+      values(http_user_agent) as user_agents
+      values(uri_query) as commands
+      by src_ip dest_host webshell_name
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table src_ip dest_host webshell_name methods http_status
+      user_agents commands first_seen last_seen count
+  schedule:
+    cron: "*/2 * * * *"
+    window: "-3m@m"
+  throttle:
+    field: "dest_host,webshell_name"
+    period: "5m"
+  actions:
+    notable:
+      rule_title: "CVE-2025-31324: Known SAP webshell $webshell_name$ accessed on $dest_host$"
+      severity: critical
+      recommended_actions:
+        - Treat the host as compromised — initiate full IR process
+        - Preserve the webshell file for forensic analysis, then remove
+        - Rotate all SAP credentials, including <SID>adm, SAP* and DDIC
+        - Extract and rotate SecStore.key and secstore.properties secrets
+        - Hunt for lateral movement from the SAP host across the domain
+        - Review Oracle/HANA connections made by SAP host for data access
+    risk:
+      score: 99
+      object_type: "system"
+      object_field: "dest_host"
+  false_positives:
+    - "None expected — these filenames are not part of standard SAP content"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: CVE-2025-31324 — JSP File Creation in SAP /irj/ Web Root
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  File-system detection. Catches the webshell drop itself by monitoring JSP
+#  file creation under the SAP j2ee web root. Under normal operations, SAP
+#  applications deploy JSPs via SDA/SCA transport or NWDS — never by direct
+#  file writes from the SAP java process to the /irj/ root at runtime.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Low — requires tuning around SAP kernel patch/transport windows
+
+rule_3_jsp_file_dropped_in_sap_webroot:
+  name: "CVE-2025-31324 — JSP File Created in SAP /irj/ Web Root"
+  description: >
+    Detects creation of a .jsp file under the SAP NetWeaver j2ee application
+    server web root (irj/servlet_jsp/irj/root/). Successful CVE-2025-31324
+    exploitation writes a webshell JSP into this directory so it becomes
+    reachable via /irj/<filename>.jsp. Legitimate JSP deployment in SAP
+    occurs only through controlled transport paths, not through runtime
+    file writes by the SAP java process (jlaunch, java, disp+work).
+  mitre:
+    tactic: "Persistence"
+    technique: "T1505.003"
+    technique_name: "Server Software Component: Web Shell"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 95
+  search: >
+    (index=main OR index=endpoint OR index=linux)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+     OR sourcetype="linux:audit" OR sourcetype="auditd")
+    (EventCode=11 OR type=PATH OR action=CREATE)
+    (TargetFilename="*\\j2ee\\cluster\\apps\\sap.com\\irj\\servlet_jsp\\irj\\root\\*.jsp"
+     OR TargetFilename="*/j2ee/cluster/apps/sap.com/irj/servlet_jsp/irj/root/*.jsp"
+     OR name="*/j2ee/cluster/apps/sap.com/irj/servlet_jsp/irj/root/*.jsp"
+     OR path="*/j2ee/cluster/apps/sap.com/irj/servlet_jsp/irj/root/*.jsp")
+    | eval file_path=coalesce(TargetFilename, name, path)
+    | eval file_name=mvindex(split(file_path, "/"), -1)
+    | eval file_name=mvindex(split(file_name, "\\"), -1)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(Image) as creating_process
+      values(User) as users
+      values(ProcessId) as pids
+      values(file_path) as file_paths
+      by Computer file_name
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer file_name creating_process users file_paths
+      first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer,file_name"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "CVE-2025-31324: JSP webshell dropped in SAP /irj/ root on $Computer$"
+      severity: critical
+      recommended_actions:
+        - Quarantine the .jsp file before the attacker can execute it
+        - Compute SHA256 and match against published IOC hashes
+        - Pull SAP J2EE httpaccess logs for the same timeframe to find the delivery POST
+        - Initiate host-level IR and credential rotation
+    risk:
+      score: 95
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "SAP Support Package (SP) or kernel patch application — correlate with change window"
+    - "NWDS / SDM deployment of a legitimate Web Dynpro app — validate with SAP Basis team"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: CVE-2025-31324 — SAP Java Process Spawning Shell or Recon Commands
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Post-exploit behavioral detection. Once the JSP webshell runs a command, the
+#  SAP java process (jlaunch.exe, java.exe on Windows; jlaunch, java on Linux)
+#  becomes the parent of cmd.exe/powershell.exe/bash/sh executing reconnaissance
+#  or data-theft commands. SAP should almost never spawn interactive shells.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Low — a small allowlist of SAP Basis job scripts may be required
+
+rule_4_sap_java_spawning_shell:
+  name: "CVE-2025-31324 — SAP Java Process Spawning Shell Interpreter"
+  description: >
+    Detects SAP NetWeaver java processes (jlaunch, java, disp+work, icman)
+    spawning shell interpreters (cmd.exe, powershell.exe, bash, sh) or
+    reconnaissance utilities. This is the behavioral signature of a JSP
+    webshell invoking Runtime.getRuntime().exec() after CVE-2025-31324
+    exploitation. Chaya_004 and UNC5221 were observed running whoami,
+    net user, cat /etc/passwd, and searches for SAP secure store files.
+  mitre:
+    tactic: "Execution"
+    technique: "T1059"
+    technique_name: "Command and Scripting Interpreter"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 96
+  search: >
+    (index=main OR index=endpoint OR index=linux)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+     OR sourcetype="linux:audit" OR sourcetype="auditd")
+    (EventCode=1 OR type=EXECVE OR type=SYSCALL)
+    (ParentImage="*\\jlaunch.exe" OR ParentImage="*\\java.exe"
+     OR ParentImage="*\\disp+work.exe" OR ParentImage="*\\icman.exe"
+     OR parent_process_name="jlaunch" OR parent_process_name="java"
+     OR parent_process_name="disp+work" OR parent_process_name="icman")
+    (Image="*\\cmd.exe" OR Image="*\\powershell.exe" OR Image="*\\pwsh.exe"
+     OR Image="*\\wscript.exe" OR Image="*\\cscript.exe"
+     OR Image="*\\net.exe" OR Image="*\\net1.exe"
+     OR Image="*\\whoami.exe" OR Image="*\\systeminfo.exe"
+     OR Image="*\\ipconfig.exe" OR Image="*\\certutil.exe"
+     OR process_name="bash" OR process_name="sh" OR process_name="dash"
+     OR process_name="whoami" OR process_name="id" OR process_name="cat"
+     OR process_name="curl" OR process_name="wget" OR process_name="nc")
+    | eval parent_process=coalesce(mvindex(split(ParentImage, "\\"), -1), parent_process_name)
+    | eval child_process=coalesce(mvindex(split(Image, "\\"), -1), process_name)
+    | eval cmd=coalesce(CommandLine, command)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(cmd) as command_lines
+      values(child_process) as child_processes
+      values(User) as users
+      by Computer parent_process
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer parent_process child_processes command_lines users
+      first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "CVE-2025-31324: SAP java process spawned shell/recon command on $Computer$"
+      severity: critical
+      recommended_actions:
+        - Pair this alert with Rule 2 (webshell access) to correlate webshell-to-command flow
+        - Capture process tree; preserve memory image of the SAP java process
+        - Hunt for secstore.properties / SecStore.key reads in audit trail
+    risk:
+      score: 96
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "SAP Basis job scripts invoking OS-level commands (sapcontrol, saposcol) — add to allowlist by CommandLine pattern"
+    - "Monitoring agents running under <SID>adm — validate with Basis team"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: CVE-2025-31324 — Access to SAP Secure Store Files After Exploit
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Credential access detection. Threat actors who achieved RCE via CVE-2025-31324
+#  pivot to stealing the SAP secure store (secstore.properties + SecStore.key)
+#  which contains encrypted database and RFC destination credentials. Reading
+#  these files as <SID>adm from a non-SAP-kernel process is highly anomalous.
+#
+#  Confidence  : HIGH
+#  Severity    : HIGH
+#  FP Rate     : Low
+
+rule_5_sap_secure_store_access:
+  name: "CVE-2025-31324 — Access to SAP Secure Store / Credential Files"
+  description: >
+    Detects read access to SAP NetWeaver secure-store artifacts
+    (secstore.properties, SecStore.key, SecStore.properties, or files under
+    /usr/sap/<SID>/SYS/global/security/data/) by processes outside the
+    expected SAP kernel set. These files hold the master encryption key and
+    ciphertext for the java secure store — their decryption yields database,
+    RFC, and connector credentials used for lateral movement.
+  mitre:
+    tactic: "Credential Access"
+    technique: "T1552.001"
+    technique_name: "Unsecured Credentials: Credentials In Files"
+  severity: HIGH
+  confidence: HIGH
+  risk_score: 90
+  search: >
+    (index=main OR index=endpoint OR index=linux)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+     OR sourcetype="linux:audit" OR sourcetype="auditd")
+    (CommandLine="*secstore.properties*" OR CommandLine="*SecStore.key*"
+     OR CommandLine="*SecStore.properties*" OR CommandLine="*/global/security/data/*"
+     OR command="*secstore.properties*" OR command="*SecStore.key*"
+     OR command="*SecStore.properties*" OR command="*/global/security/data/*"
+     OR TargetFilename="*secstore.properties" OR TargetFilename="*SecStore.key"
+     OR name="*secstore.properties" OR name="*SecStore.key")
+    NOT (Image="*\\jlaunch.exe" OR Image="*\\java.exe"
+         OR Image="*\\disp+work.exe"
+         OR process_name="jlaunch" OR process_name="java"
+         OR process_name="disp+work")
+    | eval actor_process=coalesce(Image, process_name)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(actor_process) as processes
+      values(CommandLine) as command_lines
+      values(User) as users
+      by Computer
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer processes command_lines users first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "CVE-2025-31324: SAP secure store files accessed by non-kernel process on $Computer$"
+      severity: high
+      recommended_actions:
+        - Assume SAP database and RFC credentials are compromised
+        - Re-key the SAP secure store (rsecsmp / configtool)
+        - Rotate all database, RFC destination, and connector passwords
+        - Review SAP gateway logs for anomalous RFC calls and ABAP execution
+    risk:
+      score: 90
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "SAP Basis administrators running configtool or rsecssfs during maintenance — validate with change window"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: CVE-2025-31324 — Connection from SAP Host to Known Chaya_004 IPs
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Threat-intel IOC match. Any network traffic to or from the published
+#  Chaya_004 / China-nexus infrastructure associated with CVE-2025-31324
+#  exploitation campaigns should be treated as a confirmed compromise.
+#
+#  Confidence  : CRITICAL
+#  Severity    : CRITICAL
+#  FP Rate     : Near-zero
+
+rule_6_known_chaya004_infrastructure:
+  name: "CVE-2025-31324 — Communication with Known Chaya_004 Infrastructure"
+  description: >
+    Detects inbound or outbound network traffic between any host and confirmed
+    Chaya_004 / China-nexus infrastructure IP addresses tied to CVE-2025-31324
+    exploitation (April 2025 campaign, reported by Onapsis, ReliaQuest, and
+    Mandiant). SAP servers should have no legitimate reason to communicate
+    with these hosts.
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1071.001"
+    technique_name: "Application Layer Protocol: Web Protocols"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 97
+  search: >
+    (index=network OR index=firewall OR index=proxy OR index=main)
+    (sourcetype="pan:traffic" OR sourcetype="cisco:asa" OR sourcetype="fgt_traffic"
+     OR sourcetype="zeek:conn" OR sourcetype="suricata:eve"
+     OR sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational")
+    (dest_ip IN ("47.97.42.177","43.247.135.53","103.97.98.131",
+                 "47.109.199.187","47.96.19.49","8.210.65.56",
+                 "47.99.144.100","123.57.164.70")
+     OR src_ip IN ("47.97.42.177","43.247.135.53","103.97.98.131",
+                   "47.109.199.187","47.96.19.49","8.210.65.56",
+                   "47.99.144.100","123.57.164.70")
+     OR DestinationIp IN ("47.97.42.177","43.247.135.53","103.97.98.131",
+                          "47.109.199.187","47.96.19.49","8.210.65.56",
+                          "47.99.144.100","123.57.164.70"))
+    | eval ioc_ip=coalesce(
+        if(dest_ip IN ("47.97.42.177","43.247.135.53","103.97.98.131","47.109.199.187","47.96.19.49","8.210.65.56","47.99.144.100","123.57.164.70"), dest_ip, null()),
+        if(src_ip IN ("47.97.42.177","43.247.135.53","103.97.98.131","47.109.199.187","47.96.19.49","8.210.65.56","47.99.144.100","123.57.164.70"), src_ip, null()),
+        DestinationIp)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(src_ip) as source_ips
+      values(dest_ip) as dest_ips
+      values(dest_port) as ports
+      values(app) as applications
+      by ioc_ip
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table ioc_ip source_ips dest_ips ports applications
+      first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "ioc_ip"
+    period: "60m"
+  actions:
+    notable:
+      rule_title: "CVE-2025-31324: Traffic to/from known Chaya_004 infrastructure ($ioc_ip$)"
+      severity: critical
+      recommended_actions:
+        - Block the IOC IP at the perimeter firewall, WAF, and proxy immediately
+        - Identify all internal hosts that communicated with the IOC IP
+        - Treat any SAP host involved as compromised
+        - Hunt for CVE-2025-31324 exploitation timeline via Rules 1-5
+    risk:
+      score: 97
+      object_type: "system"
+      object_field: "ioc_ip"
+  false_positives:
+    - "None expected — threat actor infrastructure"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: CVE-2025-31324 — Anomalous POST to SAP with JSP Content in Body
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Payload-based detection. If the reverse proxy or WAF captures request bodies,
+#  presence of JSP scriptlet markers (<%@ page, <%!, Runtime.getRuntime().exec)
+#  inside a POST body destined for the SAP metadatauploader or any SAP URL is
+#  a reliable exploit indicator regardless of filename.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+
+rule_7_jsp_payload_in_post_body:
+  name: "CVE-2025-31324 — JSP Scriptlet Payload in HTTP POST Body to SAP"
+  description: >
+    Detects HTTP POST requests to SAP endpoints where the request body contains
+    JSP scriptlet markers or Java reflection patterns typical of webshell
+    payloads. Requires WAF / proxy body inspection enabled.
+  mitre:
+    tactic: "Initial Access"
+    technique: "T1190"
+    technique_name: "Exploit Public-Facing Application"
+  severity: CRITICAL
+  confidence: MEDIUM
+  risk_score: 88
+  search: >
+    (index=web OR index=proxy OR index=waf)
+    (sourcetype="f5:bigip:asm:syslog" OR sourcetype="pan:threat"
+     OR sourcetype="apache:access" OR sourcetype="nginx:plus:kv"
+     OR sourcetype="zeek:http")
+    method=POST
+    (uri_path="*/developmentserver/*" OR uri_path="*/irj/*"
+     OR uri_path="*/sap/*" OR dest_port=50000 OR dest_port=50001
+     OR dest_port=8000 OR dest_port=8443)
+    (request_body="*<%@*page*" OR request_body="*Runtime.getRuntime()*"
+     OR request_body="*ProcessBuilder*" OR request_body="*<%!*"
+     OR request_body="*Class.forName*" OR request_body="*java.lang.Runtime*"
+     OR http_content="*<%@*page*" OR http_content="*Runtime.getRuntime()*")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(uri_path) as uris
+      values(http_user_agent) as user_agents
+      values(status) as http_status
+      by src_ip dest_host
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table src_ip dest_host uris user_agents http_status
+      first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "src_ip,dest_host"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "CVE-2025-31324: JSP scriptlet payload POSTed to SAP host $dest_host$ from $src_ip$"
+      severity: critical
+      recommended_actions:
+        - Capture full request body for forensic analysis
+        - Cross-reference with Rules 1 and 3 to confirm upload success
+        - Block src_ip at WAF and add as IOC in threat intel platform
+    risk:
+      score: 88
+      object_type: "system"
+      object_field: "dest_host"
+  false_positives:
+    - "SAP code repositories or NWDS transport traffic containing JSP source — filter by src_ip lookup of developer workstations"
+
+
+# ==============================================================================
+#  END OF CVE-2025-31324 DETECTION RULES
+# ==============================================================================

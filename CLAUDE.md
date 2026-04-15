@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Splunk SIEM detection rules for SOC attack detection and incident response. **164 detection rules** across 12 categories covering Windows, Active Directory, RHEL Linux, Apache, ICS/OT, network firewalls (Palo Alto, Cisco, Fortinet, Check Point), EDR platforms (CrowdStrike, Microsoft Defender, Trend Micro), credential access attacks, network security threats, and recent threat campaigns.
+Splunk SIEM detection rules for SOC attack detection and incident response. **171 detection rules** across 13 categories covering Windows, Active Directory, RHEL Linux, Apache, ICS/OT, network firewalls (Palo Alto, Cisco, Fortinet, Check Point), EDR platforms (CrowdStrike, Microsoft Defender, Trend Micro), credential access attacks, network security threats, SAP NetWeaver exploitation, and recent threat campaigns.
 
 Every rule includes SPL search queries, MITRE ATT&CK mapping, severity/confidence scoring, throttle configuration, notable event generation, and recommended response actions.
 
@@ -26,8 +26,9 @@ Every rule includes SPL search queries, MITRE ATT&CK mapping, severity/confidenc
 | **EDR Detection** | `splunk_rules/edr_detection/` | 3 | 24 | CrowdStrike Falcon (sensor tamper, C2, ransomware), Microsoft Defender (AMSI, ASR, macros), Trend Micro (agent tamper, IPS, integrity monitoring) |
 | **Network Security** | `splunk_rules/network_security/` | 1 | 6 | TOR traffic, rogue DNS, large uploads/exfiltration, unencrypted sensitive traffic, network share removal, recurring malware |
 | **Recent Attacks** | `splunk_rules/recent_attacks/` | 1 | 12 | CVE-2026-21509, APT28 Operation NeuSploit |
+| **SAP** | `splunk_rules/sap/` | 1 | 7 | CVE-2025-31324 SAP NetWeaver Visual Composer Metadata Uploader RCE (Chaya_004, UNC5221) |
 
-**Total: 52 files, 164+ rules, ~42,000 lines of YAML**
+**Total: 53 files, 171+ rules, ~43,000 lines of YAML**
 
 ### ICS/OT Protocol Coverage
 
@@ -123,6 +124,7 @@ rule_N_descriptive_name:
 | CrowdStrike | `crowdstrike:events:sensor`, `crowdstrike:events:detection` |
 | Microsoft Defender | `ms:defender:advanced`, `ms:defender:alerts` |
 | Trend Micro | `deepsecurity`, `trendmicro:deep_security` |
+| SAP NetWeaver | `sap:j2ee:httpaccess`, `apache:access`, `nginx:plus:kv`, `f5:bigip:asm:syslog`, `zeek:http` |
 
 ### Required Splunk Add-ons
 
@@ -151,6 +153,9 @@ Rules reference these lookup tables (must be created in your environment):
 | `known_good_hashes` | sha256 | EDR |
 | `domain_admin_accounts` | samaccountname | AD |
 | `approved_crosszone_access` | src_ip, dest_ip | Firewalls, ICS/OT |
+| `sap_servers` | ip, hostname, sid, environment, criticality | SAP |
+| `sap_known_webshells` | filename, sha256, campaign | SAP |
+| `approved_sap_admin_ips` | ip, username, role | SAP |
 
 ## MITRE ATT&CK Coverage
 
@@ -265,6 +270,8 @@ Detection-Engineering/
 │   │   └── checkpoint_detection.yml
 │   ├── recent_attacks/            # Threat campaign detection (12 rules)
 │   │   └── cve_2026_21509_apt28_operation_neusploit_detection.yml
+│   ├── sap/                       # SAP NetWeaver detection (7 rules)
+│   │   └── cve_2025_31324_sap_netweaver_visual_composer_detection.yml
 │   ├── rhel_linux/                # RHEL Linux detection (63 rules)
 │   │   ├── rhel_credential_access_detection.yml
 │   │   ├── rhel_defense_evasion_detection.yml

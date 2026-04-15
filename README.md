@@ -9,8 +9,8 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Splunk-SPL-dc2626?style=flat-square&logo=splunk&logoColor=white" alt="Splunk SPL"/>
   <img src="https://img.shields.io/badge/MITRE-ATT%26CK-f59e0b?style=flat-square" alt="MITRE ATT&CK"/>
-  <img src="https://img.shields.io/badge/rules-170%2B-22c55e?style=flat-square" alt="170+ Rules"/>
-  <img src="https://img.shields.io/badge/platforms-Windows%20AD%20%7C%20RHEL%20%7C%20Apache-3b82f6?style=flat-square" alt="Windows AD | RHEL | Apache"/>
+  <img src="https://img.shields.io/badge/rules-177%2B-22c55e?style=flat-square" alt="177+ Rules"/>
+  <img src="https://img.shields.io/badge/platforms-Windows%20AD%20%7C%20RHEL%20%7C%20Apache%20%7C%20SAP-3b82f6?style=flat-square" alt="Windows AD | RHEL | Apache | SAP"/>
   <img src="https://img.shields.io/badge/license-GPL--3.0-orange?style=flat-square" alt="GPL-3.0 License"/>
 </p>
 
@@ -20,7 +20,7 @@
 
 Security Operation Center (SOC) attack detection and response rules for Splunk SIEM. Each rule includes comprehensive SPL queries, MITRE ATT&CK mapping, false positive tuning guidance, investigation queries, and incident response playbooks.
 
-- **170+ detection rules** across Windows AD, RHEL Linux, Apache Web Server, and recent threat campaigns
+- **177+ detection rules** across Windows AD, RHEL Linux, Apache Web Server, SAP NetWeaver, and recent threat campaigns
 - **MITRE ATT&CK mapped** -- every rule tagged with technique IDs and tactics
 - **Investigation queries** -- ready-to-run SPL for SOC analyst triage
 - **Incident response playbooks** -- step-by-step response procedures per attack type
@@ -55,6 +55,8 @@ Detection-Engineering/
     │   └── apache_exploitation_detection.yml
     ├── recent_attacks/
     │   └── cve_2026_21509_apt28_operation_neusploit_detection.yml
+    ├── sap/
+    │   └── cve_2025_31324_sap_netweaver_visual_composer_detection.yml
     └── rhel_linux/
         ├── rhel_privilege_escalation_detection.yml
         ├── rhel_persistence_detection.yml
@@ -815,6 +817,34 @@ Detects APT28 (UAC-0001) exploitation of CVE-2026-21509 (Microsoft Office OLE Se
 | Rule 10 | Explorer.exe suspicious DLL side-load | Sysmon 7 | HIGH |
 | Rule 11 | Shell.Explorer.1 COM instantiation from Office | Sysmon 1, 4104 | HIGH |
 | Rule 12 | Full kill chain correlation (multi-stage) | Combined | CRITICAL |
+
+---
+
+## SAP NetWeaver Detection
+
+Detection rules for SAP application platform exploitation.
+
+| Rule File | Threat / CVE | MITRE ID | Severity | Detection Vectors |
+|-----------|-------------|----------|----------|-------------------|
+| `cve_2025_31324_sap_netweaver_visual_composer_detection.yml` | SAP NetWeaver Visual Composer Metadata Uploader (CVSS 10.0) | T1190, T1505.003, T1059, T1552.001, T1071.001 | CRITICAL | 7 rules covering exploit attempt, webshell access, JSP drop, shell spawn, secure-store access, IOC match, WAF body inspection |
+
+### CVE-2025-31324 — SAP NetWeaver Visual Composer Metadata Uploader
+
+**File**: `splunk_rules/sap/cve_2025_31324_sap_netweaver_visual_composer_detection.yml`
+
+Detects the first publicly reported actively exploited SAP zero-day. CVE-2025-31324 is a missing-authorization / unrestricted file upload flaw in the `/developmentserver/metadatauploader` endpoint allowing unauthenticated attackers to drop JSP webshells under the j2ee `/irj/` web root, achieving RCE as `<SID>adm`. Exploited in-the-wild since January 2025 by Chaya_004, UNC5221, UNC5174, and ransomware affiliates; SAP issued an emergency patch on 24 April 2025 and CISA added the CVE to KEV on 29 April 2025.
+
+| Rule | Detection Method | Data Source | Confidence |
+|------|-----------------|-------------|------------|
+| Rule 1 | POST to `/developmentserver/metadatauploader` | J2EE httpaccess, Apache/NGINX, WAF | HIGH |
+| Rule 2 | Access to known JSP webshell names (helper.jsp, cache.jsp, rrx.jsp) | J2EE httpaccess, Proxy | HIGH |
+| Rule 3 | JSP file creation under SAP `/irj/` web root | Sysmon 11, auditd | HIGH |
+| Rule 4 | SAP java process (jlaunch, disp+work) spawning cmd/powershell/bash | Sysmon 1, auditd execve | HIGH |
+| Rule 5 | Access to SAP secure store (secstore.properties, SecStore.key) | Sysmon 1, auditd | HIGH |
+| Rule 6 | Traffic to/from Chaya_004 IOC infrastructure | Firewall, Zeek, Suricata | HIGH |
+| Rule 7 | JSP scriptlet payload inside POST body | WAF, F5 ASM, Zeek HTTP | MEDIUM |
+
+**Required lookups**: `sap_servers.csv`, `sap_known_webshells.csv`, `approved_sap_admin_ips.csv`
 
 ---
 
