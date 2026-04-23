@@ -1,0 +1,710 @@
+# ==============================================================================
+#  CVE-2026-33825 / BlueHammer — Microsoft Defender LPE Detection Rules
+# ==============================================================================
+#  Description : Multi-layered detection for CVE-2026-33825 exploitation, also
+#                known publicly as "BlueHammer" (researcher: Chaotic Eclipse /
+#                Nightmare-Eclipse). CVE-2026-33825 is a local privilege
+#                escalation in the Microsoft Defender Antimalware Platform
+#                (CVSS 7.8, CWE-1220 Insufficient Granularity of Access Control)
+#                affecting all versions prior to 4.18.26030.3011.
+#
+#                The exploit abuses MsMpEng.exe's internal update interface to
+#                coerce Defender into reading attacker-redirected file paths
+#                while running as SYSTEM. The canonical attack chain:
+#
+#                  1. Write EICAR test string to a user-writable directory to
+#                     trigger a Defender scan and force a Volume Shadow Copy
+#                     (VSS) snapshot containing SAM/SYSTEM hives.
+#                  2. Register a fake cloud-sync provider (OneDrive-style)
+#                     with a directory callback that places oplocks on files
+#                     Defender opens during the scan, suspending its scan
+#                     thread indefinitely.
+#                  3. Invoke Defender's update-import interface with a
+#                     redirectable path to attacker-staged "signature update"
+#                     files; swap the path to point at the SAM hive inside
+#                     the frozen VSS snapshot when the oplock fires.
+#                  4. Defender reads SAM as a "signature file" and writes it
+#                     to an attacker-readable output directory.
+#                  5. Parse SAM → extract NT hashes → crack / PtH / generate
+#                     admin session → steal SYSTEM token.
+#
+#                Post-exploitation activity observed in the Huntress "Nightmare
+#                Eclipse" intrusion (April 2026) included execution of
+#                BeigeBurrow (agent.exe) establishing a yamux-multiplexed
+#                reverse tunnel to staybud.dpdns[.]org:443, followed by
+#                whoami /priv, cmdkey /list, and net group reconnaissance.
+#                Initial access to the environment was via compromised
+#                FortiGate SSL-VPN credentials.
+#
+#  MITRE ATT&CK: T1068, T1003.002, T1006, T1078.003, T1134.001, T1562.001,
+#                T1087.001, T1069.001, T1555, T1071.001, T1090, T1133
+#  Kill Chain   : Initial Access (VPN) -> Execution -> Privilege Escalation ->
+#                 Credential Access -> Discovery -> Command and Control
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : XmlWinEventLog:Microsoft-Windows-Sysmon/Operational,
+#                 XmlWinEventLog:Microsoft-Windows-Windows Defender/Operational,
+#                 XmlWinEventLog:Security, ms:defender:advanced,
+#                 ms:defender:alerts, XmlWinEventLog:System, zeek:dns,
+#                 pan:threat
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-04-23
+#  License      : MIT
+#
+#  References:
+#    - https://nvd.nist.gov/vuln/detail/CVE-2026-33825
+#    - https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-33825
+#    - https://www.cisa.gov/known-exploited-vulnerabilities-catalog?field_cve=CVE-2026-33825
+#    - https://www.huntress.com/blog/nightmare-eclipse-intrusion
+#    - https://cve.org/CVERecord?id=CVE-2026-33825
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Sysmon deployed on all Windows endpoints with the following event types:
+#     - Event 1  (Process Creation) with full command-line logging
+#     - Event 3  (Network Connection) from MsMpEng.exe and agent binaries
+#     - Event 11 (File Create) to catch MsMpEng.exe writing to user paths
+#     - Event 13 (Registry Set) for cloud-sync provider / SyncRootManager keys
+#
+#  2. Windows Defender operational channel forwarded:
+#     - Microsoft-Windows-Windows Defender/Operational (Event IDs 1006, 1007,
+#       1116, 1117) for threat detection / EICAR / BluHmr classification
+#
+#  3. Audit Policy enabled (Security log):
+#     - "Audit Process Creation" (Success) with CommandLine logging (4688)
+#     - "Audit Handle Manipulation" (Success) for SAM / SYSTEM hive access
+#
+#  4. Defender Antimalware Platform version attribute collected via endpoint
+#     inventory (Get-MpComputerStatus -> AMEngineVersion / AMServiceVersion)
+#     and forwarded to index=endpoint_inventory sourcetype="defender:status"
+#
+#  5. Upload the following lookup tables to Splunk:
+#     - bluehammer_ioc_hashes.csv      (sha256, filename, malware_family)
+#     - bluehammer_ioc_domains.csv     (domain, description)
+#     - bluehammer_ioc_ips.csv         (ip, country, description)
+#     - defender_minimum_version.csv   (min_patched_version)
+#
+#  6. For network rules: Zeek/Corelight or Palo Alto URL/DNS logging forwarded.
+#
+# ==============================================================================
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#  IOC REFERENCE — CVE-2026-33825 / BlueHammer
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+#  Exploit Binaries (observed filenames — hashes vary per build):
+#    FunnyApp.exe       BlueHammer PoC variant
+#    RedSun.exe         BlueHammer variant
+#    undef.exe          UnDefend utility (Defender manipulation)
+#    z.exe              Renamed UnDefend variant
+#
+#  Post-Exploitation Agent (BeigeBurrow):
+#    SHA-256: a2b6c7a9c4490df70de3cdbfa5fc801a3e1cf6a872749259487e354de2876b7c
+#    Filename: agent.exe
+#    CmdLine : agent.exe -server staybud.dpdns[.]org:443 -hide
+#
+#  C2 Infrastructure:
+#    staybud.dpdns[.]org   (port 443, yamux reverse tunnel)
+#
+#  Defender Classification (Microsoft):
+#    Exploit:Win32/DfndrPEBluHmr.BZ
+#
+#  Initial Access (FortiGate SSL-VPN credential compromise) source IPs:
+#    78.29.48[.]29        (Russia)
+#    212.232.23[.]69      (Singapore)
+#    179.43.140[.]214     (Switzerland)
+#
+#  Patched Defender Antimalware Platform version:
+#    4.18.26030.3011       (any lower version is vulnerable)
+#
+#  Staging Paths commonly observed:
+#    C:\Users\<user>\Pictures\
+#    C:\Users\<user>\Downloads\ks\
+#    C:\Users\<user>\Downloads\kk\
+#
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: MsMpEng.exe Writing to User-Writable Directory (SAM Exfiltration)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Core behavioral detection for CVE-2026-33825. The exploit coerces Defender
+#  (MsMpEng.exe) into writing a "signature update output" file that actually
+#  contains the contents of the SAM hive, into a location the unprivileged
+#  attacker can read. Under normal operation, MsMpEng.exe only writes into
+#  %ProgramData%\Microsoft\Windows Defender\ and %ProgramFiles%\Windows
+#  Defender\ paths. A write into C:\Users\* — especially a user profile
+#  other than SYSTEM — is a strong signal of BlueHammer SAM extraction.
+#
+#  Confidence  : VERY HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very low — MsMpEng never writes to user profile paths
+
+rule_1_msmpeng_writing_to_user_path:
+  name: "CVE-2026-33825 — MsMpEng.exe Writing to User-Writable Path (BlueHammer SAM Extraction)"
+  description: >
+    Detects the Microsoft Defender antimalware engine (MsMpEng.exe) creating
+    files inside a user profile directory (C:\Users\*) or other non-Defender
+    writable path. This is the signature behavior of CVE-2026-33825 exploitation
+    (BlueHammer), where the attacker coerces Defender to write the contents of
+    the SAM hive — read from a frozen VSS snapshot via an oplock-induced path
+    redirect — into an attacker-readable output directory. MsMpEng.exe under
+    normal operation writes only to %ProgramData%\Microsoft\Windows Defender\
+    and %ProgramFiles%\Windows Defender\ and must never write into a user
+    profile.
+  mitre:
+    tactic: "Credential Access"
+    technique: "T1003.002"
+    sub_technique: "T1003.002"
+    technique_name: "OS Credential Dumping: Security Account Manager"
+  severity: CRITICAL
+  confidence: VERY_HIGH
+  risk_score: 98
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=11
+    Image="*\\MsMpEng.exe"
+    (TargetFilename="C:\\Users\\*"
+     OR TargetFilename="C:\\Temp\\*"
+     OR TargetFilename="C:\\Windows\\Temp\\*"
+     OR TargetFilename="C:\\PerfLogs\\*"
+     OR TargetFilename="C:\\ProgramData\\Public\\*")
+    NOT TargetFilename="*\\Microsoft\\Windows Defender\\*"
+    NOT TargetFilename="*\\Windows Defender\\Scans\\*"
+    | eval target_dir=mvindex(split(TargetFilename, "\\"), 2)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(TargetFilename) as files_written
+      values(ProcessGuid) as process_guid
+      values(User) as users
+      by Computer Image target_dir
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer Image target_dir files_written users process_guid
+      first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-33825 BlueHammer: MsMpEng.exe wrote to user path on $Computer$"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$" (Image="*\\MsMpEng.exe" OR ProcessGuid="$process_guid$")
+        earliest=-1h
+      recommended_actions:
+        - Isolate $Computer$ from the network immediately — treat as SYSTEM-level compromise.
+        - Capture volatile memory and a full triage image before reboot.
+        - Dump and review the files_written list; any file that parses as a registry hive (SAM / SYSTEM / SECURITY) confirms SAM extraction.
+        - Rotate the NT hash of every local account on $Computer$ and any account that has logged on interactively in the last 30 days.
+        - Hunt for lateral pass-the-hash / overpass-the-hash from $Computer$ across the estate (4624 type 3/9, Kerberos RC4 anomalies).
+        - Verify Defender Antimalware Platform version on $Computer$ is >= 4.18.26030.3011; force-update if not.
+        - Preserve the contents of C:\Users\<user>\Pictures, Downloads\ks, Downloads\kk and any Sysmon EventCode=11/13 events for the 2 hours preceding first_seen.
+    risk:
+      score: 98
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "None expected. MsMpEng.exe writing into a user profile is not a legitimate operation."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Microsoft Defender Classification — Exploit:Win32/DfndrPEBluHmr.BZ
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Direct detection: Microsoft itself classifies known BlueHammer PoC samples
+#  as Exploit:Win32/DfndrPEBluHmr.BZ. A Defender detection of this signature
+#  on any endpoint indicates the exploit binary was present, whether or not
+#  execution succeeded.
+#
+#  Confidence  : VERY HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : None — the signature is specific to BlueHammer
+
+rule_2_defender_bluehmr_signature_hit:
+  name: "CVE-2026-33825 — Defender Detected Exploit:Win32/DfndrPEBluHmr.BZ"
+  description: >
+    Detects Microsoft Defender alerts where the threat name is
+    Exploit:Win32/DfndrPEBluHmr.BZ — the Microsoft-assigned classification
+    for BlueHammer PoC binaries targeting CVE-2026-33825. Event ID 1116 /
+    1117 in the Windows Defender Operational channel, or the equivalent
+    record in ms:defender:alerts, indicates the exploit was written to disk
+    on the endpoint. Always investigate even when Defender claims to have
+    quarantined the file — subsequent variants may evade this signature.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1068"
+    sub_technique: ""
+    technique_name: "Exploitation for Privilege Escalation"
+  severity: CRITICAL
+  confidence: VERY_HIGH
+  risk_score: 95
+  search: >
+    (index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Windows Defender/Operational"
+      (EventCode=1116 OR EventCode=1117)
+      (Threat_Name="Exploit:Win32/DfndrPEBluHmr*"
+       OR Message="*DfndrPEBluHmr*"))
+    OR
+    (index=defender sourcetype="ms:defender:alerts"
+      ThreatName="Exploit:Win32/DfndrPEBluHmr*")
+    | eval threat=coalesce(Threat_Name, ThreatName)
+    | eval host=coalesce(Computer, DeviceName)
+    | eval path=coalesce(Path, FilePath, FileName)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(threat) as threats
+      values(path) as file_paths
+      values(User) as users
+      by host
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table host threats file_paths users first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-33825 BlueHammer: Defender detected DfndrPEBluHmr on $host$"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$host$" EventCode=1 earliest=-2h
+      recommended_actions:
+        - Treat as attempted privilege escalation. The attacker already had local code execution on $host$.
+        - Investigate how the BlueHammer binary arrived — email, web download, lateral movement.
+        - Review Sysmon EventCode=1 for the 2 hours preceding first_seen and identify the parent process that dropped the file.
+        - Rotate credentials of any user that was interactively logged on at first_seen.
+        - Verify Defender version is at or above 4.18.26030.3011.
+    risk:
+      score: 95
+      object_type: "system"
+      object_field: "host"
+  false_positives:
+    - "Authorized red-team / purple-team exercise of CVE-2026-33825 — validate with the security operations calendar before closing."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Known BlueHammer Binary Name Executed
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Attackers in the Nightmare-Eclipse intrusion executed multiple renamed
+#  BlueHammer/UnDefend variants from user Downloads subfolders:
+#    - FunnyApp.exe, RedSun.exe, undef.exe, z.exe
+#    - Observed command lines included "-h" and "-agressive" flags (misspelled)
+#      which UnDefend does not support, indicating unfamiliar operators.
+#  This rule catches any of these filenames launching regardless of hash.
+#
+#  Confidence  : HIGH
+#  Severity    : HIGH
+#  FP Rate     : Low — these filenames are not legitimate Windows binaries
+
+rule_3_known_bluehammer_binary_execution:
+  name: "CVE-2026-33825 — Known BlueHammer / UnDefend Binary Execution"
+  description: >
+    Detects execution of a process whose image filename matches known
+    BlueHammer or UnDefend variant names observed in the Huntress
+    Nightmare-Eclipse intrusion: FunnyApp.exe, RedSun.exe, undef.exe, z.exe.
+    Also flags suspicious misspelled command-line flags ("-agressive")
+    observed from operators copy-pasting from the public PoC README.
+    Execution from user Downloads\ks or Downloads\kk subfolders further
+    increases confidence.
+  mitre:
+    tactic: "Execution"
+    technique: "T1204.002"
+    sub_technique: "T1204.002"
+    technique_name: "User Execution: Malicious File"
+  severity: HIGH
+  confidence: HIGH
+  risk_score: 88
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=1
+    (Image="*\\FunnyApp.exe" OR Image="*\\RedSun.exe"
+     OR Image="*\\undef.exe" OR Image="*\\z.exe"
+     OR OriginalFileName="undef.exe"
+     OR OriginalFileName="BlueHammer.exe"
+     OR CommandLine="*-agressive*")
+    | eval image_name=mvindex(split(Image, "\\"), -1)
+    | eval suspicious_path=if(match(Image, "(?i)\\\\Downloads\\\\(ks|kk)\\\\"), "true", "false")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(image_name) as image_names
+      values(Image) as image_paths
+      values(CommandLine) as command_lines
+      values(ParentImage) as parent_images
+      values(User) as users
+      values(suspicious_path) as in_suspicious_path
+      by Computer
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer image_names image_paths command_lines parent_images
+      users in_suspicious_path first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-33825 BlueHammer: Known exploit binary executed on $Computer$"
+      severity: high
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$" (EventCode=1 OR EventCode=3 OR EventCode=11)
+        earliest=-1h
+      recommended_actions:
+        - Isolate $Computer$ and preserve forensic evidence.
+        - Hash and submit image_paths to internal/third-party sandboxes.
+        - Correlate with Rule 1 (MsMpEng writes) to determine whether SAM extraction succeeded.
+        - Pull the dropping parent process and determine initial access vector (browser, email, lateral).
+    risk:
+      score: 88
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Legitimate software genuinely named FunnyApp.exe or RedSun.exe — validate by publisher signature and image hash."
+    - "Approved pentest / red-team exercise — confirm against engagement scope."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: BeigeBurrow Post-Exploitation Agent (Known Hash / C2)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  After SYSTEM privilege escalation via BlueHammer, operators in the
+#  Nightmare-Eclipse intrusion deployed the BeigeBurrow yamux-multiplexing
+#  reverse tunnel (agent.exe) to staybud.dpdns[.]org:443. Detection of the
+#  known SHA-256 or the C2 domain is a high-fidelity indicator of the same
+#  campaign, even if the BlueHammer exploit itself was not observed.
+#
+#  Confidence  : VERY HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : None — dedicated campaign IOCs
+
+rule_4_beigeburrow_c2_activity:
+  name: "CVE-2026-33825 — BeigeBurrow Agent Hash or staybud.dpdns.org C2 Observed"
+  description: >
+    Detects either the known SHA-256 of the BeigeBurrow post-exploitation
+    agent (a2b6c7a9c4490df70de3cdbfa5fc801a3e1cf6a872749259487e354de2876b7c),
+    or outbound communication to the C2 domain staybud.dpdns[.]org observed
+    in the Huntress Nightmare-Eclipse intrusion following BlueHammer
+    privilege escalation. Agent is commonly launched with the command line
+    "agent.exe -server staybud.dpdns[.]org:443 -hide".
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1071.001"
+    sub_technique: ""
+    technique_name: "Application Layer Protocol: Web Protocols"
+  severity: CRITICAL
+  confidence: VERY_HIGH
+  risk_score: 96
+  search: >
+    (index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+      EventCode=1
+      (SHA256="a2b6c7a9c4490df70de3cdbfa5fc801a3e1cf6a872749259487e354de2876b7c"
+       OR CommandLine="*staybud.dpdns*"
+       OR CommandLine="*-server*staybud*"))
+    OR
+    (index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+      EventCode=22 QueryName="staybud.dpdns.org")
+    OR
+    (index=zeek sourcetype="zeek:dns" query="staybud.dpdns.org")
+    OR
+    (index=panw sourcetype="pan:threat" url="*staybud.dpdns.org*")
+    | eval host=coalesce(Computer, src_host, src)
+    | eval indicator=coalesce(SHA256, QueryName, query, url)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(indicator) as indicators
+      values(CommandLine) as command_lines
+      values(Image) as images
+      values(User) as users
+      by host
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table host indicators command_lines images users first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-33825 BlueHammer: BeigeBurrow C2 indicator on $host$"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$host$" (EventCode=1 OR EventCode=3 OR EventCode=22)
+        earliest=-24h
+      recommended_actions:
+        - Treat $host$ as actively compromised. Isolate and preserve evidence.
+        - Block staybud.dpdns[.]org and any resolved IPs at the egress firewall and DNS resolvers.
+        - Review DNS / proxy logs estate-wide for any other host that resolved staybud.dpdns.org in the last 90 days.
+        - Hunt for the BeigeBurrow SHA-256 across all endpoints via EDR.
+        - Assume credentials on $host$ are compromised; initiate credential rotation and Kerberos ticket invalidation for impacted users.
+    risk:
+      score: 96
+      object_type: "system"
+      object_field: "host"
+  false_positives:
+    - "None expected — staybud.dpdns[.]org and the listed SHA-256 are campaign-specific IOCs."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: EICAR Test String Dropped by Unprivileged Process (Defender Trigger)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  BlueHammer stage 1 intentionally drops the EICAR test string to a user-
+#  writable path to force Defender into scanning, which in turn creates a
+#  Volume Shadow Copy snapshot the exploit depends on. Defender will detect
+#  and log EICAR (Event 1116) — the suspicious signal is not the EICAR hit
+#  itself but the fact that an unprivileged user-session process wrote it
+#  to a profile directory, outside any security-testing context.
+#
+#  Confidence  : MEDIUM
+#  Severity    : HIGH
+#  FP Rate     : Medium — security engineers legitimately test EICAR
+
+rule_5_eicar_drop_as_defender_trigger:
+  name: "CVE-2026-33825 — EICAR Dropped in User Profile (Possible BlueHammer Stage 1)"
+  description: >
+    Detects a Defender EICAR detection (Event 1116) where the file path is
+    inside a user profile or user-writable staging location (Pictures,
+    Downloads, Desktop, Temp). CVE-2026-33825 exploitation begins by dropping
+    EICAR to force a Defender scan and VSS snapshot creation. EICAR detections
+    in legitimate security-testing workflows normally originate from
+    administrative workstations owned by the security team. When combined
+    with Rule 1 (MsMpEng writing to user path) within a short window, this
+    is very high confidence for BlueHammer.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1562.001"
+    sub_technique: "T1562.001"
+    technique_name: "Impair Defenses: Disable or Modify Tools"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 70
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Windows Defender/Operational"
+    EventCode=1116
+    (Threat_Name="*EICAR*" OR Message="*EICAR*")
+    (Path="C:\\Users\\*\\Pictures\\*"
+     OR Path="C:\\Users\\*\\Downloads\\*"
+     OR Path="C:\\Users\\*\\Desktop\\*"
+     OR Path="C:\\Users\\*\\AppData\\Local\\Temp\\*")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(Threat_Name) as threat_names
+      values(Path) as paths
+      values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer threat_names paths users first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-11m@m"
+  throttle:
+    field: "Computer"
+    period: "60m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-33825: EICAR in user profile on $Computer$ (possible BlueHammer stage 1)"
+      severity: high
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$" EventCode=11 TargetFilename="C:\\Users\\*"
+        earliest=-1h
+      recommended_actions:
+        - Correlate with Rule 1 (MsMpEng writing to user path) within the next 2 hours on the same $Computer$.
+        - Identify the parent process that wrote the EICAR file via Sysmon EventCode=11.
+        - If the owning user is not on the security / red-team roster, treat as suspected BlueHammer stage 1.
+        - Preserve Volume Shadow Copies on $Computer$ for forensic analysis before any reboot.
+    risk:
+      score: 70
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Security team AV testing — maintain an allowlist of authorized tester users and workstations."
+    - "Sandbox or malware-analysis VMs where EICAR is intentionally dropped — exclude by Computer."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Post-Exploitation Recon Chain after MsMpEng Anomaly
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The Nightmare-Eclipse intrusion showed a distinctive recon sequence after
+#  privilege escalation: whoami /priv, cmdkey /list, net group — in some
+#  cases spawned from unusual parents (e.g. M365Copilot.exe, suggesting
+#  process injection into a signed application to hide SYSTEM activity).
+#  This rule fires when two or more of these commands run on a host within
+#  a short window.
+#
+#  Confidence  : MEDIUM
+#  Severity    : HIGH
+#  FP Rate     : Medium — admins and helpdesk run these commands
+
+rule_6_post_escalation_recon_sequence:
+  name: "CVE-2026-33825 — Post-Escalation Recon Chain (whoami /priv + cmdkey /list + net group)"
+  description: >
+    Detects two or more of the following reconnaissance commands executed on
+    the same host within a 10-minute window: "whoami /priv", "cmdkey /list",
+    "net group" / "net localgroup". This sequence was observed by Huntress
+    immediately following BlueHammer privilege escalation. Parent process of
+    "M365Copilot.exe" or another signed desktop application for any of these
+    children raises confidence that SYSTEM activity is being hidden behind
+    a legitimate binary via token/process injection.
+  mitre:
+    tactic: "Discovery"
+    technique: "T1087.001"
+    sub_technique: "T1087.001"
+    technique_name: "Account Discovery: Local Account"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 72
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=1
+    (CommandLine="*whoami*/priv*"
+     OR CommandLine="*cmdkey*/list*"
+     OR CommandLine="*net*group*"
+     OR CommandLine="*net*localgroup*administrators*")
+    | eval recon_type=case(
+        match(CommandLine, "(?i)whoami.*\\s/priv"), "whoami_priv",
+        match(CommandLine, "(?i)cmdkey.*\\s/list"), "cmdkey_list",
+        match(CommandLine, "(?i)net\\s+(local)?group"), "net_group",
+        true(), "other")
+    | eval suspicious_parent=if(match(ParentImage, "(?i)(M365Copilot|teams|onedrive|explorer)\\.exe$"), "true", "false")
+    | stats count dc(recon_type) as distinct_recon_types
+      min(_time) as first_seen max(_time) as last_seen
+      values(recon_type) as recon_types
+      values(CommandLine) as command_lines
+      values(ParentImage) as parent_images
+      values(User) as users
+      values(suspicious_parent) as via_signed_parent
+      by Computer
+    | where distinct_recon_types >= 2
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer recon_types command_lines parent_images users
+      via_signed_parent first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-11m@m"
+  throttle:
+    field: "Computer"
+    period: "60m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-33825: Post-escalation recon sequence on $Computer$"
+      severity: high
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$" EventCode=1 earliest=-2h
+      recommended_actions:
+        - Correlate with Rules 1, 2, 3, 4 on the same Computer within 2 hours either side.
+        - If via_signed_parent = true, investigate the signed binary as a candidate process-injection target.
+        - Review Security 4624 logon events on $Computer$ for new admin sessions not originating from known admin accounts.
+    risk:
+      score: 72
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Interactive administrator sessions — validate by matching user against approved_admin_ips / domain_admin_accounts lookups."
+    - "Helpdesk remote assistance flows — exclude by expected ParentImage (e.g. RemoteAssistance.exe)."
+    - "Endpoint security agents performing local recon — allowlist by publisher-signed parent image."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: Unpatched Microsoft Defender Antimalware Platform (Posture)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Posture rule: identify endpoints still running a Defender Antimalware
+#  Platform version below the patched 4.18.26030.3011 build. This is not an
+#  attack detection but is critical exposure reduction. Pipe the output to
+#  your vulnerability management / patch workflow.
+#
+#  Confidence  : VERY HIGH
+#  Severity    : MEDIUM (posture)
+#  FP Rate     : None — this is a deterministic version comparison
+
+rule_7_defender_unpatched_posture:
+  name: "CVE-2026-33825 — Microsoft Defender Antimalware Platform Below 4.18.26030.3011"
+  description: >
+    Identifies endpoints reporting a Microsoft Defender Antimalware Platform
+    version earlier than 4.18.26030.3011, the patched build for CVE-2026-33825.
+    This rule depends on endpoint inventory data collected from
+    Get-MpComputerStatus (AMEngineVersion / AMServiceVersion) and forwarded
+    to index=endpoint_inventory sourcetype="defender:status". Adjust source
+    conventions to match your estate.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1068"
+    sub_technique: ""
+    technique_name: "Exploitation for Privilege Escalation"
+  severity: MEDIUM
+  confidence: VERY_HIGH
+  risk_score: 60
+  search: >
+    index=endpoint_inventory sourcetype="defender:status"
+    | stats latest(AMEngineVersion) as AMEngineVersion
+      latest(AMServiceVersion) as AMServiceVersion
+      latest(_time) as last_reported
+      by Computer
+    | eval parts=split(AMServiceVersion, ".")
+    | eval v_major=tonumber(mvindex(parts,0))
+    | eval v_minor=tonumber(mvindex(parts,1))
+    | eval v_build=tonumber(mvindex(parts,2))
+    | eval v_rev=tonumber(mvindex(parts,3))
+    | eval vulnerable=case(
+        v_major<4, "true",
+        v_major=4 AND v_minor<18, "true",
+        v_major=4 AND v_minor=18 AND v_build<26030, "true",
+        v_major=4 AND v_minor=18 AND v_build=26030 AND v_rev<3011, "true",
+        true(), "false")
+    | where vulnerable="true"
+    | eval last_reported=strftime(last_reported, "%Y-%m-%d %H:%M:%S")
+    | table Computer AMEngineVersion AMServiceVersion last_reported
+  schedule:
+    cron: "0 */6 * * *"
+    window: "-6h@h"
+  throttle:
+    field: "Computer"
+    period: "12h"
+  actions:
+    notable:
+      rule_title: "CVE-2026-33825: $Computer$ running unpatched Defender ($AMServiceVersion$)"
+      severity: medium
+      recommended_actions:
+        - Force Defender platform update on $Computer$ (Update-MpSignature -UpdateSource MicrosoftUpdateServer then reboot if required).
+        - Confirm the AMServiceVersion moves to >= 4.18.26030.3011 on the next inventory cycle.
+        - If the endpoint cannot be updated (air-gapped, legacy), increase monitoring sensitivity for Rules 1, 2, 3 on that host.
+    risk:
+      score: 60
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Stale inventory records — correlate last_reported age before treating as exposed."
+    - "Endpoints explicitly running a third-party AV (Defender disabled) — exclude via asset CMDB."
+
+
+# ==============================================================================
+#  CORRELATION SEARCH — Composite BlueHammer Kill Chain (Rules 1 + 2/3 + 4/6)
+# ==============================================================================
+#  For highest fidelity, deploy a correlation search that fires when any two
+#  of the above detections trigger on the same Computer within a 2-hour
+#  window. Suggested logic (pseudo-SPL):
+#
+#    `notable` search_name IN ("CVE-2026-33825 *")
+#    | stats dc(search_name) as rule_count values(search_name) as rules by host
+#    | where rule_count >= 2
+#
+#  A rule_count of 2+ should escalate to SEV-1 and trigger host isolation.
+# ==============================================================================
