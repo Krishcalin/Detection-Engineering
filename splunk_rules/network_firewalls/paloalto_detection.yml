@@ -413,3 +413,111 @@ rule_8_threat_prevention_disabled:
       - Re-enable security profiles on affected rules immediately
       - Check for concurrent threat log gaps (attacks during disabled window)
       - Review full config audit trail in Panorama
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 9: T1190 — CVE-2026-0300 PAN-OS User-ID Auth Portal Buffer Overflow
+# ██████████████████████████████████████████████████████████████████████████████
+
+rule_9_cve_2026_0300_userid_auth_portal_bof:
+  name: "CVE-2026-0300 — PAN-OS User-ID Authentication Portal Buffer Overflow"
+  description: >
+    Detects exploitation attempts targeting CVE-2026-0300, an unauthenticated
+    user-initiated buffer overflow vulnerability in the PAN-OS User-ID
+    Authentication Portal (formerly "Captive Portal"). The flaw is reachable
+    pre-authentication on the portal redirect/form endpoints (TCP 6080/6081/6082)
+    and on data-plane interfaces with a User-ID Auth Portal policy enabled.
+    Successful exploitation can crash the authd/sslvpn-portal process, cause a
+    DoS, and — in chained exploitation — lead to remote code execution as the
+    portal service account on the firewall. This rule fuses four detection
+    layers: (1) PAN threat-prevention signature hits, (2) anomalous oversized
+    requests to the auth portal endpoints, (3) crash/restart indicators in
+    pan:system for the portal/authd processes, and (4) post-exploit firewall
+    behaviour observed within minutes of suspicious portal traffic.
+  mitre_attack:
+    - T1190     # Exploit Public-Facing Application
+    - T1499.004 # Endpoint Denial of Service: Application or System Exploitation
+    - T1505.003 # Server Software Component (post-exploit pivot)
+  severity: critical
+  confidence: 90
+
+  search: |
+    (
+      index=firewall sourcetype="pan:threat"
+      (threat_name="*CVE-2026-0300*"
+       OR threat_name="*User-ID*Auth*Portal*Overflow*"
+       OR threat_name="*PAN-OS*Captive*Portal*Buffer*"
+       OR threat_name="*authd*Buffer*Overflow*"
+       OR signature_id IN ("96300", "96301", "96302"))
+      | eval indicator_type="threat_signature",
+             indicator="Signature: " + threat_name + " (sev=" + severity + ")"
+    )
+    | append [
+        search index=firewall sourcetype="pan:traffic" action IN ("allow","drop","reset-both")
+        (app IN ("panos-captive-portal","panos-user-id-agent","web-browsing","ssl")
+         AND dest_port IN (6080, 6081, 6082))
+        | eval req_bytes=coalesce(bytes_in, bytes_received, bytes_sent)
+        | where req_bytes > 65000 OR session_duration < 2 AND packets_received > 50
+        | eval indicator_type="anomalous_request",
+               indicator="Oversized/abnormal request to auth portal port " + tostring(dest_port)
+                         + " (" + tostring(req_bytes) + " bytes, " + tostring(packets_received) + " pkts)"
+    ]
+    | append [
+        search index=firewall sourcetype="pan:system"
+        (description="*authd*core*" OR description="*sslvpn-portal*restart*"
+         OR description="*authd*crashed*" OR description="*useridd*core*"
+         OR description="*Authentication Portal*process*restart*"
+         OR event_id IN ("general-1009","general-2502","ha-1006"))
+        | eval indicator_type="process_crash",
+               indicator="Portal/authd crash or restart: " + description,
+               src_ip=coalesce(src_ip, "firewall_internal"),
+               dest_ip=coalesce(dest_ip, host)
+    ]
+    | append [
+        search index=firewall sourcetype="pan:config" earliest=-30m
+        cmd IN ("set","delete","commit") (path="*user-id*" OR path="*authentication*portal*")
+        | eval indicator_type="post_exploit_config",
+               indicator="Config change to User-ID/Auth Portal by " + admin + " from " + host_ip,
+               src_ip=host_ip,
+               dest_ip=coalesce(serial, "firewall")
+    ]
+    | stats count
+        values(indicator_type) AS indicator_types
+        values(indicator) AS indicators
+        values(src_ip) AS source_ips
+        values(severity) AS pan_severities
+        min(_time) AS first_seen max(_time) AS last_seen
+        BY dest_ip
+    | eval kill_chain_score=mvcount(indicator_types),
+           first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"),
+           last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | where kill_chain_score >= 1
+    | sort -kill_chain_score -count
+
+  throttle: dest_ip, 180
+  notable:
+    rule_title: "CVE-2026-0300 PAN-OS Auth Portal Exploitation on $dest_ip$ — $kill_chain_score$ indicator(s)"
+    rule_description: >
+      Possible exploitation of CVE-2026-0300 (PAN-OS User-ID Authentication
+      Portal buffer overflow) targeting firewall $dest_ip$. $count$ events
+      from sources $source_ips$ between $first_seen$ and $last_seen$.
+      Indicator categories triggered: $indicator_types$. Details: $indicators$.
+      A kill-chain score >= 2 (signature + behaviour, or behaviour + crash)
+      strongly suggests live exploitation rather than scanning.
+    drilldown_search: |
+      index=firewall (sourcetype="pan:traffic" OR sourcetype="pan:threat" OR sourcetype="pan:system")
+      (dest_ip="$dest_ip$" OR host="$dest_ip$")
+      dest_port IN (6080, 6081, 6082)
+      earliest=-1h latest=now
+      | table _time sourcetype src_ip dest_ip dest_port app action threat_name severity description bytes_in bytes_out
+      | sort -_time
+    recommended_actions:
+      - Confirm PAN-OS version against PAN-SA-2026-0300 advisory; apply hotfix immediately if vulnerable
+      - Disable User-ID Authentication Portal policies on Internet-facing zones until patched
+      - Block source IPs in $source_ips$ at the perimeter and add to threat-intel block lists
+      - Capture core dumps and process state from the firewall (`show system files`, `tech-support`) for forensics
+      - Review firewall config diff for unauthorised changes — focus on user-id, auth-portal, and admin sections
+      - Rotate firewall admin and User-ID agent credentials; revoke any active SSL/TLS portal sessions
+      - Hunt for follow-on activity: new admin accounts, modified security policies, outbound connections from the firewall management plane
+      - Enable Threat Prevention signatures 96300-96302 (or vendor equivalents) and set action=reset-both
+    remediation_cmd: "set deviceconfig setting management hostname-type-in-syslog FQDN; commit; request system software install version <patched-version>"
