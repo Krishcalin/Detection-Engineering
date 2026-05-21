@@ -1,0 +1,750 @@
+# ==============================================================================
+#  CVE-2026-41091 — Microsoft Defender MMPE Symlink-Follow LPE Detection
+# ==============================================================================
+#  Description : Multi-layered detection for CVE-2026-41091, a local privilege
+#                escalation in the Microsoft Malware Protection Engine (MMPE,
+#                loaded by MsMpEng.exe) versions prior to 1.1.26040.8.
+#                Classified as CWE-59 (Improper Link Resolution Before File
+#                Access). CVSS 7.8 (HIGH). Added to CISA's Known Exploited
+#                Vulnerabilities catalog on 2026-05-20 following observed
+#                in-the-wild exploitation.
+#
+#                The vulnerability is that MMPE does not adequately validate
+#                the target path of an NTFS reparse point (junction / symbolic
+#                link / mount point) when it accesses a file as part of a
+#                scan, quarantine action, or log/output write. A low-privileged
+#                local attacker plants a reparse point in a user-writable
+#                location pointing at a SYSTEM-owned target (e.g., a registry
+#                hive backup, a service binary, a scheduled-task XML, the
+#                Defender platform binary itself, or any file under
+#                %WINDIR%\System32). When MMPE — running as SYSTEM — follows
+#                the link, it reads, writes, or deletes the link target with
+#                its own elevated token. This converts a low-priv file
+#                primitive into a SYSTEM file primitive without needing any
+#                separate kernel exploit.
+#
+#                Canonical attack chain:
+#                  1. Attacker (low-priv local user or unprivileged service
+#                     account) creates a junction/symlink at a path Defender
+#                     will touch — typically inside a user profile, the
+#                     quarantine staging directory, or a logging output path.
+#                  2. Attacker triggers Defender to act on the link — by
+#                     dropping a known-bad file (EICAR, signed test sample),
+#                     by requesting a quarantine restore via MpCmdRun, or by
+#                     waiting for a scheduled scan to enumerate the path.
+#                  3. MMPE follows the reparse point and operates on the
+#                     SYSTEM-owned target. Common outcomes:
+#                        - Arbitrary file write -> drop a malicious DLL into
+#                          a DLL search path of a SYSTEM service.
+#                        - Arbitrary file delete -> remove a marker file that
+#                          gates a service security check.
+#                        - Arbitrary file overwrite -> corrupt the SAM/SYSTEM
+#                          hive backup; restore the hive on next boot and
+#                          gain admin via planted account.
+#                  4. SYSTEM-level execution achieved via the staged DLL /
+#                     service / scheduled task.
+#
+#                Detection focuses on three behavioral signals:
+#                  (a) MsMpEng.exe writing to, deleting, or reading from
+#                      SYSTEM-protected paths it would not legitimately
+#                      touch outside its own ProgramData/ProgramFiles trees.
+#                  (b) The creation of NTFS reparse points by low-privileged
+#                      users / processes inside paths Defender will enumerate.
+#                  (c) Post-exploitation SYSTEM-context process execution
+#                      whose binary or scheduled-task was modified by MsMpEng
+#                      in the immediately preceding window.
+#                Plus a posture rule for unpatched MMPE.
+#
+#  MITRE ATT&CK: T1068 (Exploitation for Privilege Escalation),
+#                T1574 (Hijack Execution Flow — DLL planted via the arbitrary
+#                      write primitive),
+#                T1006 (Direct Volume Access — sometimes used to read the
+#                      protected target via the link),
+#                T1003.002 (OS Credential Dumping: SAM — common end goal),
+#                T1562.001 (Impair Defenses: when Defender's own files are
+#                      the link target)
+#  Kill Chain   : Initial Access (any) -> Execution (user-context) ->
+#                 Privilege Escalation (CVE-2026-41091) -> Persistence /
+#                 Credential Access / Defense Evasion
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : XmlWinEventLog:Microsoft-Windows-Sysmon/Operational,
+#                 XmlWinEventLog:Microsoft-Windows-Windows Defender/Operational,
+#                 XmlWinEventLog:Security, ms:defender:advanced,
+#                 ms:defender:alerts, XmlWinEventLog:Application
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-05-21
+#  License      : MIT
+#
+#  References:
+#    - https://msrc.microsoft.com/update-guide/en-US/vulnerability/CVE-2026-41091
+#    - https://www.cisa.gov/news-events/alerts/2026/05/20/cisa-adds-seven-known-exploited-vulnerabilities-catalog
+#    - https://cve.org/CVERecord?id=CVE-2026-41091
+#    - https://cwe.mitre.org/data/definitions/59.html
+#    - https://attack.mitre.org/techniques/T1068/
+#    - https://attack.mitre.org/techniques/T1574/
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Sysmon deployed on all Windows endpoints with the following event types:
+#     - Event 1  (Process Creation) with full command-line logging
+#     - Event 5  (Process Terminated)
+#     - Event 11 (File Create) — catches both file writes and reparse-point
+#                  creation when the FILE_FLAG_OPEN_REPARSE_POINT path is used
+#     - Event 12/13/14 (Registry) — for service / scheduled task tampering
+#     - Event 23 (File Delete) — for MsMpEng deleting SYSTEM files via link
+#     - Event 26 (File Delete Detected) — for tombstone records
+#
+#  2. Windows Defender operational channel forwarded:
+#     - Microsoft-Windows-Windows Defender/Operational
+#         1006, 1007, 1116, 1117 (threat actions — used as trigger evidence)
+#         1009, 1011, 1012        (quarantine restore / delete — link follow)
+#         5007                    (configuration changed)
+#
+#  3. Audit Policy enabled (Security log):
+#     - "Audit File System" (Success/Failure) on SYSTEM-protected paths
+#       (C:\\Windows\\System32, C:\\Windows\\Tasks, C:\\Windows\\SysWOW64,
+#       C:\\Windows\\System32\\config) so that Event 4663/4660 records
+#       MsMpEng.exe access by handle.
+#     - "Audit Handle Manipulation" (Success) for SAM / SYSTEM hive access.
+#     - "Audit Process Creation" (Success) with CommandLine logging (4688).
+#
+#  4. Defender Antimalware Platform / Engine version attribute collected via
+#     endpoint inventory (Get-MpComputerStatus -> AMEngineVersion /
+#     AMServiceVersion / AMProductVersion) and forwarded to
+#     index=endpoint_inventory sourcetype="defender:status".
+#
+#  5. Upload the following lookup table to Splunk:
+#     - defender_minimum_engine_version_cve_2026_41091.csv
+#         min_patched_AMEngineVersion (string, e.g. "1.1.26040.8")
+#       Update this when Microsoft confirms the fixed engine build.
+#
+#  6. Optional (high signal-to-noise): a custom Sysmon ruleset including
+#     EID 11 with the IncludeReparsePoint condition matching
+#     TargetFilename="C:\\Users\\*" AND TargetFilename containing
+#     reparse-point indicators (see Rule 2 for SPL handling).
+#
+# ==============================================================================
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#  REFERENCE — Tools commonly used to plant the reparse point
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+#   cmd built-ins:
+#     mklink /J  <link> <target>   directory junction (no admin required)
+#     mklink /D  <link> <target>   directory symlink (admin or developer mode)
+#     mklink     <link> <target>   file symlink (admin or developer mode)
+#
+#   PowerShell:
+#     New-Item -ItemType Junction       -Path <link> -Target <target>
+#     New-Item -ItemType SymbolicLink   -Path <link> -Target <target>
+#
+#   Native API (high-end implants):
+#     CreateSymbolicLinkW
+#     DeviceIoControl(FSCTL_SET_REPARSE_POINT)
+#     NtCreateFile + FILE_OPEN_REPARSE_POINT
+#
+#   Common public PoC tooling that produces the same artefact:
+#     James Forshaw's "symboliclink-testing-tools" (CreateSymlink.exe,
+#     CreateMountPoint.exe, CreateNtMountPoint.exe).
+#
+#   Patched Microsoft Malware Protection Engine version:
+#     1.1.26040.8   (any AMEngineVersion lower is vulnerable)
+#
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: MsMpEng.exe / MpCmdRun.exe Writing to a SYSTEM-Protected Path
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Highest-fidelity behavioral signal of CVE-2026-41091 exploitation. MMPE
+#  (running as SYSTEM inside MsMpEng.exe or MpCmdRun.exe) is coerced via a
+#  reparse point into writing a file under a SYSTEM-protected directory.
+#  Under normal operation, MsMpEng writes only to %ProgramData%\Microsoft\
+#  Windows Defender\ and %ProgramFiles%\Windows Defender\ trees. A write
+#  into System32, Tasks, drivers\, Spool\Drivers, or the registry config
+#  directory is not a legitimate Defender operation — it is the LPE
+#  primitive landing.
+#
+#  Confidence  : VERY HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very low — these write targets are not in MsMpEng's
+#                legitimate scope
+
+rule_1_msmpeng_writing_to_system_path:
+  name: "CVE-2026-41091 — MsMpEng.exe Writing to SYSTEM-Protected Path (Symlink LPE Primitive)"
+  description: >
+    Detects the Microsoft Defender antimalware engine (MsMpEng.exe) or the
+    Defender command runner (MpCmdRun.exe) creating or modifying a file
+    inside a SYSTEM-protected directory: C:\Windows\System32\,
+    C:\Windows\SysWOW64\, C:\Windows\Tasks\, C:\Windows\System32\Tasks\,
+    C:\Windows\System32\config\ (registry hives), C:\Windows\System32\
+    spool\drivers\, or C:\Windows\System32\drivers\. This is the signature
+    behavior of CVE-2026-41091 exploitation: an attacker planted a reparse
+    point that redirected an MMPE file operation onto a SYSTEM-owned target,
+    and MMPE — running as SYSTEM — followed the link and wrote to the
+    redirect target. Under normal operation, neither MsMpEng.exe nor
+    MpCmdRun.exe writes anywhere outside of their %ProgramData% and
+    %ProgramFiles% trees.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1068"
+    sub_technique: ""
+    technique_name: "Exploitation for Privilege Escalation"
+  severity: CRITICAL
+  confidence: VERY_HIGH
+  risk_score: 96
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=11
+    (Image="*\\MsMpEng.exe" OR Image="*\\MpCmdRun.exe" OR Image="*\\MsMpEngCP.exe")
+    (TargetFilename="C:\\Windows\\System32\\*"
+     OR TargetFilename="C:\\Windows\\SysWOW64\\*"
+     OR TargetFilename="C:\\Windows\\Tasks\\*"
+     OR TargetFilename="C:\\Windows\\System32\\Tasks\\*"
+     OR TargetFilename="C:\\Windows\\System32\\config\\*"
+     OR TargetFilename="C:\\Windows\\System32\\drivers\\*"
+     OR TargetFilename="C:\\Windows\\System32\\spool\\drivers\\*"
+     OR TargetFilename="C:\\Windows\\Microsoft.NET\\*"
+     OR TargetFilename="C:\\Windows\\WinSxS\\*"
+     OR TargetFilename="C:\\Windows\\System32\\wbem\\*")
+    NOT TargetFilename="*\\Windows Defender\\*"
+    | eval target_root=mvindex(split(TargetFilename, "\\"), 2)
+    | eval target_subdir=mvindex(split(TargetFilename, "\\"), 3)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(TargetFilename) as files_written
+      values(Image) as defender_images
+      values(ProcessGuid) as process_guid
+      values(User) as users
+      by Computer target_root target_subdir
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer defender_images target_root target_subdir files_written
+      users process_guid first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-41091: MsMpEng.exe wrote to SYSTEM-protected path on $Computer$ ($target_root$\\$target_subdir$)"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$" (EventCode=11 OR EventCode=23 OR EventCode=1)
+        earliest=-1h
+      recommended_actions:
+        - Isolate $Computer$ from the network immediately — treat as SYSTEM-level compromise.
+        - Capture volatile memory and a full triage image before reboot.
+        - Acquire the file at files_written paths before reboot — those bytes were under attacker control and are now executing or persisting as SYSTEM.
+        - Hunt for the staging reparse point (junction / symlink) in user-writable directories on $Computer$ — typically C:\\Users\\<user>\\* or C:\\ProgramData\\<vendor>\\* — using "fsutil reparsepoint query" or "dir /AL".
+        - If files_written includes a scheduled-task XML, list new/modified tasks via "schtasks /query /v" and disable any unsigned/unfamiliar tasks immediately.
+        - If files_written includes a driver / .sys file, check loaded drivers via "driverquery /v" and the registry HKLM\System\CurrentControlSet\Services for new entries.
+        - Rotate the NT hash of every local account on $Computer$ and any account that has logged on interactively in the last 30 days.
+        - Verify Defender Antimalware Engine version (AMEngineVersion) on $Computer$ is >= 1.1.26040.8; force-update if not.
+    risk:
+      score: 96
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "None expected. MsMpEng.exe / MpCmdRun.exe writing into System32, Tasks, drivers, or config is not a legitimate operation."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: NTFS Reparse Point Creation by User-Context Process
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The attacker's setup step: planting a directory junction, mount point,
+#  or symbolic link in a path Defender will enumerate. Detects use of
+#  mklink (cmd.exe builtin), New-Item -ItemType Junction|SymbolicLink
+#  (PowerShell), and known public reparse-point-creation tools
+#  (CreateSymlink.exe, CreateMountPoint.exe from Forshaw's testing kit).
+#  High-confidence when (a) the source path is user-writable AND (b) the
+#  target path is a SYSTEM-protected location.
+#
+#  Confidence  : HIGH
+#  Severity    : HIGH
+#  FP Rate     : Medium — developers and admins legitimately use mklink,
+#                but rarely from inside a user profile
+
+rule_2_reparse_point_creation_to_system_target:
+  name: "CVE-2026-41091 — Reparse Point Planted by User Process Targeting SYSTEM Path"
+  description: >
+    Detects creation of an NTFS junction, mount point, or symbolic link via
+    mklink, PowerShell New-Item -ItemType Junction|SymbolicLink, or known
+    reparse-point tooling (CreateSymlink.exe, CreateMountPoint.exe,
+    CreateNtMountPoint.exe), where the link source is in a user-writable
+    path and the target is a SYSTEM-owned location. This is the staging
+    primitive for CVE-2026-41091 — the planted link redirects a subsequent
+    MMPE file operation onto an attacker-chosen SYSTEM target. Also matches
+    direct call-out to NtCreateFile / DeviceIoControl reparse-point flags
+    if logged by EDR. Note: PR:L on the CVE means the attacker may already
+    be running with low privileges, so a non-admin user creating these
+    links is not in itself unusual — the combination of user-writable
+    source and SYSTEM target is what matters.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1068"
+    sub_technique: ""
+    technique_name: "Exploitation for Privilege Escalation"
+  severity: HIGH
+  confidence: HIGH
+  risk_score: 85
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=1
+    (
+      (Image="*\\cmd.exe" CommandLine="*mklink*"
+        (CommandLine="*/J*" OR CommandLine="*/D*" OR CommandLine="* /j *"
+         OR CommandLine="* /d *"))
+      OR
+      (Image="*\\powershell*.exe"
+        CommandLine="*New-Item*"
+        (CommandLine="*Junction*" OR CommandLine="*SymbolicLink*"))
+      OR
+      (Image="*\\CreateSymlink.exe" OR Image="*\\CreateMountPoint.exe"
+       OR Image="*\\CreateNtMountPoint.exe"
+       OR OriginalFileName="CreateSymlink.exe"
+       OR OriginalFileName="CreateMountPoint.exe")
+    )
+    | eval link_tool=case(
+        match(Image, "(?i)cmd\\.exe$"), "mklink",
+        match(Image, "(?i)powershell.*\\.exe$"), "powershell_newitem",
+        match(Image, "(?i)CreateSymlink\\.exe$"), "createsymlink_forshaw",
+        match(Image, "(?i)CreateMountPoint\\.exe$"), "createmountpoint_forshaw",
+        match(Image, "(?i)CreateNtMountPoint\\.exe$"), "createntmountpoint_forshaw",
+        true(), "other")
+    | rex field=CommandLine "(?i)mklink\\s+/[JD]\\s+\"?(?<link_src>[^\"\\s]+)\"?\\s+\"?(?<link_tgt>[^\"\\s]+)\"?"
+    | rex field=CommandLine "(?i)New-Item.*-Path\\s+\"?(?<link_src_ps>[^\"]+)\"?.*-Target\\s+\"?(?<link_tgt_ps>[^\"]+)\"?"
+    | eval link_src=coalesce(link_src, link_src_ps)
+    | eval link_tgt=coalesce(link_tgt, link_tgt_ps)
+    | eval src_in_user=if(match(link_src, "(?i)^([A-Z]:\\\\Users\\\\|.*\\\\AppData\\\\|.*\\\\Temp\\\\|C:\\\\ProgramData\\\\)"), "true", "false")
+    | eval tgt_in_system=if(match(link_tgt, "(?i)^([A-Z]:\\\\Windows\\\\System32|[A-Z]:\\\\Windows\\\\SysWOW64|[A-Z]:\\\\Windows\\\\Tasks|[A-Z]:\\\\Windows\\\\System32\\\\config|[A-Z]:\\\\Windows\\\\System32\\\\drivers)"), "true", "false")
+    | eval suspicion=case(
+        src_in_user="true" AND tgt_in_system="true", "HIGH (user->system)",
+        link_tool LIKE "%forshaw%", "HIGH (PoC tool)",
+        src_in_user="true", "MEDIUM (user source)",
+        true(), "LOW")
+    | where suspicion!="LOW"
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(link_tool) as tools
+      values(CommandLine) as command_lines
+      values(link_src) as link_sources
+      values(link_tgt) as link_targets
+      values(User) as users
+      values(ParentImage) as parents
+      values(suspicion) as suspicion_levels
+      by Computer
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer tools command_lines link_sources link_targets
+      users parents suspicion_levels first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-41091: Reparse point planted on $Computer$ ($suspicion_levels$)"
+      severity: high
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$" (EventCode=1 OR EventCode=11) earliest=-1h
+      recommended_actions:
+        - List existing reparse points under the link_sources directories ("fsutil reparsepoint query" or "dir /AL") and capture their targets.
+        - Determine whether any link is still present — if so, remove with "fsutil reparsepoint delete" before triggering scans on $Computer$.
+        - Correlate with Rule 1 (MsMpEng writing to SYSTEM path) for the same Computer within 1 hour either side — that combination confirms exploitation completed.
+        - Identify the parent process chain of the link creator — was the user interactive, was this from a script, was a known-good admin tool invoked legitimately?
+        - If link_tool is "createsymlink_forshaw" or "createmountpoint_forshaw", treat as confirmed offensive tooling — these binaries are not legitimate operational utilities.
+    risk:
+      score: 85
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Developers using mklink for repo / WSL workflows — typically targets within user profile, not SYSTEM paths; the src->tgt suspicion field filters most of this."
+    - "Installer / build tools using junctions for vendor directories — exclude by ParentImage publisher."
+    - "Authorized red-team exercise — verify against engagement scope."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: MsMpEng.exe Deleting a SYSTEM-Owned File
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  CVE-2026-41091 enables arbitrary file delete as SYSTEM as well as
+#  arbitrary write. A common LPE pattern is using delete primitives to
+#  remove a gating file that disables a service-side security check.
+#  Detects Sysmon EventCode=23 (FileDelete) or 26 (FileDeleteDetected)
+#  where the Image is MsMpEng.exe / MpCmdRun.exe and the TargetFilename
+#  is a SYSTEM-protected location.
+#
+#  Confidence  : VERY HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very low — MsMpEng does not delete System32 / Tasks
+#                / config files
+
+rule_3_msmpeng_deleting_system_file:
+  name: "CVE-2026-41091 — MsMpEng.exe Deleting a SYSTEM-Owned File"
+  description: >
+    Detects MsMpEng.exe (or MpCmdRun.exe / MsMpEngCP.exe) performing a
+    file delete (Sysmon EventCode=23 or 26) where the target file is in
+    a SYSTEM-protected location (System32, SysWOW64, Tasks, config, drivers).
+    CVE-2026-41091 allows the attacker to coerce MMPE — running as SYSTEM —
+    into deleting an arbitrary file by planting a reparse point whose
+    target is the file to delete. Defender then "quarantines" or "removes"
+    the redirected target instead of the file it intended to operate on.
+    No legitimate Defender workflow deletes files in these locations.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1068"
+    sub_technique: ""
+    technique_name: "Exploitation for Privilege Escalation"
+  severity: CRITICAL
+  confidence: VERY_HIGH
+  risk_score: 95
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    (EventCode=23 OR EventCode=26)
+    (Image="*\\MsMpEng.exe" OR Image="*\\MpCmdRun.exe" OR Image="*\\MsMpEngCP.exe")
+    (TargetFilename="C:\\Windows\\System32\\*"
+     OR TargetFilename="C:\\Windows\\SysWOW64\\*"
+     OR TargetFilename="C:\\Windows\\Tasks\\*"
+     OR TargetFilename="C:\\Windows\\System32\\Tasks\\*"
+     OR TargetFilename="C:\\Windows\\System32\\config\\*"
+     OR TargetFilename="C:\\Windows\\System32\\drivers\\*"
+     OR TargetFilename="C:\\Windows\\System32\\spool\\drivers\\*"
+     OR TargetFilename="C:\\Windows\\System32\\wbem\\*"
+     OR TargetFilename="C:\\Windows\\Microsoft.NET\\*"
+     OR TargetFilename="C:\\Windows\\WinSxS\\*")
+    NOT TargetFilename="*\\Windows Defender\\*"
+    | eval delete_kind=case(EventCode=23, "FileDelete (archived)", EventCode=26, "FileDeleteDetected", true(), "unknown")
+    | eval target_root=mvindex(split(TargetFilename, "\\"), 2)
+    | eval target_subdir=mvindex(split(TargetFilename, "\\"), 3)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(delete_kind) as delete_kinds
+      values(TargetFilename) as files_deleted
+      values(Image) as defender_images
+      values(ProcessGuid) as process_guid
+      values(User) as users
+      by Computer target_root target_subdir
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer defender_images delete_kinds target_root target_subdir
+      files_deleted users process_guid first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-41091: MsMpEng.exe deleted SYSTEM file on $Computer$ ($target_root$\\$target_subdir$)"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$" (EventCode=23 OR EventCode=26 OR EventCode=1 OR EventCode=11)
+        earliest=-2h
+      recommended_actions:
+        - Isolate $Computer$ — SYSTEM-level arbitrary delete primitive confirmed.
+        - Check whether the deleted file was a security-critical gating file (driver, service binary, scheduled task XML, certificate, group policy file). Lookup files_deleted against your golden image manifest.
+        - Restore the deleted file(s) from backup or DISM and verify integrity ("sfc /scannow", "DISM /Online /Cleanup-Image /RestoreHealth").
+        - Recover the file from a Sysmon archive if EventCode=23 is enabled and Sysmon archive directory is configured.
+        - Correlate with Rules 1 and 2 within a 30-minute window — the same exploitation often involves multiple deletes / writes.
+    risk:
+      score: 95
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Defender deleting its own files via Windows Defender path — already excluded by NOT clause."
+    - "Authorized incident response cleanup performed by Microsoft Defender Endpoint live response — verify against the SOC change window."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Post-Exploitation — SYSTEM Service / Task Started from a Path
+#          Recently Modified by MsMpEng.exe
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Once MsMpEng has been coerced into writing the attacker's bytes into a
+#  SYSTEM-execution location, the attacker only needs the OS to load that
+#  payload. This rule joins Rule 1's "MsMpEng wrote to SYSTEM path" signal
+#  with any subsequent process-create (EventCode=1) whose Image is the
+#  written file. A process-create whose binary was itself authored by
+#  MsMpEng minutes earlier is near-conclusive of exploitation.
+#
+#  Confidence  : VERY HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : None — this scenario does not occur outside of CVE-2026-41091
+
+rule_4_execution_from_msmpeng_authored_file:
+  name: "CVE-2026-41091 — Process Execution from Binary Authored by MsMpEng.exe (SYSTEM LPE Landing)"
+  description: >
+    Correlates Sysmon EventCode=11 (file create) by MsMpEng.exe /
+    MpCmdRun.exe with a subsequent Sysmon EventCode=1 (process create)
+    where the new process Image is the exact path MsMpEng just wrote.
+    This sequence is the operational landing of CVE-2026-41091: the
+    attacker used the symlink-follow flaw to make Defender write SYSTEM-
+    owned content (DLL, EXE, scheduled task), then the OS loaded or
+    launched it. There is no legitimate scenario in which Defender
+    authors a file that is subsequently executed by the OS.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1574"
+    sub_technique: ""
+    technique_name: "Hijack Execution Flow"
+  severity: CRITICAL
+  confidence: VERY_HIGH
+  risk_score: 98
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    (
+      (EventCode=11
+        (Image="*\\MsMpEng.exe" OR Image="*\\MpCmdRun.exe" OR Image="*\\MsMpEngCP.exe")
+        NOT TargetFilename="*\\Windows Defender\\*")
+      OR EventCode=1
+    )
+    | eval event_kind=case(
+        EventCode=11, "msmpeng_write",
+        EventCode=1, "process_create",
+        true(), "other")
+    | where event_kind!="other"
+    | eval candidate_path=if(event_kind="msmpeng_write", lower(TargetFilename), null())
+    | eval exec_path=if(event_kind="process_create", lower(Image), null())
+    | sort 0 Computer _time
+    | streamstats current=f last(_time) as write_time
+                   last(candidate_path) as written_file
+                   last(Image) as writer_image
+                   by Computer
+                   reset_after="event_kind=\"process_create\""
+    | where event_kind="process_create" AND isnotnull(written_file)
+      AND lower(Image)=written_file
+    | eval seconds_between=_time-write_time
+    | where seconds_between>=0 AND seconds_between<=1800
+    | eval exec_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+    | eval write_time=strftime(write_time, "%Y-%m-%d %H:%M:%S")
+    | table Computer written_file writer_image Image CommandLine
+      ParentImage User write_time exec_time seconds_between
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-31m@m"
+  throttle:
+    field: "Computer"
+    period: "60m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-41091: $Image$ on $Computer$ executed from path authored by MsMpEng $seconds_between$s earlier"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$" (EventCode=1 OR EventCode=3 OR EventCode=11 OR EventCode=22)
+        earliest=-2h
+      recommended_actions:
+        - Treat $Computer$ as confirmed SYSTEM-level compromise. Isolate immediately.
+        - Acquire the file at $written_file$ — this is the LPE payload.
+        - Capture memory, collect Sysmon EventCode=3 (network) for the new process, and any child processes.
+        - Pull the chain of file creates by MsMpEng in the last 1 hour; any additional written files outside Defender paths are part of the same intrusion.
+        - Rotate all credentials present on $Computer$ (local accounts, machine account, any cached domain creds).
+        - Hunt the $written_file$ hash and $Image$ hash estate-wide.
+    risk:
+      score: 98
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "None expected. This sequence does not occur in legitimate Defender or OS workflows."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Defender Quarantine / Action on a Path Containing a Reparse Point
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Defender's quarantine and remediation paths are common targets for the
+#  symlink redirect because the attacker can place a reparse point inside
+#  the staging directory and trigger Defender to "act" on a file there.
+#  This rule looks at Defender Operational events (1006/1007/1116/1117 -
+#  threat acted on, 1009/1011/1012 - quarantine restore/delete) whose
+#  reported Path field traverses a user-writable directory but resolves
+#  to a SYSTEM location — a heuristic for the link follow having occurred.
+#
+#  Confidence  : MEDIUM
+#  Severity    : HIGH
+#  FP Rate     : Medium — relies on lookalike paths; tune in your estate
+
+rule_5_defender_action_on_reparse_path:
+  name: "CVE-2026-41091 — Defender Action Recorded on Path Suggestive of Reparse Follow"
+  description: >
+    Detects Microsoft Defender Operational events (1006, 1007, 1116, 1117,
+    1009, 1011, 1012) where the reported file Path begins inside a user-
+    writable directory but the action description or recorded "resolved"
+    path indicates a SYSTEM-owned target. CVE-2026-41091 exploitation
+    typically routes Defender's remediation operation through a planted
+    reparse point — Defender logs the original (user) path while actually
+    operating on the link target. Confidence is MEDIUM because Defender's
+    logging fidelity here varies; pair with Rules 1, 3, 4 for confirmation.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1068"
+    sub_technique: ""
+    technique_name: "Exploitation for Privilege Escalation"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 70
+  search: >
+    (index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Windows Defender/Operational"
+      (EventCode=1006 OR EventCode=1007 OR EventCode=1116 OR EventCode=1117
+       OR EventCode=1009 OR EventCode=1011 OR EventCode=1012))
+    OR
+    (index=defender sourcetype="ms:defender:alerts")
+    | eval host=coalesce(Computer, DeviceName)
+    | eval defender_path=coalesce(Path, FileName, FilePath, FullPath)
+    | eval defender_action=coalesce(Action_Name, Action, ActionName)
+    | eval src_user_writable=if(match(defender_path, "(?i)^([A-Z]:\\\\Users\\\\|.*\\\\AppData\\\\|C:\\\\ProgramData\\\\(?!Microsoft\\\\Windows Defender)|C:\\\\Windows\\\\Temp\\\\|C:\\\\Temp\\\\)"), "true", "false")
+    | eval target_in_system=if(match(Message, "(?i)(System32|SysWOW64|\\\\Tasks\\\\|\\\\drivers\\\\|\\\\config\\\\(SAM|SECURITY|SYSTEM))"), "true", "false")
+    | where src_user_writable="true" AND target_in_system="true"
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(defender_path) as defender_paths
+      values(defender_action) as actions
+      values(Threat_Name) as threats
+      values(User) as users
+      by host
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table host defender_paths actions threats users first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-11m@m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-41091: Defender action on user path with SYSTEM-target indicator on $host$"
+      severity: high
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$host$" (EventCode=11 OR EventCode=23 OR EventCode=1) earliest=-1h
+      recommended_actions:
+        - Inspect $defender_paths$ on $host$ for the presence of a reparse point ("fsutil reparsepoint query <path>").
+        - Correlate with Rule 1 (MsMpEng writing to SYSTEM path), Rule 3 (MsMpEng deleting SYSTEM file), Rule 4 (execution from MsMpEng-authored file) on $host$ within the previous 1 hour.
+        - If a reparse point is present, capture its target with "dir /AL <parent>"; remove the link with "fsutil reparsepoint delete" only after preserving forensic evidence.
+        - Verify integrity of files under the resolved SYSTEM target (sfc /scannow; compare against golden image).
+    risk:
+      score: 70
+      object_type: "system"
+      object_field: "host"
+  false_positives:
+    - "Defender action descriptions that legitimately reference System32 in the Message field for unrelated reasons (e.g., naming a related but un-acted file)."
+    - "Custom Defender log formats that include resolved-path information natively — tune the target_in_system regex per environment."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Unpatched Microsoft Malware Protection Engine (Posture)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Posture rule: identify endpoints whose Microsoft Malware Protection
+#  Engine (AMEngineVersion) is below the minimum patched build for
+#  CVE-2026-41091. The fixed-build string is held in
+#  defender_minimum_engine_version_cve_2026_41091.csv so the rule remains
+#  correct if Microsoft revises the engine version. Note: this CVE is
+#  fixed in the engine (AMEngineVersion, format 1.1.x.x), not the
+#  Antimalware Platform (AMServiceVersion, format 4.18.x.x). They update
+#  on independent cadences.
+#
+#  Confidence  : VERY HIGH
+#  Severity    : MEDIUM (posture)
+#  FP Rate     : None — deterministic version comparison
+
+rule_6_mmpe_unpatched_posture:
+  name: "CVE-2026-41091 — Microsoft Malware Protection Engine Below Patched Build"
+  description: >
+    Identifies endpoints reporting a Microsoft Malware Protection Engine
+    version (AMEngineVersion) earlier than the patched build for
+    CVE-2026-41091, as defined in the
+    defender_minimum_engine_version_cve_2026_41091 lookup table
+    (min_patched_AMEngineVersion). The reference patched build is
+    1.1.26040.8 per the Microsoft Security Response Center advisory; the
+    lookup exists so the value can be revised without editing the rule.
+    Depends on endpoint inventory data collected from Get-MpComputerStatus
+    (AMEngineVersion / AMServiceVersion / AMProductVersion) and forwarded
+    to index=endpoint_inventory sourcetype="defender:status".
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1068"
+    sub_technique: ""
+    technique_name: "Exploitation for Privilege Escalation"
+  severity: MEDIUM
+  confidence: VERY_HIGH
+  risk_score: 60
+  search: >
+    index=endpoint_inventory sourcetype="defender:status"
+    | stats latest(AMEngineVersion) as AMEngineVersion
+            latest(AMServiceVersion) as AMServiceVersion
+            latest(AMProductVersion) as AMProductVersion
+            latest(_time) as last_reported
+        by Computer
+    | lookup defender_minimum_engine_version_cve_2026_41091.csv
+        min_patched_AMEngineVersion OUTPUT min_patched_AMEngineVersion
+    | eval cur_parts=split(AMEngineVersion, ".")
+    | eval min_parts=split(min_patched_AMEngineVersion, ".")
+    | eval cur_n=tonumber(mvindex(cur_parts,0))*1000000000000
+                + tonumber(mvindex(cur_parts,1))*100000000
+                + tonumber(mvindex(cur_parts,2))*10000
+                + tonumber(mvindex(cur_parts,3))
+    | eval min_n=tonumber(mvindex(min_parts,0))*1000000000000
+                + tonumber(mvindex(min_parts,1))*100000000
+                + tonumber(mvindex(min_parts,2))*10000
+                + tonumber(mvindex(min_parts,3))
+    | eval vulnerable=if(cur_n<min_n, "true", "false")
+    | where vulnerable="true"
+    | eval last_reported=strftime(last_reported, "%Y-%m-%d %H:%M:%S")
+    | table Computer AMEngineVersion AMServiceVersion AMProductVersion
+      min_patched_AMEngineVersion last_reported
+  schedule:
+    cron: "0 */6 * * *"
+    window: "-6h@h"
+  throttle:
+    field: "Computer"
+    period: "12h"
+  actions:
+    notable:
+      rule_title: "CVE-2026-41091: $Computer$ running unpatched MMPE ($AMEngineVersion$ < $min_patched_AMEngineVersion$)"
+      severity: medium
+      recommended_actions:
+        - Force Defender signature/engine update on $Computer$ (Update-MpSignature -UpdateSource MicrosoftUpdateServer; reboot if required).
+        - Confirm AMEngineVersion moves to >= $min_patched_AMEngineVersion$ on the next inventory cycle.
+        - For endpoints that cannot be updated (air-gapped, legacy), increase monitoring sensitivity for Rules 1, 2, 3, 4 on those hosts.
+        - Validate that the defender_minimum_engine_version_cve_2026_41091 lookup reflects the latest Microsoft-published fixed engine build.
+    risk:
+      score: 60
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Stale inventory records — correlate last_reported age before treating as exposed."
+    - "Endpoints explicitly running a third-party AV (Defender disabled) — exclude via asset CMDB."
+
+
+# ==============================================================================
+#  CORRELATION SEARCH — Composite CVE-2026-41091 Kill Chain
+# ==============================================================================
+#  For highest fidelity, deploy a correlation search that fires when two or
+#  more of Rules 1-5 trigger on the same Computer within a 1-hour window.
+#  Suggested logic (pseudo-SPL):
+#
+#    `notable` search_name IN ("CVE-2026-41091 *")
+#    | stats dc(search_name) as rule_count values(search_name) as rules
+#        min(_time) as first by Computer
+#    | where rule_count >= 2
+#    | eval first=strftime(first, "%Y-%m-%d %H:%M:%S")
+#
+#  A rule_count of 2+ on the same host should escalate to SEV-1 and trigger
+#  host isolation. The canonical exploitation chain produces, in order:
+#    Rule 2 (reparse point planted) -> Rule 1 or Rule 3 (MsMpEng write or
+#    delete to SYSTEM path) -> Rule 4 (execution from MsMpEng-authored file)
+#  When you observe the full chain on a single host, isolation, memory
+#  capture, and credential rotation are non-negotiable.
+# ==============================================================================
