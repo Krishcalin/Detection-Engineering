@@ -1,0 +1,673 @@
+# ==============================================================================
+#  CVE-2026-45498 — Microsoft Defender Antimalware Platform DoS Detection
+# ==============================================================================
+#  Description : Multi-layered detection for CVE-2026-45498, a Microsoft
+#                Defender Antimalware Platform Denial-of-Service vulnerability
+#                (CVSS 4.0, CWE-400 Uncontrolled Resource Consumption, local
+#                attack vector AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L). Added to
+#                CISA's Known Exploited Vulnerabilities catalog on 2026-05-19
+#                following observed in-the-wild exploitation.
+#
+#                The vulnerability is triggered by a crafted file that, when
+#                inspected by the Defender scan engine (MsMpEng.exe), causes
+#                uncontrolled resource consumption resulting in the antimalware
+#                service becoming unresponsive, crashing, or being terminated
+#                by the SCM. Because the bug is reached purely via the on-
+#                access scan path, no privileges or user interaction are
+#                required beyond placing the payload anywhere the real-time
+#                scanner will inspect it (Downloads, mapped share, email
+#                attachment cache, etc.). The Defender service typically
+#                recovers, but the attack window between crash and restart
+#                allows follow-on payloads to execute without inspection.
+#
+#                Observed attacker objective: blind real-time AV briefly so
+#                a second-stage malware drop or LOLBin chain runs without
+#                Defender intercepting it. The DoS itself produces no integrity
+#                or confidentiality impact, but functions as a defense-evasion
+#                primer for a multi-stage intrusion.
+#
+#                These rules detect the DoS preconditions (MsMpEng crashes,
+#                WinDefend service restarts, sustained MsMpEng resource
+#                exhaustion), the protective-state gap (real-time protection
+#                turning off), the temporal correlation of a payload write
+#                with an immediate MsMpEng crash, the second-stage execution
+#                landing inside the protection gap, and unpatched-platform
+#                exposure.
+#
+#  MITRE ATT&CK: T1562.001 (Impair Defenses: Disable or Modify Tools),
+#                T1499.004 (Endpoint Denial of Service: Application or System
+#                Exploitation), T1211 (Exploitation for Defense Evasion),
+#                T1068 (Exploitation for Privilege Escalation - posture)
+#  Kill Chain   : Defense Evasion (DoS Defender) -> Execution (unscanned
+#                 payload) -> any follow-on tactic
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : XmlWinEventLog:Microsoft-Windows-Sysmon/Operational,
+#                 XmlWinEventLog:Microsoft-Windows-Windows Defender/Operational,
+#                 XmlWinEventLog:System, XmlWinEventLog:Application,
+#                 ms:defender:advanced, ms:defender:alerts,
+#                 perfmon:defender (or equivalent endpoint perf telemetry)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-05-21
+#  License      : MIT
+#
+#  References:
+#    - https://msrc.microsoft.com/update-guide/en-US/vulnerability/CVE-2026-45498
+#    - https://www.cisa.gov/news-events/alerts/2026/05/20/cisa-adds-seven-known-exploited-vulnerabilities-catalog
+#    - https://cve.org/CVERecord?id=CVE-2026-45498
+#    - https://attack.mitre.org/techniques/T1499/004/
+#    - https://attack.mitre.org/techniques/T1562/001/
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Sysmon deployed on all Windows endpoints with the following event types:
+#     - Event 1  (Process Creation) with full command-line logging
+#     - Event 5  (Process Terminated) — captures MsMpEng.exe abnormal exit
+#     - Event 11 (File Create) — to correlate payload drop with crash
+#     - Event 12/13 (Registry) — for Defender DisableRealtimeMonitoring keys
+#
+#  2. Windows Application channel (Source: Application Error, Event ID 1000;
+#     Source: Windows Error Reporting, Event ID 1001).
+#
+#  3. Windows System channel (Source: Service Control Manager, Event IDs
+#     7000, 7031, 7034, 7036).
+#
+#  4. Windows Defender operational channel forwarded:
+#     - Microsoft-Windows-Windows Defender/Operational — Event IDs 5001
+#       (real-time protection disabled), 5004 (configuration changed), 5007
+#       (configuration changed), 5010 (scanning for malware/PUA disabled),
+#       5012 (virus scanning disabled), 2001 (signature update failed), 1002
+#       (scan timed out), 1006/1116/1117 (threat detection — used as a
+#       liveness signal pre/post crash).
+#
+#  5. Defender Antimalware Platform version attribute collected via endpoint
+#     inventory (Get-MpComputerStatus -> AMEngineVersion / AMServiceVersion /
+#     AMProductVersion) and forwarded to index=endpoint_inventory
+#     sourcetype="defender:status".
+#
+#  6. Upload the following lookup table to Splunk:
+#     - defender_minimum_version_cve_2026_45498.csv
+#         min_patched_AMServiceVersion (string, e.g. "4.18.26050.4001")
+#       Update this when Microsoft publishes the fixed platform build.
+#
+#  7. Optional but recommended: a perfmon collector forwarding MsMpEng.exe
+#     "% Processor Time" and "Working Set - Private" to a metrics index
+#     (index=metrics_perfmon sourcetype="perfmon:defender") for Rule 3.
+#
+# ==============================================================================
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#  TUNING NOTES — CVE-2026-45498
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+#  - "Background noise": MsMpEng.exe legitimately consumes high CPU during
+#    full scans, large package install scans, or signature definition rebuilds.
+#    Rule 3 is therefore time-bounded against an unscheduled-scan window and
+#    requires sustained saturation, not a transient spike.
+#
+#  - The DoS itself produces only an availability impact. Severity for the
+#    isolated DoS signal is HIGH (Defender offline = real risk), but only
+#    rises to CRITICAL when a second-stage execution lands inside the
+#    protection gap (Rule 5).
+#
+#  - Throttle is intentionally short (10-15 min) because the attack is fast:
+#    crash -> drop -> execute -> Defender restarts. We need each event in
+#    the chain to fire.
+#
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: MsMpEng.exe Application Crash (Windows Error Reporting)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The most direct signal of CVE-2026-45498 exploitation is the Defender
+#  antimalware engine process itself crashing. The Application channel
+#  records the crash via Application Error (Event ID 1000) with Faulting
+#  Application Name "MsMpEng.exe" and Windows Error Reporting (Event ID
+#  1001) shortly thereafter. A single MsMpEng crash is rare and warrants
+#  investigation; repeated crashes on the same host within a short window
+#  are near-conclusive of exploitation.
+#
+#  Confidence  : HIGH
+#  Severity    : HIGH
+#  FP Rate     : Low — MsMpEng crashes are uncommon on healthy endpoints
+
+rule_1_msmpeng_application_crash:
+  name: "CVE-2026-45498 — MsMpEng.exe Application Crash (Possible Defender DoS)"
+  description: >
+    Detects the Microsoft Defender antimalware engine (MsMpEng.exe) crashing
+    via Application Error (Event ID 1000) or Windows Error Reporting
+    (Event ID 1001) in the Windows Application channel. CVE-2026-45498 is
+    a CWE-400 Uncontrolled Resource Consumption flaw triggered when MsMpEng
+    inspects a crafted file; successful exploitation crashes the scan
+    process and produces a 1000/1001 record. A single event is suspicious;
+    two or more within 30 minutes on the same host is high confidence for
+    in-the-wild exploitation. Always correlate with Rule 4 (payload drop
+    immediately preceding the crash) and Rule 5 (post-crash execution).
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1499.004"
+    sub_technique: "T1499.004"
+    technique_name: "Endpoint Denial of Service: Application or System Exploitation"
+  severity: HIGH
+  confidence: HIGH
+  risk_score: 80
+  search: >
+    index=main (sourcetype="WinEventLog:Application" OR sourcetype="XmlWinEventLog:Application")
+    (
+      (EventCode=1000 SourceName="Application Error"
+        (Faulting_application_name="MsMpEng.exe*"
+         OR Message="*MsMpEng.exe*"))
+      OR
+      (EventCode=1001 SourceName="Windows Error Reporting"
+        (Application_Name="MsMpEng.exe*"
+         OR Message="*MsMpEng.exe*"))
+    )
+    | eval crash_type=case(
+        EventCode=1000, "Application Error",
+        EventCode=1001, "Windows Error Reporting",
+        true(), "unknown")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(crash_type) as crash_types
+      values(Faulting_module_name) as faulting_modules
+      values(Exception_code) as exception_codes
+      values(Faulting_application_version) as defender_versions
+      by Computer
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | eval confidence_uplift=if(count>=2, "HIGH (repeated crash)", "MEDIUM (single crash)")
+    | table Computer crash_types faulting_modules exception_codes
+      defender_versions confidence_uplift first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-45498: MsMpEng.exe crashed on $Computer$ ($count$ in window)"
+      severity: high
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$" (EventCode=11 OR EventCode=1 OR EventCode=5)
+        earliest=-30m
+      recommended_actions:
+        - Pull all Sysmon EventCode=11 (file create) events on $Computer$ in the 5 minutes preceding first_seen — the file scanned at the moment of crash is the candidate exploit payload.
+        - Hash any newly written files in that window and submit to internal/third-party sandboxes; the payload may not be malware in the conventional sense (no execution), but the file content triggers the DoS.
+        - Correlate against Rule 2 (WinDefend service restart), Rule 4 (write-then-crash correlation), and Rule 5 (post-crash execution).
+        - Verify the AMServiceVersion on $Computer$ against the defender_minimum_version_cve_2026_45498 lookup; force an update if the host is unpatched.
+        - Preserve WER report directories (C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportQueue\\) on $Computer$ before they auto-purge — the minidump may show the exact faulting input.
+    risk:
+      score: 80
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Genuine Defender engine bugs unrelated to CVE-2026-45498 — review the Exception_code against published Microsoft KB articles."
+    - "Faulty third-party AV/EDR coexistence — hosts running two AV stacks occasionally produce MsMpEng crashes; exclude such hosts via CMDB."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: WinDefend Service Unexpected Termination / Restart
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  When MsMpEng crashes, the Service Control Manager records a sequence of
+#  events in the System channel: 7034 (service terminated unexpectedly),
+#  7031 (service terminated unexpectedly and will be restarted), and 7036
+#  (state changed to Stopped, then Running again). A single 7031/7034 for
+#  WinDefend (or any WdFilter / WdNisSvc auxiliary) is a high-fidelity
+#  signal that the AV stack lost availability — exactly the impact of
+#  CVE-2026-45498.
+#
+#  Confidence  : HIGH
+#  Severity    : HIGH
+#  FP Rate     : Low — WinDefend rarely crashes; legitimate restarts come
+#                from Windows Update and produce 7036 only
+
+rule_2_windefend_service_unexpected_termination:
+  name: "CVE-2026-45498 — WinDefend Service Terminated Unexpectedly"
+  description: >
+    Detects the Service Control Manager logging an unexpected termination
+    or restart of the Windows Defender Antivirus Service (WinDefend) or its
+    auxiliary services (WdFilter, WdNisSvc, Sense). Event IDs 7031 (service
+    terminated unexpectedly and will be restarted) and 7034 (service
+    terminated unexpectedly) are the canonical indicators of an MsMpEng
+    crash recovered by the SCM. Under normal operation, WinDefend stays
+    running for the uptime of the host except during platform updates,
+    which use a 7036 stop/start pair but never produce 7031/7034. A 7031
+    or 7034 for WinDefend should always be investigated.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1562.001"
+    sub_technique: "T1562.001"
+    technique_name: "Impair Defenses: Disable or Modify Tools"
+  severity: HIGH
+  confidence: HIGH
+  risk_score: 82
+  search: >
+    index=main (sourcetype="WinEventLog:System" OR sourcetype="XmlWinEventLog:System")
+    SourceName="Service Control Manager"
+    (EventCode=7031 OR EventCode=7034 OR EventCode=7000)
+    (param1="WinDefend"
+     OR param1="WdFilter"
+     OR param1="WdNisSvc"
+     OR param1="Sense"
+     OR Message="*WinDefend*"
+     OR Message="*Windows Defender Antivirus*")
+    | eval service_event=case(
+        EventCode=7031, "terminated unexpectedly (will restart)",
+        EventCode=7034, "terminated unexpectedly (no restart)",
+        EventCode=7000, "service failed to start",
+        true(), "unknown")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(service_event) as service_events
+      values(param1) as services
+      values(param2) as failure_actions
+      by Computer
+    | where count >= 1
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer services service_events failure_actions
+      first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-45498: WinDefend terminated unexpectedly on $Computer$"
+      severity: high
+      drilldown_search: >
+        index=main (sourcetype="WinEventLog:System" OR sourcetype="XmlWinEventLog:System"
+                    OR sourcetype="XmlWinEventLog:Application"
+                    OR sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational")
+        Computer="$Computer$" earliest=-30m
+      recommended_actions:
+        - Correlate with Rule 1 (MsMpEng.exe crash) — the two should fire together for a CVE-2026-45498 event.
+        - Correlate with Rule 3 (real-time protection gap) to determine how long the host was unprotected.
+        - Pull Sysmon EventCode=11 (file create) events on $Computer$ in the 5 minutes preceding first_seen to identify the candidate payload.
+        - Check Windows Update history; if no Defender platform update completed in the last 24h, the restart was unsolicited.
+        - Verify $Computer$ AMServiceVersion against the defender_minimum_version_cve_2026_45498 lookup.
+    risk:
+      score: 82
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Defender platform update — produces 7036 stop/start, not 7031/7034. If 7036 is the only event, exclude."
+    - "Disk-full or driver-incompatibility crashes — review failure_actions and recent driver installs."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Real-Time Protection Gap (Defender Disabled Between Crash & Recovery)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The window between MsMpEng.exe crashing and the SCM restarting WinDefend
+#  is the operational payoff of CVE-2026-45498 — during the gap, no on-
+#  access scanning occurs. Defender Operational channel events 5001
+#  (real-time protection disabled), 5010 (scanning for malware/PUA
+#  disabled), and 5012 (virus/spyware scanning disabled) record this gap
+#  explicitly. A non-administrative trigger of these events (no
+#  corresponding 5004/5007 admin configuration change) is the signal of
+#  in-the-wild DoS exploitation rather than a deliberate admin action.
+#
+#  Confidence  : HIGH
+#  Severity    : HIGH
+#  FP Rate     : Low when filtered against deliberate admin reconfiguration
+
+rule_3_realtime_protection_gap:
+  name: "CVE-2026-45498 — Defender Real-Time Protection Disabled Without Admin Action"
+  description: >
+    Detects Windows Defender real-time protection / on-access scanning
+    transitioning to a disabled state (Event IDs 5001, 5010, 5012) without
+    a paired configuration-change event (5004, 5007) from an administrative
+    process in the same window. CVE-2026-45498 produces this signal as a
+    side effect of MsMpEng crashing — real-time protection becomes
+    unavailable until the service restarts. Legitimate deliberate disables
+    by administrators or GPO produce 5004/5007 first. A 5001/5010/5012
+    without a preceding configuration change is the protection gap window
+    the attacker creates.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1562.001"
+    sub_technique: "T1562.001"
+    technique_name: "Impair Defenses: Disable or Modify Tools"
+  severity: HIGH
+  confidence: HIGH
+  risk_score: 78
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Windows Defender/Operational"
+    (EventCode=5001 OR EventCode=5010 OR EventCode=5012
+     OR EventCode=5004 OR EventCode=5007)
+    | eval protection_change=case(
+        EventCode=5001, "Real-time protection disabled",
+        EventCode=5010, "Scanning for malware and PUA disabled",
+        EventCode=5012, "Virus and spyware scanning disabled",
+        EventCode=5004, "Real-time protection configuration changed",
+        EventCode=5007, "Configuration changed",
+        true(), "other")
+    | eval is_disable_event=if(EventCode IN (5001,5010,5012), 1, 0)
+    | eval is_config_change=if(EventCode IN (5004,5007), 1, 0)
+    | stats sum(is_disable_event) as disable_events
+            sum(is_config_change) as config_changes
+            min(_time) as first_seen max(_time) as last_seen
+            values(protection_change) as changes
+            values(User) as users
+        by Computer
+    | where disable_events >= 1 AND config_changes = 0
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer changes users disable_events config_changes
+      first_seen last_seen
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-11m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-45498: Defender real-time protection gap on $Computer$ (no admin config change)"
+      severity: high
+      drilldown_search: >
+        index=main (sourcetype="XmlWinEventLog:Microsoft-Windows-Windows Defender/Operational"
+                    OR sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+                    OR sourcetype="WinEventLog:System")
+        Computer="$Computer$" earliest=-30m
+      recommended_actions:
+        - Correlate with Rules 1 and 2 — a protection gap caused by CVE-2026-45498 should coincide with an MsMpEng crash and a WinDefend 7031/7034.
+        - If Rules 1 and 2 did not fire, the disable may be intentional malware tampering (T1562.001) rather than DoS exploitation — pivot to that investigation.
+        - List all processes that ran on $Computer$ during the gap (between first_seen of Rule 1 and the next 5007 re-enable) — anything unsigned or anomalous is suspect (Rule 5 covers this).
+        - Force a Defender quick scan after the service recovers to catch payloads that landed during the gap.
+    risk:
+      score: 78
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Endpoints transitioning to a third-party AV during managed migration — exclude affected hosts/dates via CMDB."
+    - "Recovery from disk pressure / Defender update failure — correlate with EventCode=2001 (signature update failed)."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: File Write Immediately Followed by MsMpEng Termination
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  CVE-2026-45498's exploit primitive is a file that, when read by the on-
+#  access scanner, exhausts a Defender resource. The clearest behavioral
+#  signature is a Sysmon EventCode=11 (file create) closely followed (under
+#  60 seconds) by an MsMpEng.exe Sysmon EventCode=5 (ProcessTerminated) on
+#  the same host, where the terminated process is MsMpEng.exe. This rule
+#  joins the two signals and reports the candidate payload path.
+#
+#  Confidence  : VERY HIGH
+#  Severity    : HIGH
+#  FP Rate     : Very low — the temporal binding is specific
+
+rule_4_payload_drop_to_msmpeng_crash_correlation:
+  name: "CVE-2026-45498 — File Write Immediately Preceded MsMpEng.exe Termination"
+  description: >
+    Correlates Sysmon EventCode=11 (file create) with Sysmon EventCode=5
+    (process terminated) for MsMpEng.exe on the same host within a 60-second
+    window. CVE-2026-45498 is triggered when the Defender real-time scanner
+    inspects a crafted file; successful exploitation produces an MsMpEng
+    crash. By correlating the candidate payload path with the immediately
+    subsequent MsMpEng termination, this rule pinpoints the file content
+    that triggered the DoS. The TargetFilename from the file-create event
+    is the highest-priority artifact to capture for sample analysis.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1499.004"
+    sub_technique: "T1499.004"
+    technique_name: "Endpoint Denial of Service: Application or System Exploitation"
+  severity: HIGH
+  confidence: VERY_HIGH
+  risk_score: 92
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    (EventCode=11 OR (EventCode=5 Image="*\\MsMpEng.exe"))
+    | eval event_kind=case(
+        EventCode=11, "file_create",
+        EventCode=5 AND match(Image, "(?i)\\\\MsMpEng\\.exe$"), "msmpeng_terminated",
+        true(), "other")
+    | where event_kind!="other"
+    | sort 0 Computer _time
+    | streamstats current=f last(_time) as prev_create_time
+                   last(TargetFilename) as candidate_payload
+                   last(Image) as candidate_writer
+                   last(User) as candidate_user
+                   by Computer
+                   reset_after="event_kind=\"msmpeng_terminated\""
+    | where event_kind="msmpeng_terminated" AND isnotnull(prev_create_time)
+    | eval seconds_between=_time-prev_create_time
+    | where seconds_between>=0 AND seconds_between<=60
+    | eval crash_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+    | eval write_time=strftime(prev_create_time, "%Y-%m-%d %H:%M:%S")
+    | table Computer candidate_payload candidate_writer candidate_user
+      write_time crash_time seconds_between
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-11m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-45498: $candidate_payload$ on $Computer$ preceded MsMpEng.exe crash by $seconds_between$s"
+      severity: high
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$" earliest=-30m
+      recommended_actions:
+        - Acquire the file at $candidate_payload$ before any reboot or remediation; the file content IS the exploit primitive.
+        - Submit the payload to an isolated analysis sandbox running an unpatched Defender instance to confirm the DoS is reproducible.
+        - Identify $candidate_writer$ as the writing process — investigate its parent process chain to determine initial access vector (email, browser, share).
+        - Hash the payload and pivot estate-wide via EDR / Splunk to identify other hosts with the same SHA-256.
+        - Block the source (URL, sender, share path) of the payload as identified upstream.
+        - Force Defender update on $Computer$ to a patched version; rescan the host after recovery.
+    risk:
+      score: 92
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Coincidental file write at the same moment as an unrelated MsMpEng crash — review whether the candidate_payload path is plausibly attacker-controlled (Downloads, Temp, Outlook attachments) vs. system-managed."
+    - "Authorized red-team exercise reproducing CVE-2026-45498 — verify against engagement scope before closing."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Process Execution During Defender Real-Time Protection Gap
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The attacker's payoff for triggering CVE-2026-45498 is the protection
+#  gap. This rule fires when a process starts on a host while the Defender
+#  service is non-running (between a 7031/7034 and the next 7036 start, or
+#  between a 5001/5010/5012 and the next 5007 re-enable). An unsigned or
+#  user-profile-located process executed inside that window is a strong
+#  indication that the DoS was used to land a second-stage payload.
+#
+#  Confidence  : HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Low — innocent processes rarely start during a sub-minute
+#                Defender outage; system processes are signed
+
+rule_5_execution_during_defender_outage:
+  name: "CVE-2026-45498 — Unsigned/User-Path Process Started During Defender Outage"
+  description: >
+    Detects a Sysmon process-create event (EventCode=1) for an unsigned
+    binary or a binary located inside a user-writable path during a window
+    in which the Windows Defender real-time protection is known to be
+    offline. The Defender outage is established by a recent WinDefend
+    service termination (Event 7031/7034) or a Defender Operational 5001/
+    5010/5012 disable event without a paired 5004/5007 admin change.
+    Execution within that gap is exactly the operational payoff an attacker
+    gains from CVE-2026-45498 — a second-stage payload runs without
+    real-time scanning. Severity is critical because the DoS by itself
+    only matters when paired with a follow-on execution; this rule captures
+    that pairing.
+  mitre:
+    tactic: "Execution"
+    technique: "T1204.002"
+    sub_technique: "T1204.002"
+    technique_name: "User Execution: Malicious File"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 94
+  search: >
+    (index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        EventCode=1
+        (Signed="false"
+         OR SignatureStatus!="Valid"
+         OR Image="C:\\Users\\*"
+         OR Image="C:\\ProgramData\\*"
+         OR Image="C:\\Windows\\Temp\\*"
+         OR Image="C:\\Temp\\*"
+         OR Image="*\\AppData\\Local\\Temp\\*"))
+    | eval exec_time=_time
+    | eval Image_lower=lower(Image)
+    | join type=left Computer [
+        search index=main
+          (sourcetype="WinEventLog:System" OR sourcetype="XmlWinEventLog:System")
+          SourceName="Service Control Manager"
+          (EventCode=7031 OR EventCode=7034)
+          (param1="WinDefend" OR Message="*WinDefend*")
+          earliest=-30m
+        | stats max(_time) as defender_outage_start by Computer ]
+    | where isnotnull(defender_outage_start)
+    | eval gap_seconds=exec_time-defender_outage_start
+    | where gap_seconds>=0 AND gap_seconds<=180
+    | eval exec_time=strftime(exec_time, "%Y-%m-%d %H:%M:%S")
+    | eval defender_outage_start=strftime(defender_outage_start, "%Y-%m-%d %H:%M:%S")
+    | table Computer Image CommandLine ParentImage User Signed
+      SignatureStatus defender_outage_start exec_time gap_seconds
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-11m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-45498: Suspicious execution on $Computer$ inside Defender outage ($gap_seconds$s after WinDefend crash)"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$" (EventCode=1 OR EventCode=3 OR EventCode=11)
+        earliest=-30m
+      recommended_actions:
+        - Treat $Computer$ as actively compromised — isolate immediately from the network.
+        - Preserve $Image$ and capture memory before reboot.
+        - Pull all Sysmon EventCode=3 (network connect) for $Image$ and ParentImage in the last 1h — the C2 channel is established now.
+        - Submit $Image$ hash + $CommandLine$ for sandbox analysis; assume EDR-evasion since it ran while real-time scanning was off.
+        - Treat any $User$ session interactively logged on at exec_time as compromised — rotate credentials and Kerberos tickets.
+        - Correlate with Rules 1, 2, 4 — together they describe the full attack chain (payload write -> Defender crash -> outage -> payload execute).
+    risk:
+      score: 94
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Scheduled software install kicked off at the same moment Defender restarted post-update — verify by correlating with Windows Update history."
+    - "Authorized red-team exercise — confirm against engagement scope."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Unpatched Microsoft Defender Antimalware Platform (Posture)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Posture rule: identify endpoints whose Defender Antimalware Platform
+#  version is below the minimum patched build for CVE-2026-45498. The
+#  fixed-build string is held in the defender_minimum_version_cve_2026_45498
+#  lookup so this rule remains correct as Microsoft publishes updates.
+#  Output feeds the vulnerability management / patch workflow.
+#
+#  Confidence  : VERY HIGH
+#  Severity    : MEDIUM (posture)
+#  FP Rate     : None — deterministic version comparison
+
+rule_6_defender_unpatched_posture:
+  name: "CVE-2026-45498 — Microsoft Defender Antimalware Platform Below Patched Build"
+  description: >
+    Identifies endpoints reporting a Microsoft Defender Antimalware Platform
+    version earlier than the patched build for CVE-2026-45498, as defined
+    in the defender_minimum_version_cve_2026_45498 lookup table
+    (min_patched_AMServiceVersion). Update the lookup as Microsoft publishes
+    the fixed platform build. The rule depends on endpoint inventory data
+    collected from Get-MpComputerStatus (AMEngineVersion / AMServiceVersion /
+    AMProductVersion) and forwarded to index=endpoint_inventory
+    sourcetype="defender:status".
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1562.001"
+    sub_technique: "T1562.001"
+    technique_name: "Impair Defenses: Disable or Modify Tools"
+  severity: MEDIUM
+  confidence: VERY_HIGH
+  risk_score: 55
+  search: >
+    index=endpoint_inventory sourcetype="defender:status"
+    | stats latest(AMEngineVersion) as AMEngineVersion
+            latest(AMServiceVersion) as AMServiceVersion
+            latest(AMProductVersion) as AMProductVersion
+            latest(_time) as last_reported
+        by Computer
+    | lookup defender_minimum_version_cve_2026_45498.csv min_patched_AMServiceVersion
+        OUTPUT min_patched_AMServiceVersion
+    | eval cur_parts=split(AMServiceVersion, ".")
+    | eval min_parts=split(min_patched_AMServiceVersion, ".")
+    | eval cur_n=tonumber(mvindex(cur_parts,0))*1000000000000
+                + tonumber(mvindex(cur_parts,1))*100000000
+                + tonumber(mvindex(cur_parts,2))*10000
+                + tonumber(mvindex(cur_parts,3))
+    | eval min_n=tonumber(mvindex(min_parts,0))*1000000000000
+                + tonumber(mvindex(min_parts,1))*100000000
+                + tonumber(mvindex(min_parts,2))*10000
+                + tonumber(mvindex(min_parts,3))
+    | eval vulnerable=if(cur_n<min_n, "true", "false")
+    | where vulnerable="true"
+    | eval last_reported=strftime(last_reported, "%Y-%m-%d %H:%M:%S")
+    | table Computer AMEngineVersion AMServiceVersion AMProductVersion
+      min_patched_AMServiceVersion last_reported
+  schedule:
+    cron: "0 */6 * * *"
+    window: "-6h@h"
+  throttle:
+    field: "Computer"
+    period: "12h"
+  actions:
+    notable:
+      rule_title: "CVE-2026-45498: $Computer$ running unpatched Defender ($AMServiceVersion$ < $min_patched_AMServiceVersion$)"
+      severity: medium
+      recommended_actions:
+        - Force Defender platform update on $Computer$ (Update-MpSignature -UpdateSource MicrosoftUpdateServer; reboot if required).
+        - Confirm AMServiceVersion moves to >= $min_patched_AMServiceVersion$ on next inventory cycle.
+        - For endpoints that cannot be updated (air-gapped, legacy), increase monitoring sensitivity for Rules 1, 2, 3, 4 on those hosts.
+        - Validate that the defender_minimum_version_cve_2026_45498 lookup reflects the latest Microsoft-published fixed build.
+    risk:
+      score: 55
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Stale inventory records — correlate last_reported age before treating as exposed."
+    - "Endpoints explicitly running a third-party AV (Defender disabled) — exclude via asset CMDB."
+
+
+# ==============================================================================
+#  CORRELATION SEARCH — Composite CVE-2026-45498 Kill Chain
+# ==============================================================================
+#  For highest fidelity, deploy a correlation search that fires when two or
+#  more of Rules 1-5 trigger on the same Computer within a 30-minute window.
+#  Suggested logic (pseudo-SPL):
+#
+#    `notable` search_name IN ("CVE-2026-45498 *")
+#    | stats dc(search_name) as rule_count values(search_name) as rules
+#        min(_time) as first values(Computer) as host by Computer
+#    | where rule_count >= 2
+#    | eval first=strftime(first, "%Y-%m-%d %H:%M:%S")
+#
+#  A rule_count of 2+ on the same host should escalate to SEV-1 and trigger
+#  host isolation — by that point you have evidence of both the DoS event
+#  itself and either a payload artifact (Rule 4) or a follow-on execution
+#  (Rule 5).
+# ==============================================================================
