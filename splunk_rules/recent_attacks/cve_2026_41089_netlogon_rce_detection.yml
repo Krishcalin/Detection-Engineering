@@ -1,0 +1,807 @@
+# ==============================================================================
+#  CVE-2026-41089 — Windows Netlogon Stack Buffer Overflow RCE Detection
+# ==============================================================================
+#  Description : Multi-layered detection for CVE-2026-41089, an unauthenticated
+#                remote code execution vulnerability in the Windows Netlogon
+#                service. Classified as CWE-121 (Stack-based Buffer Overflow).
+#                CVSS 3.1 base score 9.8 (CRITICAL). Disclosed by Microsoft on
+#                2026-05-12 (Patch Tuesday). The Centre for Cybersecurity
+#                Belgium (CCB) updated its May Patch Tuesday advisory on
+#                2026-05-29 confirming active in-the-wild exploitation and
+#                recommending highest-priority patching.
+#
+#                The vulnerability is in the Netlogon Remote Protocol (MS-NRPC)
+#                message-handling code. The service — hosted inside lsass.exe
+#                on every Windows Domain Controller — copies an attacker-
+#                controlled length-prefixed field from an incoming Netlogon
+#                RPC request into a fixed-size stack buffer without enforcing
+#                the destination buffer's length. A specially crafted Netlogon
+#                request from any unauthenticated source on the network that
+#                can reach the DC's RPC endpoints overwrites the return
+#                address / saved registers on the stack and redirects
+#                execution into attacker-supplied shellcode or a ROP chain.
+#                Because lsass.exe runs as NT AUTHORITY\SYSTEM, the attacker
+#                achieves SYSTEM-level code execution on the Domain Controller
+#                with a single network message — no credentials, no user
+#                interaction, no prior foothold required.
+#
+#                Canonical attack chain:
+#                  1. Attacker locates a Windows Domain Controller exposing
+#                     RPC endpoints (TCP 135 + dynamic high ports, or SMB
+#                     named pipe \\PIPE\\NETLOGON over TCP 445) reachable
+#                     from the attacker's network position.
+#                  2. Attacker sends a crafted Netlogon RPC request — typically
+#                     to one of the NetrServer*, NetrLogon*, or NetrAccountSync
+#                     opnums — with an oversized length-prefixed field
+#                     designed to overflow the target stack buffer.
+#                  3. The overflow overwrites the saved return address on
+#                     the lsass.exe Netlogon thread stack. Execution is
+#                     redirected to attacker shellcode or a ROP gadget chain
+#                     that ultimately calls CreateProcess / LoadLibrary /
+#                     ReflectiveLoader.
+#                  4. SYSTEM-level execution on the DC is achieved. Common
+#                     follow-on actions:
+#                        - Spawn cmd.exe / powershell.exe / rundll32.exe as
+#                          a child of lsass.exe (highly anomalous — lsass
+#                          almost never has children).
+#                        - Dump the NTDS.dit / SAM / SYSTEM hives.
+#                        - Create a new domain administrator account.
+#                        - Inject into another SYSTEM service for stealth.
+#                        - Beacon outbound to attacker C2 (DCs should rarely
+#                          initiate outbound to internet).
+#                  5. Optional: the overflow miscalculation crashes the
+#                     Netlogon thread or lsass.exe itself, producing
+#                     Application Error event 1000 and SCM event 7031/7034.
+#                     A working exploit usually avoids this, but PoC code
+#                     and failed exploit attempts do not.
+#
+#                Detection focuses on six behavioral signals:
+#                  (a) Netlogon service / lsass.exe crash or abnormal
+#                      termination on a Domain Controller.
+#                  (b) Anomalous SYSTEM-context child process whose parent
+#                      is lsass.exe on a Domain Controller — the post-
+#                      exploit pivot signature.
+#                  (c) Privileged account or Domain Admins group membership
+#                      change on a DC within a short window of Netlogon RPC
+#                      anomalies — common persistence step.
+#                  (d) Suspicious outbound network connection initiated by
+#                      a Domain Controller — beacon / staging traffic.
+#                  (e) Anomalous high-volume or malformed Netlogon RPC
+#                      traffic to a Domain Controller — the exploit network
+#                      signature.
+#                  (f) Posture rule for unpatched Domain Controllers missing
+#                      the May 2026 cumulative update that ships the fix.
+#
+#  MITRE ATT&CK: T1190 (Exploit Public-Facing Application — DC-reachable),
+#                T1210 (Exploitation of Remote Services — internal pivot),
+#                T1068 (Exploitation for Privilege Escalation — SYSTEM via lsass),
+#                T1003.003 (OS Credential Dumping: NTDS — common end goal),
+#                T1136.002 (Create Account: Domain Account — persistence),
+#                T1098 (Account Manipulation — DA group add),
+#                T1071.001 (Application Layer Protocol: Web — post-exploit C2)
+#  Kill Chain   : Initial Access / Lateral Movement (CVE-2026-41089) ->
+#                 Execution (lsass child as SYSTEM) -> Privilege Escalation
+#                 (already SYSTEM) -> Credential Access (NTDS) ->
+#                 Persistence (new DA) -> Command and Control
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : XmlWinEventLog:Microsoft-Windows-Sysmon/Operational,
+#                 XmlWinEventLog:Security,
+#                 XmlWinEventLog:System,
+#                 XmlWinEventLog:Application,
+#                 zeek:conn, zeek:dce_rpc, zeek:smb_files,
+#                 pan:traffic, suricata:eve
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-06-05
+#  License      : MIT
+#
+#  References:
+#    - https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-41089
+#    - https://nvd.nist.gov/vuln/detail/cve-2026-41089
+#    - https://www.bleepingcomputer.com/news/microsoft/critical-windows-netlogon-remote-code-execution-flaw-now-exploited-in-attacks/
+#    - https://www.securityweek.com/critical-windows-netlogon-vulnerability-in-attackers-crosshairs/
+#    - https://threat-modeling.com/windows-netlogon-buffer-overflow-cve-2026-41089/
+#    - https://cwe.mitre.org/data/definitions/121.html
+#    - https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-nrpc/
+#    - https://attack.mitre.org/techniques/T1190/
+#    - https://attack.mitre.org/techniques/T1210/
+#    - https://attack.mitre.org/techniques/T1068/
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Sysmon deployed on all Windows Domain Controllers with the following
+#     event types:
+#     - Event 1  (Process Creation) with full command-line + ParentImage logging
+#     - Event 3  (Network Connection) — for outbound connections from lsass.exe
+#                  / DC initiated traffic
+#     - Event 5  (Process Terminated) — for lsass.exe / Netlogon thread death
+#     - Event 8  (CreateRemoteThread) — for in-process implant injection
+#     - Event 10 (ProcessAccess) — for handles into lsass.exe
+#     - Event 11 (File Create) — for NTDS.dit / SAM / SYSTEM hive copy
+#
+#  2. Windows event channels forwarded from every DC:
+#     - Security (4624, 4672, 4720, 4728, 4732, 4756, 4625, 4663)
+#     - System  (7031, 7034, 7036 — SCM events for Netlogon service)
+#     - Application (1000, 1001 — application error & WER for lsass.exe /
+#                    netlogon.dll faulting module)
+#
+#  3. Audit Policy enabled (Security log):
+#     - "Audit Process Creation" (Success) with CommandLine logging (4688)
+#     - "Audit Security Group Management" (Success/Failure) for 4728/4732/4756
+#     - "Audit User Account Management" (Success/Failure) for 4720/4738
+#     - "Audit Logon" (Success/Failure) for 4624/4625
+#     - "Audit Special Logon" (Success) for 4672
+#
+#  4. Network telemetry covering inter-segment-to-DC paths:
+#     - Zeek dce_rpc + conn logs on the DC ingress segment, OR
+#     - Suricata eve on inter-VLAN trunks watching TCP/135, TCP/445, TCP/49152-65535,
+#       OR
+#     - Palo Alto pan:traffic logs for sessions to DC IPs on RPC / SMB ports.
+#
+#  5. Upload the following lookup tables to Splunk:
+#     - domain_controllers.csv
+#         ip (string), hostname (string), site (string)
+#         All DC IPs and hostnames in your forest.
+#     - approved_admin_ips.csv
+#         ip (string), username (string), role (string)
+#         Tier-0 jump hosts and DA workstations that legitimately
+#         talk RPC to DCs.
+#     - dc_minimum_patched_build_cve_2026_41089.csv
+#         os_version (string), min_patched_build (string)
+#         Maps "Windows Server 2019" / "Windows Server 2022" / "Windows
+#         Server 2025" etc. to the minimum OS build (UBR) that contains
+#         the May 2026 patch. Sourced from Microsoft Update Catalog.
+#     - approved_dc_outbound.csv
+#         dest_ip (string), dest_host (string), purpose (string)
+#         Allow-list of outbound destinations DCs are legitimately
+#         allowed to reach (e.g., Microsoft Update, internal NTP, SIEM).
+#
+#  6. Endpoint inventory forwarded to index=endpoint_inventory with the OS
+#     build / UBR collected via Win32_OperatingSystem -> BuildNumber +
+#     CurrentBuildNumber + UBR registry value
+#     (HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\UBR).
+#
+# ==============================================================================
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#  REFERENCE — Netlogon RPC surface and patched OS builds
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+#   Netlogon RPC endpoints reachable on a DC:
+#     - TCP 135       Endpoint Mapper — resolves Netlogon's dynamic port
+#     - TCP 49152-65535 (Win Server 2008+) — Netlogon RPC dynamic high port
+#     - TCP 445       SMB — named pipe \\PIPE\\NETLOGON (\\.\PIPE\NETLOGON)
+#
+#   Netlogon RPC interface UUID (MS-NRPC):
+#     12345678-1234-abcd-ef00-01234567cffb
+#
+#   Patched Windows Server OS builds (May 2026 Patch Tuesday cumulative):
+#     - Windows Server 2025          : 26100.4061   (KB5058411 or later)
+#     - Windows Server 2022 23H2     : 25398.1611   (KB5058385 or later)
+#     - Windows Server 2022          : 20348.3692   (KB5058385 or later)
+#     - Windows Server 2019          : 17763.7434   (KB5058392 or later)
+#     - Windows Server 2016          : 14393.8060   (KB5058383 or later)
+#     - Windows Server 2012 R2 ESU   : 9600.22431   (KB5058363 or later)
+#     - Windows Server 2012 ESU      : 9200.25395   (KB5058369 or later)
+#   Any DC with a lower UBR / KB is vulnerable. Verify against
+#   dc_minimum_patched_build_cve_2026_41089.csv in your environment, which
+#   should be sourced directly from the Microsoft Update Catalog.
+#
+#   Public PoC / weaponization indicators (as of 2026-06-05):
+#     - Tool names observed in early disclosure traffic: "NRPC-Storm",
+#       "NetlogonNuke", "MS-NRPC-PoC". Names are unstable — rely on
+#       behavior, not strings.
+#
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: Netlogon Service / lsass.exe Crash on Domain Controller
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Highest-fidelity post-exploit signal. A buffer overflow exploit that does
+#  not perfectly land its ROP chain will crash either the Netlogon thread or
+#  lsass.exe itself. Application Error event 1000 with FaultingModule
+#  "netlogon.dll", or SCM events 7031/7034 for the Netlogon service on a DC,
+#  is virtually never benign and is one of the cleanest indicators of an
+#  exploitation attempt — successful or failed. PoC tooling in particular
+#  often crashes the service before iterating to a stable payload.
+#
+#  Confidence  : VERY HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very low — Netlogon does not crash in normal operation
+
+rule_1_netlogon_lsass_crash_on_dc:
+  name: "CVE-2026-41089 — Netlogon Service or lsass.exe Crash on Domain Controller"
+  description: >
+    Detects an Application Error (Event 1000) where the faulting module
+    is netlogon.dll, OR an Application Error / WER record for lsass.exe,
+    OR a Service Control Manager event 7031/7034 for the Netlogon service,
+    occurring on a Domain Controller. CVE-2026-41089 is a stack buffer
+    overflow in Netlogon hosted inside lsass.exe; a misaligned exploit
+    payload, a PoC iteration, or a failed exploitation attempt will crash
+    the Netlogon thread or the entire lsass.exe process. Because lsass.exe
+    is the security authority on a DC, its crash forces an unscheduled
+    reboot — which itself is a very loud and atypical event. Use this rule
+    in conjunction with Rule 5 (anomalous Netlogon traffic) to correlate
+    network exploit attempts with their host-side impact.
+  mitre:
+    tactic: "Initial Access"
+    technique: "T1190"
+    sub_technique: ""
+    technique_name: "Exploit Public-Facing Application"
+  severity: CRITICAL
+  confidence: VERY_HIGH
+  risk_score: 98
+  search: >
+    (index=wineventlog OR index=main)
+    sourcetype IN ("XmlWinEventLog:Application","XmlWinEventLog:System")
+    [| inputlookup domain_controllers.csv | fields hostname | rename hostname as Computer]
+    (
+      (sourcetype="XmlWinEventLog:Application" EventCode=1000
+        (Faulting_module_name="netlogon.dll" OR Faulting_application_name="lsass.exe"
+         OR Message="*netlogon.dll*" OR Message="*lsass.exe*"))
+      OR
+      (sourcetype="XmlWinEventLog:System" EventCode IN (7031,7034)
+        (ServiceName="Netlogon" OR Message="*Netlogon*"))
+    )
+    | eval crash_type=case(
+        EventCode=1000 AND match(Message,"netlogon\.dll"), "netlogon_module_fault",
+        EventCode=1000 AND match(Message,"lsass\.exe"), "lsass_process_fault",
+        EventCode=7031, "netlogon_service_terminated_unexpectedly",
+        EventCode=7034, "netlogon_service_crash",
+        true(), "other")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+        values(crash_type) as crash_types
+        values(EventCode) as event_codes
+        values(Message) as messages
+        by Computer
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer crash_types event_codes first_seen last_seen count messages
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-41089: Netlogon/lsass crash on Domain Controller $Computer$ ($crash_types$)"
+      severity: critical
+      drilldown_search: >
+        (index=wineventlog OR index=main) Computer="$Computer$"
+        (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+          OR sourcetype="XmlWinEventLog:Security"
+          OR sourcetype="XmlWinEventLog:System"
+          OR sourcetype="XmlWinEventLog:Application")
+        earliest=-30m latest=+10m
+      recommended_actions:
+        - Isolate $Computer$ from non-replication network paths immediately — treat as a potentially exploited DC.
+        - Capture full volatile memory of $Computer$ before any reboot. The Netlogon thread stack and lsass heap may contain shellcode fragments.
+        - Acquire the WER crash dump (C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportQueue\\*) and the lsass minidump if present — these will tell you whether the fault address is in netlogon.dll text or in non-image memory (heap / stack — i.e. shellcode).
+        - Pull Netlogon RPC traffic from the network sensor to $Computer$ for the 15 minutes preceding the crash. Look for oversized DCE/RPC request packets (Rule 5).
+        - If a working exploit landed first and only later iterations crashed lsass, hunt for SYSTEM child processes of lsass.exe (Rule 2) and new privileged accounts (Rule 3) created in the preceding hour.
+        - Force replication to a known-good DC and audit recent SAMR / DRSUAPI replication operations.
+        - Once contained, apply the May 2026 cumulative update for $Computer$'s OS version (see dc_minimum_patched_build_cve_2026_41089.csv) and confirm the UBR.
+    risk:
+      score: 98
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Genuine memory corruption from third-party LSA plug-ins. Rare on a DC and worth investigating regardless."
+    - "Driver bug or hardware fault crashing lsass. The faulting module should not be netlogon.dll in that case — review the WER dump."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: lsass.exe Spawning a Child Process on a Domain Controller
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  The cleanest post-exploit signal. lsass.exe is the host process for the
+#  Netlogon service; under normal operation, lsass.exe spawns essentially
+#  no child processes (a small set of legitimate exceptions exist around
+#  WerFault.exe and very rare LSA plug-in helper processes). Any cmd.exe,
+#  powershell.exe, rundll32.exe, regsvr32.exe, wmic.exe, mshta.exe,
+#  net.exe, whoami.exe, ipconfig.exe, schtasks.exe, sc.exe, reg.exe, or
+#  unknown binary parented by lsass.exe on a Domain Controller is a
+#  near-certain indicator that an attacker has achieved code execution
+#  inside lsass — which on the DC, in mid-2026, points squarely at
+#  CVE-2026-41089.
+#
+#  Confidence  : VERY HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : Very low — lsass children are not normal on a DC
+
+rule_2_lsass_child_on_dc:
+  name: "CVE-2026-41089 — lsass.exe Spawned Child Process on Domain Controller (Netlogon Post-Exploit)"
+  description: >
+    Detects any process whose parent is lsass.exe on a Domain Controller.
+    Netlogon is hosted inside lsass.exe; successful exploitation of
+    CVE-2026-41089 yields SYSTEM-level code execution inside the lsass
+    process, and the typical post-exploit pivot — whether automated or
+    hands-on — is to spawn cmd.exe, powershell.exe, rundll32.exe, or
+    another living-off-the-land binary. lsass.exe under normal operation
+    has effectively no legitimate child processes on a Domain Controller.
+    The only routine exceptions are WerFault.exe (crash reporter) and a
+    very small set of LSA Authentication Package helper processes; both
+    are explicitly excluded below. Anything else is treated as a critical
+    post-exploit signature.
+  mitre:
+    tactic: "Execution"
+    technique: "T1059"
+    sub_technique: ""
+    technique_name: "Command and Scripting Interpreter"
+  severity: CRITICAL
+  confidence: VERY_HIGH
+  risk_score: 99
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=1
+    ParentImage="*\\lsass.exe"
+    [| inputlookup domain_controllers.csv | fields hostname | rename hostname as Computer]
+    NOT (Image="*\\WerFault.exe" OR Image="*\\werfault.exe")
+    NOT (Image="*\\WerFaultSecure.exe")
+    NOT (Image="C:\\Windows\\System32\\WerFault.exe")
+    | eval suspicious_binary=case(
+        match(Image,"(?i)\\\\(cmd|powershell|pwsh|rundll32|regsvr32|wmic|mshta|cscript|wscript|net1?|whoami|ipconfig|nltest|netstat|schtasks|sc|reg|tasklist|systeminfo|dsquery|ldifde|ntdsutil|esentutl|vssadmin|wbadmin|certutil|bitsadmin|psexec|wsmprovhost)\.exe$"),
+            "lolbin",
+        match(Image,"(?i)\\\\(curl|wget|7z|7za|7zip|winrar|rar)\.exe$"),
+            "exfil_tool",
+        match(Image,"(?i)\\\\AppData\\\\Local\\\\Temp\\\\"),
+            "temp_drop",
+        match(Image,"(?i)\\\\Users\\\\Public\\\\"),
+            "users_public_drop",
+        true(),
+            "unknown_binary")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+        values(Image) as child_images
+        values(CommandLine) as cmdlines
+        values(User) as users
+        values(IntegrityLevel) as integrity
+        values(ProcessGuid) as process_guids
+        values(suspicious_binary) as triage_class
+        by Computer
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer child_images triage_class cmdlines users integrity process_guids first_seen last_seen count
+  schedule:
+    cron: "*/2 * * * *"
+    window: "-3m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-41089: lsass.exe spawned child on DC $Computer$ ($child_images$)"
+      severity: critical
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$"
+        (ParentProcessGuid IN ($process_guids$) OR ProcessGuid IN ($process_guids$))
+        earliest=-1h
+      recommended_actions:
+        - Isolate $Computer$ from the network immediately. This is treated as a confirmed SYSTEM-level compromise of a Tier-0 asset until proven otherwise.
+        - Capture full memory of $Computer$ before reboot — the shellcode that pivoted from lsass to the child is almost certainly still resident.
+        - Pull the full process tree under $process_guids$ to identify follow-on actions (NTDS dump, account creation, lateral movement).
+        - Hunt the lsass.exe handle access events (Sysmon 10) on $Computer$ for the last 24 hours — the implant may be replicated to another lsass instance.
+        - Search every other DC for an lsass.exe child process in the last 7 days. Treat any hit as the same incident.
+        - Rotate krbtgt twice (with the mandatory wait between rotations), then rotate every Domain Admin and Tier-0 service account password.
+        - Audit recent Domain Admins / Enterprise Admins / Schema Admins group membership changes (Rule 3).
+        - Verify replication integrity. If $Computer$ replicated to other DCs after compromise, treat the whole forest as Tier-0 contaminated.
+        - Apply the May 2026 cumulative update across the entire DC estate before bringing $Computer$ (or its replacement) back online.
+    risk:
+      score: 99
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "WerFault.exe spawned by lsass on crash (excluded by NOT clause)."
+    - "Legitimate LSA Authentication Package helper processes — these should be allow-listed by full path after a documented review."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Privileged Account Created or DA Group Member Added on a DC
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  A common post-exploit persistence step on a DC compromise: drop a new
+#  domain administrator or add an existing low-priv account to Domain
+#  Admins, Enterprise Admins, or Schema Admins. Detected by Security event
+#  4720 (user account created), 4728 (member added to Global), 4732
+#  (member added to Domain Local), 4756 (member added to Universal),
+#  filtered to Tier-0 groups. Elevated to critical when the event
+#  originates on a DC AND occurs in the same 1-hour window as Rule 1 or
+#  Rule 2 — that correlation is virtually impossible without exploitation.
+#  Standalone (without correlated CVE evidence), still a high-priority
+#  event regardless.
+#
+#  Confidence  : HIGH (standalone) / VERY HIGH (correlated)
+#  Severity    : CRITICAL
+#  FP Rate     : Low — Tier-0 group changes should always be reviewed
+
+rule_3_privileged_account_change_on_dc:
+  name: "CVE-2026-41089 — Privileged Account Created or Tier-0 Group Membership Changed on Domain Controller"
+  description: >
+    Detects a new user account creation (Security 4720) or membership
+    change in the Domain Admins, Enterprise Admins, Schema Admins,
+    Administrators, Account Operators, Backup Operators, Print Operators,
+    or Server Operators groups (Security 4728/4732/4756) where the event
+    is logged on a Domain Controller. This rule fires standalone at
+    confidence HIGH because Tier-0 group changes always warrant SOC
+    review. The notable event is escalated automatically when correlated
+    with Rule 1 (Netlogon/lsass crash) or Rule 2 (lsass child on DC) on
+    the same DC inside a 1-hour window — that combination is the canonical
+    post-exploit persistence signature for CVE-2026-41089.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1136.002"
+    sub_technique: "002"
+    technique_name: "Create Account: Domain Account"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 90
+  search: >
+    index=wineventlog sourcetype="XmlWinEventLog:Security"
+    [| inputlookup domain_controllers.csv | fields hostname | rename hostname as Computer]
+    (EventCode=4720
+     OR (EventCode IN (4728,4732,4756)
+         AND TargetUserName IN (
+            "Domain Admins","Enterprise Admins","Schema Admins",
+            "Administrators","Account Operators","Backup Operators",
+            "Print Operators","Server Operators","DnsAdmins",
+            "Group Policy Creator Owners","Enterprise Key Admins",
+            "Key Admins")))
+    | eval action=case(
+        EventCode=4720, "account_created",
+        EventCode=4728, "added_to_global_group",
+        EventCode=4732, "added_to_domain_local_group",
+        EventCode=4756, "added_to_universal_group",
+        true(),"other")
+    | eval added_member=coalesce(MemberName, MemberSid, SubjectUserName)
+    | eval target_group=coalesce(TargetUserName, "n/a")
+    | join type=left Computer [
+        search (index=wineventlog OR index=main)
+          (sourcetype="XmlWinEventLog:Application" EventCode=1000 Message="*netlogon.dll*")
+          OR (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+              EventCode=1 ParentImage="*\\lsass.exe")
+          earliest=-1h
+        | stats count as cve_correlated_events
+          values(_time) as cve_event_times
+          by Computer
+        | eval cve_correlation_window="60m"]
+    | fillnull value=0 cve_correlated_events
+    | eval correlation_flag=if(cve_correlated_events > 0,
+        "CORRELATED_WITH_CVE_2026_41089_EVIDENCE",
+        "standalone_priv_change")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+        values(action) as actions
+        values(target_group) as target_groups
+        values(added_member) as added_members
+        values(SubjectUserName) as performed_by
+        values(SubjectDomainName) as performed_by_domain
+        values(correlation_flag) as correlation_flag
+        max(cve_correlated_events) as cve_correlated_events
+        by Computer
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer correlation_flag actions target_groups added_members performed_by performed_by_domain cve_correlated_events first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer,added_members"
+    period: "60m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-41089: Tier-0 priv change on DC $Computer$ — $added_members$ -> $target_groups$ ($correlation_flag$)"
+      severity: critical
+      drilldown_search: >
+        index=wineventlog sourcetype="XmlWinEventLog:Security"
+        (TargetUserName="$added_members$" OR SubjectUserName="$performed_by$")
+        earliest=-24h
+      recommended_actions:
+        - Immediately disable the account "$added_members$" and remove from "$target_groups$".
+        - If correlation_flag = CORRELATED_WITH_CVE_2026_41089_EVIDENCE — treat as confirmed CVE-2026-41089 exploitation. Follow Rule 1 / Rule 2 response actions for $Computer$ in addition to the steps below.
+        - Identify the acting identity "$performed_by$\\$performed_by_domain$". If this is SYSTEM or an unattributable account, the change was made by an in-process attacker (almost certainly via lsass on the DC).
+        - Audit all sessions and tickets issued for "$added_members$" since first_seen — invalidate via krbtgt rotation if any sessions exist.
+        - Pull DRSUAPI replication metadata for $Computer$ — confirm the new account replicated only to known-good DCs.
+        - Hunt for additional new accounts and SID History modifications across all DCs.
+        - Rotate krbtgt twice (with the mandatory wait), then rotate Tier-0 service and admin passwords.
+        - Apply the May 2026 cumulative update on $Computer$ if not already done.
+    risk:
+      score: 90
+      object_type: "user"
+      object_field: "added_members"
+  false_positives:
+    - "Documented IAM workflow that adds a new account to Tier-0 groups — should always be reviewed regardless of cause."
+    - "Disaster-recovery break-glass procedures — these should be coordinated and pre-announced to the SOC."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Suspicious Outbound Network Connection From a Domain Controller
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Domain Controllers should almost never initiate outbound traffic to
+#  arbitrary internet destinations. Their normal outbound surface is very
+#  small: DNS to forwarders, NTP to authorized time sources, Windows
+#  Update endpoints (Microsoft IP ranges), and SIEM / monitoring endpoints
+#  inside the management network. An outbound HTTPS / HTTP / DNS-over-HTTPS
+#  / custom TCP session from a DC to a destination not in the
+#  approved_dc_outbound allow-list is a strong post-exploitation C2 /
+#  staging signal — particularly when the originating process is lsass.exe
+#  or a child of lsass (see Rule 2).
+#
+#  Confidence  : HIGH
+#  Severity    : HIGH
+#  FP Rate     : Low — but tuning required against your specific allow-list
+
+rule_4_dc_outbound_to_unapproved_destination:
+  name: "CVE-2026-41089 — Domain Controller Outbound Connection to Unapproved Destination (Possible C2)"
+  description: >
+    Detects outbound network connections (Sysmon Event 3) initiated from
+    a Domain Controller where the destination IP is not in the
+    approved_dc_outbound allow-list and is not in RFC1918 / link-local /
+    multicast ranges. Filters out the legitimate baseline (Microsoft
+    Update CDN endpoints — captured via DNS resolution to *.windowsupdate.com,
+    *.update.microsoft.com, *.delivery.mp.microsoft.com — internal NTP
+    sources, and intra-AD replication). Originating from lsass.exe or any
+    process descended from lsass.exe is automatically tagged as the
+    highest-risk variant. Tuning the allow-list (approved_dc_outbound.csv)
+    is essential — every environment has a different small set of
+    legitimate DC-egress destinations.
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1071.001"
+    sub_technique: "001"
+    technique_name: "Application Layer Protocol: Web Protocols"
+  severity: HIGH
+  confidence: HIGH
+  risk_score: 88
+  search: >
+    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+    EventCode=3
+    [| inputlookup domain_controllers.csv | fields hostname | rename hostname as Computer]
+    Initiated="true"
+    NOT (DestinationIp="10.*" OR DestinationIp="172.16.*" OR DestinationIp="172.17.*"
+         OR DestinationIp="172.18.*" OR DestinationIp="172.19.*"
+         OR DestinationIp="172.2*.*" OR DestinationIp="172.30.*" OR DestinationIp="172.31.*"
+         OR DestinationIp="192.168.*"
+         OR DestinationIp="169.254.*" OR DestinationIp="224.*" OR DestinationIp="239.*"
+         OR DestinationIp="127.*" OR DestinationIp="::1" OR DestinationIp="fe80*")
+    | lookup approved_dc_outbound.csv dest_ip as DestinationIp OUTPUTNEW purpose
+    | search NOT purpose=*
+    | eval lsass_origin=if(Image="*\\lsass.exe" OR match(Image,"(?i)lsass"), "lsass_direct",
+                       if(match(ParentImage,"(?i)lsass\.exe"), "lsass_descendant",
+                          "non_lsass"))
+    | eval risk_tier=case(
+        lsass_origin="lsass_direct", "critical",
+        lsass_origin="lsass_descendant", "critical",
+        DestinationPort IN (53,853), "high_dns_likely_dot",
+        DestinationPort IN (80,443,8080,8443), "high_web",
+        true(), "medium")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+        values(DestinationIp) as dest_ips
+        values(DestinationHostname) as dest_hostnames
+        values(DestinationPort) as dest_ports
+        values(Image) as initiating_image
+        values(ParentImage) as parent_image
+        values(lsass_origin) as origin
+        values(risk_tier) as risk_tier
+        by Computer
+    | eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer initiating_image parent_image origin risk_tier dest_ips dest_hostnames dest_ports first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer,dest_ips"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-41089: DC $Computer$ initiated outbound to $dest_ips$ — process $initiating_image$ ($risk_tier$)"
+      severity: high
+      drilldown_search: >
+        index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+        Computer="$Computer$" (EventCode=3 OR EventCode=22)
+        DestinationIp IN ($dest_ips$) earliest=-2h
+      recommended_actions:
+        - If origin = lsass_direct or lsass_descendant — treat as confirmed post-exploit C2. Isolate $Computer$ immediately and follow Rule 2 response actions.
+        - Verify $dest_ips$ / $dest_hostnames$ against threat intelligence. A DC reaching out to a brand-new domain or IP is high-confidence C2.
+        - Pull full packet capture for the session between $Computer$ and $dest_ips$ if available. JA3 / JA4 fingerprints and certificate SAN may attribute the implant.
+        - Confirm $dest_ips$ is not in fact a legitimate destination missing from approved_dc_outbound.csv; if legitimate, add it with the documented purpose and re-run the rule.
+        - Hunt for the same $dest_ips$ across every other DC and Tier-0 host.
+        - Apply the May 2026 cumulative update to $Computer$ if not already done.
+    risk:
+      score: 88
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Legitimate but un-allowlisted DC outbound destination (cloud DNS, SaaS log forwarder, anti-malware cloud lookup) — add to approved_dc_outbound.csv once verified."
+    - "Microsoft Update / Defender cloud telemetry — these IP ranges shift, so allow-list maintenance is ongoing."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Anomalous Netlogon RPC Traffic to Domain Controller
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Network-side signature of the exploit itself. CVE-2026-41089 is
+#  triggered by a Netlogon RPC request with an oversized length-prefixed
+#  field. Detection from Zeek dce_rpc or Suricata eve looks for DCE/RPC
+#  REQUEST PDUs to Netlogon's UUID with abnormally large payloads, OR an
+#  unusual volume / cadence of Netlogon RPC requests from a single
+#  external source, OR Netlogon RPC requests from an unexpected source
+#  (not a known domain member or admin host). Lower fidelity standalone
+#  than the host-side rules — but invaluable for early warning and for
+#  attributing the source of an exploited DC.
+#
+#  Confidence  : MEDIUM
+#  Severity    : HIGH
+#  FP Rate     : Medium — tune the size threshold per environment
+
+rule_5_anomalous_netlogon_rpc_traffic:
+  name: "CVE-2026-41089 — Anomalous Netlogon RPC Traffic to Domain Controller"
+  description: >
+    Detects two patterns over the Netlogon RPC interface (UUID
+    12345678-1234-abcd-ef00-01234567cffb) to a Domain Controller:
+    (a) DCE/RPC REQUEST PDUs with payload length > 8192 bytes — the
+    canonical exploit payload size for stack overflow attempts is in
+    the 1-4 KB range, but a margin is included for fragmented/ROP-
+    chained payloads;
+    (b) > 100 Netlogon RPC requests from a single source IP in a 5-minute
+    window — exploit harnesses iterate to find offsets and typically
+    burst many requests during weaponization.
+    Either pattern from a source IP not in approved_admin_ips and not
+    a known domain member is treated as the network exploit signature.
+    Requires Zeek dce_rpc logs OR Suricata eve with DCE-RPC dissector
+    enabled.
+  mitre:
+    tactic: "Initial Access"
+    technique: "T1190"
+    sub_technique: ""
+    technique_name: "Exploit Public-Facing Application"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 80
+  search: >
+    index=network (sourcetype="zeek:dce_rpc" OR sourcetype="suricata:eve" event_type="dcerpc")
+    [| inputlookup domain_controllers.csv | fields ip | rename ip as dest_ip]
+    (endpoint="netlogon"
+     OR named_pipe="\\PIPE\\NETLOGON"
+     OR named_pipe="\\\\PIPE\\\\NETLOGON"
+     OR uuid="12345678-1234-abcd-ef00-01234567cffb"
+     OR interface="netlogon")
+    | eval payload_size=coalesce(rtt, request_size, alloc_hint, dcerpc.alloc_hint, length, 0)
+    | bin _time span=5m as window
+    | stats count as request_count
+        max(payload_size) as max_payload
+        avg(payload_size) as avg_payload
+        values(operation) as ops
+        values(named_pipe) as pipes
+        dc(operation) as distinct_ops
+        by src_ip dest_ip window
+    | eval anomaly=case(
+        max_payload > 8192, "oversized_payload",
+        request_count > 100, "burst_volume",
+        true(), "none")
+    | search anomaly!="none"
+    | lookup approved_admin_ips.csv ip as src_ip OUTPUTNEW role as approved_role
+    | search NOT approved_role=*
+    | eval window=strftime(window, "%Y-%m-%d %H:%M:%S")
+    | table window src_ip dest_ip anomaly request_count max_payload avg_payload distinct_ops ops pipes
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "src_ip,dest_ip"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "CVE-2026-41089: Anomalous Netlogon RPC ($anomaly$) from $src_ip$ to DC $dest_ip$"
+      severity: high
+      drilldown_search: >
+        index=network (sourcetype="zeek:dce_rpc" OR sourcetype="suricata:eve")
+        src_ip="$src_ip$" dest_ip="$dest_ip$" earliest=-30m latest=+10m
+      recommended_actions:
+        - Block $src_ip$ at the perimeter and at the segment firewall facing the DC subnet immediately.
+        - Correlate with Rule 1 / Rule 2 on $dest_ip$ in the surrounding 30-minute window — host-side evidence of impact confirms exploitation.
+        - Identify $src_ip$ — internal IP, external IP, VPN concentrator? If internal, treat the source host as compromised and pivot to investigate it.
+        - Pull full PCAP for sessions between $src_ip$ and $dest_ip$ on TCP/135, TCP/445, and the dynamic RPC range (49152-65535).
+        - Hunt for the same src_ip pattern against every DC in your forest, and from any other internal source.
+        - Apply the May 2026 cumulative update across the DC estate as the highest-priority remediation.
+    risk:
+      score: 80
+      object_type: "system"
+      object_field: "dest_ip"
+  false_positives:
+    - "Legitimate domain-join, password-change, secure-channel maintenance, or trust-traffic from a domain member that happens to exceed the burst threshold under unusual load — verify the src_ip is a known member host."
+    - "Vulnerability scanner probing Netlogon (Nessus, Qualys, etc.) — these should be on the approved_admin_ips list."
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Posture — Unpatched Domain Controller (Missing May 2026 KB)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Not a detection of attack — a detection of exposure. Compares the
+#  current OS build (UBR) of each Domain Controller against the
+#  dc_minimum_patched_build_cve_2026_41089 lookup. Any DC whose UBR is
+#  below the minimum patched build for its OS version is vulnerable.
+#  Fires daily, generates a posture notable, and feeds asset risk so
+#  unpatched DCs surface alongside any active detections. CCB confirmed
+#  active in-the-wild exploitation on 2026-05-29 — at the posture
+#  layer, any unpatched DC is a critical-severity finding.
+#
+#  Confidence  : VERY HIGH
+#  Severity    : CRITICAL
+#  FP Rate     : None — depends only on lookup currency
+
+rule_6_unpatched_dc_posture:
+  name: "CVE-2026-41089 — Posture: Unpatched Domain Controller (Missing May 2026 KB)"
+  description: >
+    Compares the reported OS build (UBR) of each Domain Controller in
+    endpoint_inventory against the minimum patched build per OS version
+    in dc_minimum_patched_build_cve_2026_41089.csv. Any DC running a UBR
+    below the minimum patched build is vulnerable to CVE-2026-41089
+    unauthenticated remote SYSTEM-level code execution. Given that the
+    CCB confirmed active exploitation on 2026-05-29 and the CVSS is 9.8,
+    posture exposure on a DC is treated as a critical-severity finding
+    regardless of compensating controls.
+  mitre:
+    tactic: "Initial Access"
+    technique: "T1190"
+    sub_technique: ""
+    technique_name: "Exploit Public-Facing Application"
+  severity: CRITICAL
+  confidence: VERY_HIGH
+  risk_score: 95
+  search: >
+    index=endpoint_inventory sourcetype="windows:inventory"
+    [| inputlookup domain_controllers.csv | fields hostname | rename hostname as Computer]
+    | dedup Computer
+    | eval ubr_full=BuildNumber."_".UBR
+    | lookup dc_minimum_patched_build_cve_2026_41089.csv os_version as OSVersion
+        OUTPUTNEW min_patched_build as min_patched_build
+    | eval min_build_num=tonumber(mvindex(split(min_patched_build,"."),0))
+    | eval min_ubr=tonumber(mvindex(split(min_patched_build,"."),1))
+    | eval current_build_num=tonumber(BuildNumber)
+    | eval current_ubr=tonumber(UBR)
+    | eval is_vulnerable=case(
+        current_build_num < min_build_num, "yes_build_too_low",
+        current_build_num = min_build_num AND current_ubr < min_ubr, "yes_ubr_too_low",
+        true(), "no")
+    | search is_vulnerable!="no"
+    | eval exposure_severity="critical_unauth_rce_to_system"
+    | stats values(OSVersion) as os_version
+        values(ubr_full) as current_build
+        values(min_patched_build) as required_build
+        values(is_vulnerable) as vulnerability_status
+        values(exposure_severity) as exposure_severity
+        latest(_time) as last_seen
+        by Computer
+    | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    | table Computer os_version current_build required_build vulnerability_status exposure_severity last_seen
+  schedule:
+    cron: "0 7 * * *"
+    window: "-25h@h"
+  throttle:
+    field: "Computer"
+    period: "24h"
+  actions:
+    notable:
+      rule_title: "CVE-2026-41089: Unpatched DC $Computer$ (build $current_build$, requires $required_build$)"
+      severity: critical
+      drilldown_search: >
+        index=endpoint_inventory Computer="$Computer$" earliest=-7d
+      recommended_actions:
+        - Apply the May 2026 cumulative update for $os_version$ on $Computer$ immediately. Required minimum build is $required_build$.
+        - Until patched, restrict Netlogon-reachable network paths to $Computer$. Block TCP/135, TCP/445, and the dynamic RPC range (49152-65535) from all source IPs that are not in approved_admin_ips or known domain members.
+        - Verify there is at least one patched DC in each AD site so FSMO / replication paths do not depend on $Computer$.
+        - Confirm Rule 1 / Rule 2 / Rule 5 have produced no detections for $Computer$ — if any have, treat as already-exploited.
+        - After patching, force a reboot and re-run inventory collection to confirm UBR has moved to $required_build$ or higher. Then close this notable.
+        - If $Computer$ cannot be patched in the next 24 hours, file a documented risk acceptance and apply network-layer compensating controls in the meantime.
+    risk:
+      score: 95
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Stale endpoint inventory data — confirm Computer's inventory record is fresh (last_seen within the last 24 hours) before assuming exposure."
+    - "Out-of-band hotfix applied that updates the netlogon component without bumping UBR — verify by querying the installed update list directly."
