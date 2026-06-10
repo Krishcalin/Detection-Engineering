@@ -9,7 +9,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Splunk-SPL-dc2626?style=flat-square&logo=splunk&logoColor=white" alt="Splunk SPL"/>
   <img src="https://img.shields.io/badge/MITRE-ATT%26CK-f59e0b?style=flat-square" alt="MITRE ATT&CK"/>
-  <img src="https://img.shields.io/badge/rules-186%2B-22c55e?style=flat-square" alt="186+ Rules"/>
+  <img src="https://img.shields.io/badge/rules-195%2B-22c55e?style=flat-square" alt="195+ Rules"/>
   <img src="https://img.shields.io/badge/platforms-Windows%20AD%20%7C%20RHEL%20%7C%20Apache%20%7C%20SAP-3b82f6?style=flat-square" alt="Windows AD | RHEL | Apache | SAP"/>
   <img src="https://img.shields.io/badge/license-GPL--3.0-orange?style=flat-square" alt="GPL-3.0 License"/>
 </p>
@@ -20,7 +20,7 @@
 
 Security Operation Center (SOC) attack detection and response rules for Splunk SIEM. Each rule includes comprehensive SPL queries, MITRE ATT&CK mapping, false positive tuning guidance, investigation queries, and incident response playbooks.
 
-- **186+ detection rules** across Windows AD, RHEL Linux, Apache Web Server, SAP NetWeaver, npm/GitHub supply-chain, and recent threat campaigns
+- **195+ detection rules** across Windows AD, RHEL Linux, Apache Web Server, SAP NetWeaver, npm/GitHub supply-chain, and recent threat campaigns (incl. UAT-8837)
 - **MITRE ATT&CK mapped** -- every rule tagged with technique IDs and tactics
 - **Investigation queries** -- ready-to-run SPL for SOC analyst triage
 - **Incident response playbooks** -- step-by-step response procedures per attack type
@@ -54,7 +54,8 @@ Detection-Engineering/
     │   ├── apache_reconnaissance_detection.yml
     │   └── apache_exploitation_detection.yml
     ├── recent_attacks/
-    │   └── cve_2026_21509_apt28_operation_neusploit_detection.yml
+    │   ├── cve_2026_21509_apt28_operation_neusploit_detection.yml
+    │   └── uat_8837_critical_infrastructure_detection.yml
     ├── sap/
     │   └── cve_2025_31324_sap_netweaver_visual_composer_detection.yml
     ├── supply_chain/
@@ -69,6 +70,42 @@ Detection-Engineering/
         ├── rhel_discovery_enumeration_detection.yml
         └── rhel_exfiltration_detection.yml
 ```
+
+## Recent Attacks — UAT-8837 (China-nexus, North American Critical Infrastructure)
+
+**File**: `splunk_rules/recent_attacks/uat_8837_critical_infrastructure_detection.yml`
+
+Detects the **UAT-8837** intrusion set (Cisco Talos) targeting Energy, Healthcare,
+and Manufacturing critical-infrastructure organizations in North America. Initial
+access via **CVE-2025-53690 (Sitecore ViewState deserialization)** or stolen
+credentials, followed by an open-source post-exploitation toolkit (Earthworm,
+GoTokenTheft, SharpHound, Rubeus, Certipy, GoExec, Impacket, DWAgent).
+**9 complementary rules** across endpoint, identity, and network telemetry, with
+investigation queries and an IR playbook.
+
+| Rule | Detection Method | MITRE | Confidence |
+|------|-----------------|-------|------------|
+| Rule 1 | Sitecore (CVE-2025-53690) IIS worker (`w3wp.exe`) spawning shell/tooling | T1190 | HIGH |
+| Rule 2 | RDP `DisableRestrictedAdmin` registry modification | T1112 | HIGH |
+| Rule 3 | Known tool SHA256 / masquerade filename (`.ico` PEs, `dwagent.exe`, …) | T1105 | HIGH |
+| Rule 4 | PE executable masquerading as `.ico` run from Temp/Public | T1036.008 | HIGH |
+| Rule 5 | Earthworm reverse-SOCKS commands + C2 IP traffic | T1572 | HIGH |
+| Rule 6 | Host/AD reconnaissance command burst | T1087.002 | MEDIUM |
+| Rule 7 | GPP `cpassword` theft / `secedit` policy export | T1552.006 | HIGH |
+| Rule 8 | Backdoor domain account creation / privileged group add | T1136.002 | MEDIUM |
+| Rule 9 | Rubeus / Certipy / SharpHound / GoExec usage | T1558.003 | HIGH |
+
+**C2 IPs**: `74.176.166.174`, `20.200.129.75`, `172.188.162.183`, `4.144.1.47`, `103.235.46.102`
+**Lookups**: `uat8837_file_hashes.csv` (sha256, tool — seed from the Talos IOC list), `uat8837_c2_ips.csv`
+**Cross-product**: ClamAV `Win.Malware.Earthworm`; Snort SIDs `61883/61884/63727/63728/300585`.
+
+### Quick Deploy
+1. Deploy Rules 1, 2, 3, 5 first — highest fidelity (initial access, RestrictedAdmin, tool IOCs, C2).
+2. Block the five C2 IPs at the perimeter immediately and patch Sitecore (CVE-2025-53690) + rotate ASP.NET machine keys.
+3. Seed `uat8837_file_hashes.csv` from the Talos report, then enable Rule 3 hash matching.
+4. Tune Rule 6 (recon burst) distinct-command threshold to your admin baseline before alerting.
+
+---
 
 ## Supply Chain — Shai-Hulud / TeamPCP npm & GitHub Worm
 

