@@ -1,0 +1,826 @@
+# ==============================================================================
+#  Shai-Hulud / TeamPCP — npm & GitHub Supply-Chain Worm
+#  Splunk Detection Rules
+# ==============================================================================
+#  Description : Multi-layered detection for the "Shai-Hulud" self-replicating
+#                npm/GitHub supply-chain worm, its "The Second Coming" (v2.0)
+#                variant, the TeamPCP "Mini Shai-Hulud" wave, and the post-leak
+#                copycat clones (Miasma, "Wave Four", and typosquat variants).
+#
+#                Core behaviour (consistent across waves):
+#                  1. Initial access via a trojanised npm package whose
+#                     package.json pre/postinstall hook runs a large, minified
+#                     JavaScript payload (bundle.js / setup_bun.js /
+#                     bun_environment.js / router_init.js).
+#                  2. Credential theft: the payload runs TruffleHog
+#                     ("trufflehog filesystem . --json --results=verified"),
+#                     scrapes env vars, ~/.npmrc, ~/.aws, ~/.ssh, GitHub Actions
+#                     runner memory, and cloud IMDS (169.254.169.254 / .170.2).
+#                  3. Exfiltration to webhook.site / attacker C2 and/or by
+#                     pushing the stolen secrets into newly-created PUBLIC
+#                     GitHub repos (classic marker repos + "-migration" copies
+#                     of the victim's private repos).
+#                  4. Persistence: injects a malicious GitHub Actions workflow
+#                     (.github/workflows/shai-hulud-workflow.yml / discussion.yaml)
+#                     on a "shai-hulud" branch; drops editor/agent hooks
+#                     (.vscode/tasks.json, .claude/*), self-hosted runners.
+#                  5. Self-replication: with stolen npm tokens, republishes
+#                     malicious versions of every package the maintainer can
+#                     access — spreading the worm across the ecosystem.
+#
+#                WAVE / ACTOR ATTRIBUTION (drives the IOC sets below):
+#                  * Original Shai-Hulud  (Sep 2025) — bundle.js, repo/desc
+#                    "Shai-Hulud", "-migration" suffix, workflow
+#                    shai-hulud-workflow.yml, exfil webhook.site/bb8ca5f6-...
+#                  * "The Second Coming" (Nov 2025) — setup_bun.js,
+#                    bun_environment.js, desc "Sha1-Hulud: The Second Coming"
+#                    (27,000+ repos), workflow discussion.yaml, self-hosted
+#                    runner "SHA1HULUD" in ~/.dev-env/.
+#                  * TeamPCP "Mini Shai-Hulud" (May 2026, TanStack) — router_init.js,
+#                    tanstack_runner.js, exfil filev2.getsession.org /
+#                    api.masscan.cloud / git-tanstack.com / seed1.getsession.org,
+#                    persistence .claude/router_runtime.js + .vscode/tasks.json,
+#                    Dune-themed branches dependabot/github_actions/format/<dune>,
+#                    marker repos siridar-ghola-567 / tleilaxu-ornithopter-43,
+#                    commit author claude@users.noreply.github.com, subnet
+#                    83.142.209.0/24.  TeamPCP open-sourced the code 2026-05-12
+#                    ("A Gift From TeamPCP", commit author TeamPCP_OSS, dates
+#                    obfuscated to 2099-01-01).
+#                  * COPYCATS (post-leak, OTHER actors):
+#                      - Miasma (Jun 2026, @redhat-cloud-services/*) — desc
+#                        "Miasma: The Spreading Blight", Greek-mythology account
+#                        pool, exfil api.anthropic.com/v1/api (camouflage) +
+#                        GitHub commit-search C2 "q=firedalazer", commit-msg
+#                        threat "IfYouInvalidateThisTokenItWillNukeTheComputerOfTheOwner".
+#                      - "Wave Four" — Russian-folklore repo names (BABA-YAGA,
+#                        KOSCHEI, FIREBIRD, PTITSA, RUSALKA, MOROZKO, LESHY,
+#                        DOMOVOI, VODYANOY), C2 check.git-service.com /
+#                        t.m-kosche.com (83.142.209.0/24), FIRESCALE commit
+#                        dead-drop, rope.pyz, durabletask PyPI worm.
+#                      - Typosquat clones — chalk-tempalte, axois-utils,
+#                        @deadcode09284814/axios-util, color-style-utils; C2 on
+#                        *.lhr.life + 80.200.28.28:2222; largely UNOBFUSCATED.
+#
+#  MITRE ATT&CK: T1195.002 (Compromise Software Supply Chain),
+#                T1195.001 (Compromise Software Dependencies and Dev Tools),
+#                T1059.007 (JavaScript), T1059.006 (Python — PyPI variants),
+#                T1552.001 (Credentials In Files), T1552.004 (Private Keys),
+#                T1528 (Steal Application Access Token),
+#                T1567.001 (Exfil to Code Repository),
+#                T1567.002 (Exfil to Cloud Storage),
+#                T1078 (Valid Accounts), T1648 (Serverless/CI Execution),
+#                T1546 / T1547 (Event-Triggered / Boot-Logon persistence),
+#                T1083 (File and Directory Discovery), T1530 (Data from Cloud — IMDS)
+#  Kill Chain   : Initial Access → Execution → Credential Access → Collection →
+#                 Exfiltration → Persistence → Lateral Movement (self-replication)
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : GitHub Enterprise/Cloud audit log (github:cloud:audit),
+#                 XmlWinEventLog:Microsoft-Windows-Sysmon/Operational,
+#                 linux:audit / auditd, sysmon_linux, npm registry/proxy logs,
+#                 DNS / web-proxy / firewall (pan:traffic, zeek:conn, zeek:http,
+#                 suricata:eve), CloudTrail/GCP/Azure audit (IMDS & token use)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-06-10
+#  License      : MIT
+#
+#  References:
+#    - https://www.ox.security/blog/new-actors-deploy-shai-hulud-clones-teampcp-copycats-are-here/
+#    - https://unit42.paloaltonetworks.com/npm-supply-chain-attack/
+#    - https://phoenix.security/mini-shai-hulud-teampcp-tanstack/
+#    - https://research.splunk.com/stories/npm_supply_chain_compromise/
+#    - https://attack.mitre.org/software/S9008/
+#    - https://www.reversinglabs.com/blog/shai-hulud-second-coming
+#    - https://docs.github.com/en/organizations/keeping-your-organization-secure/managing-security-settings-for-your-organization/audit-log-events-for-your-organization
+# ==============================================================================
+#
+#  PREREQUISITES:
+#
+#  1. GitHub Enterprise Cloud / Server audit-log streaming into Splunk:
+#     - Sourcetype: github:cloud:audit  (Splunk Add-on for GitHub / audit log stream)
+#     - Ensure these actions are captured: repo.create, repo.access (visibility),
+#       git.push, personal_access_token.create, repository_secret.create,
+#       protected_branch.destroy, workflows.*
+#
+#  2. Endpoint process + file telemetry on developer workstations and CI runners:
+#     - Windows: Sysmon Events 1 (ProcessCreate), 3 (NetworkConnect), 11 (FileCreate)
+#     - Linux:   auditd (execve, open/openat) and/or Sysmon for Linux (1, 3, 11)
+#
+#  3. Network egress visibility (DNS, web-proxy, or firewall) for exfil C2 match.
+#
+#  4. (Optional) npm registry / proxy (e.g. Verdaccio, Artifactory, GitHub Packages)
+#     publish + install logs — sourcetype npm:registry.
+#
+#  5. Lookup tables required:
+#     - npm_compromised_packages.csv   (package, version, ecosystem, campaign, sha256)
+#     - approved_npm_publishers.csv     (publisher, package_scope)
+#     - github_admin_actors.csv         (actor, role)            # optional, FP tuning
+#     - dev_ci_hosts.csv                (host, role, environment) # optional
+#
+# ==============================================================================
+#
+#  IOC REFERENCE — Shai-Hulud / TeamPCP / Copycats
+#
+#  Malicious payload files:
+#    bundle.js  setup_bun.js  bun_environment.js  router_init.js
+#    tanstack_runner.js  rope.pyz  /tmp/processor.sh  /tmp/migrate-repos.sh
+#    /tmp/p*.js
+#
+#  Persistence artifacts:
+#    .github/workflows/shai-hulud-workflow.yml   .github/workflows/discussion.yaml
+#    .claude/settings.json   .claude/router_runtime.js   .vscode/tasks.json
+#    ~/.config/systemd/user/gh-token-monitor.service
+#    ~/Library/LaunchAgents/com.user.gh-token-monitor.plist
+#    self-hosted runner "SHA1HULUD" in ~/.dev-env/
+#
+#  Secret-staging files:
+#    cloud.json  environment.json  truffleSecrets.json  actionsSecrets.json
+#    contents.json  data.json  results-<ts>-<n>.json
+#
+#  GitHub repo / branch / commit markers:
+#    repo/desc: "Shai-Hulud"  "Sha1-Hulud: The Second Coming"  "Shai-Hulud Migration"
+#               "Miasma: The Spreading Blight"  "A Gift From TeamPCP"
+#               "A Mini Sha1-Hulud has Appeared"
+#    repo names: siridar-ghola-567  tleilaxu-ornithopter-43
+#                BABA-YAGA KOSCHEI FIREBIRD PTITSA RUSALKA MOROZKO LESHY DOMOVOI VODYANOY
+#    branches:  shai-hulud   *-migration   dependabot/github_actions/format/<dune-word>
+#    commit:    author claude@users.noreply.github.com | TeamPCP_OSS ; date 2099-01-01
+#    markers:   FIRESCALE   firedalazer
+#               IfYouInvalidateThisTokenItWillNukeTheComputerOfTheOwner
+#
+#  Network / C2 (exfil):
+#    webhook.site/bb8ca5f6-4175-45d2-b042-fc9ebb8170b7
+#    *.lhr.life (87e0bbc636999b / b94b6bcfa27554 / edcf8b03c84634)   80.200.28.28:2222
+#    api.masscan.cloud  filev2.getsession.org  seed1.getsession.org  git-tanstack.com
+#    check.git-service.com  t.m-kosche.com   83.142.209.0/24 (.11 .194 .203)
+#    api.anthropic.com/v1/api  (CAMOUFLAGE — real API path is /v1/messages)
+#    api.github.com/search/commits?q=firedalazer | ?q=FIRESCALE  (commit-search C2)
+#    169.254.169.254 / 169.254.170.2  (cloud IMDS — credential harvest)
+#
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: GitHub Repo / Description Campaign Markers
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Highest-fidelity indicator. The worm creates public repos (and renames private
+#  ones to "<name>-migration") whose name or description carries a campaign
+#  marker string. Any repo.create / rename carrying one of these is a confirmed
+#  exfiltration repo or worm artifact.
+#
+#  Confidence : CRITICAL   Severity : CRITICAL   FP Rate : Near-zero
+
+rule_1_github_campaign_marker_repo:
+  name: "Shai-Hulud — Malicious GitHub Repo/Description Marker Created"
+  description: >
+    Detects creation (or rename) of a GitHub repository whose name or description
+    matches a Shai-Hulud / TeamPCP / copycat campaign marker. These repos are
+    used to publicly host exfiltrated secrets ("-migration" copies of private
+    repos) or as worm signatures. Markers span all known waves: the original
+    "Shai-Hulud", "Sha1-Hulud: The Second Coming", "Shai-Hulud Migration",
+    TeamPCP's "A Gift From TeamPCP", the Miasma copycat's "Miasma: The Spreading
+    Blight", and Wave-Four Russian-folklore repo names.
+  mitre:
+    tactic: "Exfiltration"
+    technique: "T1567.001"
+    technique_name: "Exfiltration to Code Repository"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 98
+  search: >
+    (index=github OR index=cloud OR index=main) sourcetype="github:cloud:audit"
+    (action="repo.create" OR action="repo.rename" OR action="repo.access"
+     OR action="repository.create")
+    | eval repo_name=coalesce(repo, repository, 'data.repository')
+    | eval repo_desc=coalesce('data.description', description, "")
+    | eval marker=case(
+        match(repo_name, "(?i)-migration$") OR match(repo_desc, "(?i)Shai.?Hulud Migration"), "MIGRATION_EXFIL_REPO",
+        match(repo_desc, "(?i)Sha1?.?Hulud:?\s*The Second Coming"), "SECOND_COMING",
+        match(repo_desc, "(?i)Miasma:?\s*The Spreading Blight"), "MIASMA_COPYCAT",
+        match(repo_desc, "(?i)A Gift From TeamPCP"), "TEAMPCP_RELEASE",
+        match(repo_desc, "(?i)A Mini Sha1?.?Hulud has Appeared"), "MINI_COPYCAT",
+        match(repo_name, "(?i)^(siridar-ghola-567|tleilaxu-ornithopter-43)$"), "TEAMPCP_MARKER_REPO",
+        match(repo_name, "(?i)^(BABA-YAGA|KOSCHEI|FIREBIRD|PTITSA|RUSALKA|MOROZKO|LESHY|DOMOVOI|VODYANOY)$"), "WAVE_FOUR_REPO",
+        match(repo_name, "(?i)shai.?hulud") OR match(repo_desc, "(?i)shai.?hulud"), "SHAI_HULUD",
+        true(), null())
+    | where isnotnull(marker)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(marker) as markers values(repo_desc) as descriptions
+      values(action) as actions by actor repo_name
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table actor repo_name markers descriptions actions first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "actor,repo_name"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "Shai-Hulud: Campaign-marker repo '$repo_name$' created by $actor$ ($markers$)"
+      severity: critical
+      drilldown_search: >
+        index=github sourcetype="github:cloud:audit" actor="$actor$" earliest=-24h
+      recommended_actions:
+        - Treat the actor account as compromised — suspend it and revoke its sessions/PATs
+        - Make the offending repo private/delete it AFTER preserving evidence (it may contain leaked secrets)
+        - Rotate ALL secrets the actor could access (npm tokens, GitHub PATs, cloud keys)
+        - Hunt the actor's recent git.push, repo.access, and personal_access_token.create events
+        - Pivot to Rules 2–9 to scope the worm on endpoints and the registry
+    risk:
+      score: 98
+      object_type: "user"
+      object_field: "actor"
+  false_positives:
+    - "Security researchers / internal red-team repos named after the campaign — allowlist by actor"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Malicious GitHub Actions Workflow / Branch Pushed
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Persistence + propagation. The worm pushes a malicious workflow file on a
+#  dedicated branch so CI re-runs the exfil/replication on every event.
+#
+#  Confidence : CRITICAL   Severity : CRITICAL   FP Rate : Near-zero
+
+rule_2_malicious_workflow_push:
+  name: "Shai-Hulud — Malicious GitHub Actions Workflow / Branch Pushed"
+  description: >
+    Detects a git.push that introduces a Shai-Hulud worm workflow file
+    (.github/workflows/shai-hulud-workflow.yml or discussion.yaml) or pushes to
+    a worm-specific branch (shai-hulud, *-migration, or the TeamPCP Dune-themed
+    dependabot/github_actions/format/<dune-word> dead-drop branches). These
+    workflows re-execute credential theft and self-replication inside GitHub
+    Actions runners.
+  mitre:
+    tactic: "Persistence"
+    technique: "T1546"
+    technique_name: "Event Triggered Execution (CI/CD Workflow)"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 97
+  search: >
+    (index=github OR index=cloud OR index=main) sourcetype="github:cloud:audit"
+    action="git.push"
+    | eval ref=coalesce('data.ref', ref, "")
+    | eval pushed=coalesce('data.pushed_files', 'data.commit_files', "")
+    | eval ioc=case(
+        match(pushed, "(?i)\.github/workflows/(shai-hulud-workflow\.yml|discussion\.yaml)"), "WORM_WORKFLOW_FILE",
+        match(ref, "(?i)(^|/)shai-?hulud$"), "SHAI_HULUD_BRANCH",
+        match(ref, "(?i)dependabot/github_actions/format/(atreides|fremen|harkonnen|melange|sandworm|ornithopter|ghola|siridar)"), "TEAMPCP_DUNE_BRANCH",
+        match(ref, "(?i)-migration$"), "MIGRATION_BRANCH",
+        true(), null())
+    | where isnotnull(ioc)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(ioc) as iocs values(ref) as refs values(pushed) as pushed_files
+      by actor repo
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table actor repo iocs refs pushed_files first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "actor,repo"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "Shai-Hulud: Worm workflow/branch pushed to $repo$ by $actor$ ($iocs$)"
+      severity: critical
+      recommended_actions:
+        - Disable GitHub Actions on the affected repo and delete the malicious workflow/branch (after evidence capture)
+        - Suspend the actor account and revoke its tokens/sessions
+        - Rotate any repository_secret values the workflow could read
+        - Inspect recent workflow_run logs for npm publish / curl exfil steps
+    risk:
+      score: 97
+      object_type: "user"
+      object_field: "actor"
+  false_positives:
+    - "Legitimate workflows coincidentally named 'discussion.yaml' — validate file content and author"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Private→Public Flip + PAT/Secret Burst (Mass Repo Exfil)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Behavioral. The worm exfiltrates private repos by copying them to public
+#  "-migration" repos and mints/uses PATs. A burst of visibility flips and/or
+#  new PATs from one actor in a short window is the mass-exfil signature.
+#
+#  Confidence : HIGH   Severity : CRITICAL   FP Rate : Low
+
+rule_3_visibility_flip_pat_burst:
+  name: "Shai-Hulud — Repo Made Public + PAT/Secret Burst (Mass Exfil)"
+  description: >
+    Detects an actor flipping repositories to public visibility and/or minting
+    personal access tokens at a burst rate, consistent with Shai-Hulud mass
+    exfiltration of private repositories and secrets. Correlates repo.access
+    (visibility=public) with personal_access_token.create and
+    repository_secret.create events from the same actor.
+  mitre:
+    tactic: "Exfiltration"
+    technique: "T1567.001"
+    technique_name: "Exfiltration to Code Repository"
+  severity: CRITICAL
+  confidence: MEDIUM
+  risk_score: 92
+  search: >
+    (index=github OR index=cloud OR index=main) sourcetype="github:cloud:audit"
+    (action="repo.access" OR action="personal_access_token.create"
+     OR action="personal_access_token.request" OR action="repository_secret.create")
+    | eval visibility=coalesce('data.visibility', visibility, "")
+    | eval evt=case(
+        action="repo.access" AND match(visibility,"(?i)public"), "MADE_PUBLIC",
+        match(action,"personal_access_token"), "NEW_PAT",
+        action="repository_secret.create", "SECRET_TOUCH",
+        true(), null())
+    | where isnotnull(evt)
+    | bucket _time span=10m
+    | stats dc(repo) as repos_touched count(eval(evt=="MADE_PUBLIC")) as made_public
+      count(eval(evt=="NEW_PAT")) as new_pats values(evt) as events
+      values(repo) as repos by _time actor
+    | where (made_public >= 3) OR (new_pats >= 3) OR (made_public >= 1 AND new_pats >= 1)
+    | eval window=strftime(_time,"%Y-%m-%d %H:%M:%S")
+    | table window actor made_public new_pats repos_touched events repos
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-15m@m"
+  throttle:
+    field: "actor"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "Shai-Hulud: Mass repo-public/PAT burst by $actor$ ($made_public$ public, $new_pats$ PATs)"
+      severity: critical
+      recommended_actions:
+        - Suspend the actor and revoke all its PATs/sessions immediately
+        - Re-privatize the exposed repositories and assess what secrets leaked
+        - Rotate exposed credentials org-wide; force secret-scanning re-baseline
+        - Correlate with Rule 1 (marker repos) and Rule 2 (workflow push)
+    risk:
+      score: 92
+      object_type: "user"
+      object_field: "actor"
+  false_positives:
+    - "Planned open-sourcing of multiple repos / bulk PAT rotation by platform team — validate via change ticket"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: GitHub Commit / C2 Dead-Drop Markers
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Copycat-specific. Miasma and Wave-Four use GitHub commit-search as a C2
+#  dead-drop ("q=firedalazer", "q=FIRESCALE") and tag commits with distinctive
+#  author identities and extortion messages.
+#
+#  Confidence : HIGH   Severity : HIGH   FP Rate : Low
+
+rule_4_commit_c2_markers:
+  name: "Shai-Hulud — Commit / C2 Dead-Drop Markers (TeamPCP / Miasma / Wave Four)"
+  description: >
+    Detects Shai-Hulud copycat commit markers: the dead-man's-switch extortion
+    message "IfYouInvalidateThisTokenItWillNukeTheComputerOfTheOwner", the
+    FIRESCALE / firedalazer commit-search C2 dead-drop strings, the obfuscated
+    far-future commit date (2099-01-01), and the TeamPCP / claude@users.noreply
+    commit-author identities used by the Mini Shai-Hulud dead-drops.
+  mitre:
+    tactic: "Command and Control"
+    technique: "T1567.001"
+    technique_name: "Exfiltration to Code Repository (C2 dead-drop)"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 88
+  search: >
+    (index=github OR index=cloud OR index=main) sourcetype="github:cloud:audit"
+    (action="git.push" OR action="git.commit" OR action="protected_branch.destroy")
+    | eval msg=coalesce('data.commit_message', commit_message, "")
+    | eval cauthor=coalesce('data.author_email', author_email, 'data.committer', "")
+    | eval cdate=coalesce('data.commit_date', commit_date, "")
+    | eval ioc=case(
+        match(msg, "(?i)IfYouInvalidateThisToken|NukeTheComputerOfTheOwner|WipeTheComputerOfTheOwner"), "DEADMAN_SWITCH_THREAT",
+        match(msg, "FIRESCALE") OR match(msg, "(?i)firedalazer"), "C2_DEADDROP_MARKER",
+        match(cauthor, "(?i)TeamPCP") OR match(msg, "(?i)A Gift From TeamPCP"), "TEAMPCP_AUTHOR",
+        match(cauthor, "(?i)^claude@users\.noreply\.github\.com$"), "MINI_SHAIHULUD_AUTHOR",
+        match(cdate, "^2099-"), "OBFUSCATED_FUTURE_DATE",
+        true(), null())
+    | where isnotnull(ioc)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(ioc) as iocs values(cauthor) as authors values(msg) as messages
+      by actor repo
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table actor repo iocs authors messages first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "actor,repo"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "Shai-Hulud: Copycat commit/C2 marker in $repo$ ($iocs$)"
+      severity: high
+      recommended_actions:
+        - Capture the commit and surrounding history; identify the dead-drop payload
+        - Suspend the actor and rotate its credentials
+        - Block the associated C2 (see Rule 8) and hunt for the install-time payload (Rules 5-7)
+    risk:
+      score: 88
+      object_type: "repository"
+      object_field: "repo"
+  false_positives:
+    - "Threat-intel notes / detections that quote these marker strings — allowlist your security repos"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: npm/node/bun Install Hook Spawning Credential-Harvest Tooling
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Primary endpoint behavioral signal. A pre/postinstall hook runs the payload,
+#  which spawns TruffleHog and curl/git to scrape and exfil secrets.
+#
+#  Confidence : CRITICAL   Severity : CRITICAL   FP Rate : Low
+
+rule_5_install_hook_credential_tooling:
+  name: "Shai-Hulud — npm/node/bun Install Hook Spawning TruffleHog/curl"
+  description: >
+    Detects a Node/npm/bun process spawning credential-harvesting tooling —
+    most notably TruffleHog invoked as "trufflehog filesystem . --json
+    --results=verified" — or curl/wget/git used for secret exfiltration, during
+    package installation. This is the core execution+credential-access behavior
+    of the Shai-Hulud worm payload (bundle.js / setup_bun.js / bun_environment.js).
+  mitre:
+    tactic: "Credential Access"
+    technique: "T1552.001"
+    technique_name: "Unsecured Credentials: Credentials In Files"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 95
+  search: >
+    (index=main OR index=endpoint OR index=linux)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+     OR sourcetype="linux:audit" OR sourcetype="auditd" OR sourcetype="sysmon_linux")
+    (EventCode=1 OR type=EXECVE)
+    (ParentImage="*\\node.exe" OR ParentImage="*\\npm*" OR ParentImage="*\\bun.exe"
+     OR parent_process_name="node" OR parent_process_name="npm"
+     OR parent_process_name="bun" OR parent_process_name="bunx" OR parent_process_name="npx")
+    | eval cmd=lower(coalesce(CommandLine, command))
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), process_name))
+    | where (match(child,"trufflehog") OR match(cmd,"trufflehog filesystem")
+             OR (match(child,"^(curl|wget)$") AND match(cmd,"(webhook\.site|lhr\.life|getsession|masscan|git-service|m-kosche|git-tanstack)"))
+             OR (match(child,"^git$") AND match(cmd,"(clone|push).*(getsession|git-tanstack|lhr\.life)")))
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(child) as child_proc values(cmd) as command_lines values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer child_proc command_lines users first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "Shai-Hulud: npm/node/bun spawned credential-harvest tool on $Computer$"
+      severity: critical
+      recommended_actions:
+        - Isolate the host/CI runner; it is actively harvesting secrets
+        - Identify the installed package + version (npm/yarn/pnpm logs) and quarantine it
+        - Rotate ALL secrets reachable from this host (npm, GitHub PAT, cloud keys, SSH)
+        - Pivot to Rules 6-8 for the dropped payload, staging files, and exfil destination
+    risk:
+      score: 95
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Legitimate use of TruffleHog in a security-scanning pipeline — allowlist that CI host/job via dev_ci_hosts.csv"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Worm Payload & Persistence File Artifacts
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  File-based IOC. Catches the dropped payload and the editor/agent/OS
+#  persistence artifacts regardless of which package delivered them.
+#
+#  Confidence : HIGH   Severity : CRITICAL   FP Rate : Low
+
+rule_6_payload_persistence_files:
+  name: "Shai-Hulud — Worm Payload / Persistence File Artifact Written"
+  description: >
+    Detects creation of Shai-Hulud / TeamPCP payload files (bundle.js,
+    setup_bun.js, bun_environment.js, router_init.js, tanstack_runner.js,
+    rope.pyz, /tmp/processor.sh, /tmp/migrate-repos.sh, /tmp/p*.js) and
+    persistence artifacts (.claude/router_runtime.js, .claude/settings.json,
+    .vscode/tasks.json, gh-token-monitor systemd service / LaunchAgent,
+    self-hosted runner under ~/.dev-env/).
+  mitre:
+    tactic: "Persistence"
+    technique: "T1546"
+    technique_name: "Event Triggered Execution"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 93
+  search: >
+    (index=main OR index=endpoint OR index=linux)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+     OR sourcetype="linux:audit" OR sourcetype="auditd" OR sourcetype="sysmon_linux")
+    (EventCode=11 OR type=PATH OR action=CREATE)
+    | eval fpath=lower(coalesce(TargetFilename, name, path))
+    | eval ioc=case(
+        match(fpath,"(^|[\\\\/])(setup_bun\.js|bun_environment\.js|router_init\.js|tanstack_runner\.js|rope\.pyz)$"), "WORM_PAYLOAD",
+        match(fpath,"[\\\\/]tmp[\\\\/](processor\.sh|migrate-repos\.sh|p[a-z0-9]*\.js)$"), "WORM_TMP_PAYLOAD",
+        match(fpath,"[\\\\/]node_modules[\\\\/].*[\\\\/]bundle\.js$"), "BUNDLE_JS_IN_PKG",
+        match(fpath,"[\\\\/]\.github[\\\\/]workflows[\\\\/](shai-hulud-workflow\.yml|discussion\.yaml)$"), "WORM_WORKFLOW",
+        match(fpath,"[\\\\/]\.claude[\\\\/](router_runtime\.js|settings\.json)$"), "CLAUDE_HOOK_PERSIST",
+        match(fpath,"[\\\\/]\.vscode[\\\\/]tasks\.json$"), "VSCODE_TASK_PERSIST",
+        match(fpath,"gh-token-monitor\.(service|plist)$") OR match(fpath,"[\\\\/]\.dev-env[\\\\/]"), "RUNTIME_PERSIST",
+        true(), null())
+    | where isnotnull(ioc)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(ioc) as iocs values(Image) as creating_process values(User) as users
+      values(fpath) as file_paths by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer iocs file_paths creating_process users first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer,iocs"
+    period: "20m"
+  actions:
+    notable:
+      rule_title: "Shai-Hulud: Worm payload/persistence file on $Computer$ ($iocs$)"
+      severity: critical
+      recommended_actions:
+        - Quarantine the file(s); compute SHA256 and compare to published IOC hashes
+        - Remove persistence (workflow, .claude/.vscode hooks, systemd/LaunchAgent, self-hosted runner)
+        - Treat the host as compromised — rotate all reachable secrets
+    risk:
+      score: 93
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Projects that legitimately ship a webpack 'bundle.js' — scope BUNDLE_JS_IN_PKG to >1MB files in node_modules and correlate with Rule 5"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: Secret-Staging JSON Files Written
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Collection stage. The payload writes harvested secrets into named JSON files
+#  before exfil. Their creation by a node/bun process is a strong indicator.
+#
+#  Confidence : HIGH   Severity : HIGH   FP Rate : Low-Medium
+
+rule_7_secret_staging_files:
+  name: "Shai-Hulud — Secret-Staging JSON File Created"
+  description: >
+    Detects creation of the JSON files the Shai-Hulud payload uses to stage
+    harvested credentials before exfiltration (cloud.json, environment.json,
+    truffleSecrets.json, actionsSecrets.json, contents.json, data.json,
+    results-<timestamp>-<n>.json), particularly when written by a node/bun
+    process or within an npm install working directory.
+  mitre:
+    tactic: "Collection"
+    technique: "T1074.001"
+    technique_name: "Local Data Staging"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 85
+  search: >
+    (index=main OR index=endpoint OR index=linux)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+     OR sourcetype="linux:audit" OR sourcetype="auditd" OR sourcetype="sysmon_linux")
+    (EventCode=11 OR type=PATH OR action=CREATE)
+    | eval fname=lower(mvindex(split(coalesce(TargetFilename,name,path),"/"),-1))
+    | eval fname=mvindex(split(fname,"\\"),-1)
+    | eval proc=lower(coalesce(mvindex(split(Image,"\\"),-1), process_name))
+    | where (match(fname,"^(cloud|environment|trufflesecrets|actionssecrets|contents|data)\.json$")
+             OR match(fname,"^results-[0-9]+-[0-9]+\.json$"))
+       AND (match(proc,"^(node|bun|npm|npx|python[0-9.]*)$") OR isnull(proc))
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(fname) as staged_files values(proc) as processes values(User) as users
+      by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer staged_files processes users first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "20m"
+  actions:
+    notable:
+      rule_title: "Shai-Hulud: Secret-staging file(s) $staged_files$ written on $Computer$"
+      severity: high
+      recommended_actions:
+        - Preserve the staging files (they reveal exactly which secrets leaked), then remove
+        - Rotate every credential present in the staged files
+        - Correlate with Rule 8 to confirm/deny successful exfil
+    risk:
+      score: 85
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Applications with a legitimate 'data.json'/'environment.json' — the multi-file or results-<ts> pattern + node/bun parent is the high-fidelity combination"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: Exfiltration / C2 Network IOCs (incl. cloud IMDS)
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Network IOC match across all waves. Includes the cloud IMDS endpoints the
+#  payload queries for cloud credentials. Note the api.anthropic.com CAMOUFLAGE:
+#  the worm posts to /v1/api (NOT a real Anthropic path — the real API is
+#  /v1/messages), so we match that specific path to avoid FPs on legit usage.
+#
+#  Confidence : CRITICAL   Severity : CRITICAL   FP Rate : Low
+
+rule_8_exfil_c2_network:
+  name: "Shai-Hulud — Exfiltration / C2 Network IOC"
+  description: >
+    Detects network traffic to Shai-Hulud / TeamPCP / copycat exfiltration and
+    C2 infrastructure (webhook.site dead-drop, *.lhr.life tunnels, getsession.org
+    Session CDN, api.masscan.cloud, git-tanstack.com, check.git-service.com,
+    t.m-kosche.com, the 83.142.209.0/24 and 80.200.28.28 hosts, the GitHub
+    commit-search dead-drops, and the api.anthropic.com/v1/api camouflage path),
+    plus cloud IMDS access (169.254.169.254 / 169.254.170.2) used to harvest
+    cloud credentials from CI runners.
+  mitre:
+    tactic: "Exfiltration"
+    technique: "T1567.002"
+    technique_name: "Exfiltration to Cloud Storage"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 96
+  search: >
+    (index=network OR index=firewall OR index=proxy OR index=dns OR index=main OR index=endpoint)
+    (sourcetype="pan:traffic" OR sourcetype="zeek:conn" OR sourcetype="zeek:http"
+     OR sourcetype="zeek:dns" OR sourcetype="suricata:eve" OR sourcetype="cisco:asa"
+     OR sourcetype="fgt_traffic" OR sourcetype="stream:dns" OR sourcetype="stream:http"
+     OR sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational")
+    | eval host_dom=lower(coalesce(query, host, url_domain, dest_host, uri_host, DestinationHostname, ssl_server_name, "")), urlp=lower(coalesce(uri_path, url, "")), dst=coalesce(dest_ip, DestinationIp, "")
+    | eval ioc=case(
+        match(host_dom,"webhook\.site") AND (urlp=="" OR match(urlp,"bb8ca5f6-4175-45d2-b042-fc9ebb8170b7")), "WEBHOOK_SITE_EXFIL",
+        match(host_dom,"\.lhr\.life$"), "LHR_LIFE_C2",
+        match(host_dom,"(getsession\.org|masscan\.cloud|git-tanstack\.com|git-service\.com|m-kosche\.com)$"), "TEAMPCP_COPYCAT_C2",
+        match(host_dom,"^api\.anthropic\.com$") AND match(urlp,"^/v1/api(\b|/|$)"), "ANTHROPIC_CAMOUFLAGE_EXFIL",
+        match(host_dom,"api\.github\.com") AND match(urlp,"search/commits") AND match(urlp,"(firedalazer|firescale)"), "GITHUB_COMMIT_SEARCH_C2",
+        cidrmatch("83.142.209.0/24", dst) OR dst=="80.200.28.28", "TEAMPCP_C2_IP",
+        dst=="169.254.169.254" OR dst=="169.254.170.2", "CLOUD_IMDS_HARVEST",
+        true(), null())
+    | where isnotnull(ioc)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(ioc) as iocs values(host_dom) as domains values(dst) as dest_ips
+      values(src_ip) as source_hosts by ioc
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table ioc domains dest_ips source_hosts first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "ioc,source_hosts"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "Shai-Hulud: Exfil/C2 traffic to $domains$ ($iocs$)"
+      severity: critical
+      drilldown_search: >
+        index=* (src_ip="$source_hosts$") earliest=-6h
+      recommended_actions:
+        - Block the C2 domain/IP at proxy, firewall, and DNS sinkhole
+        - Treat every source host as compromised — rotate its reachable secrets
+        - For CLOUD_IMDS_HARVEST from a CI runner, rotate the instance role / workload-identity creds
+        - Correlate the source host with Rules 5-7 to confirm the worm chain
+    risk:
+      score: 96
+      object_type: "system"
+      object_field: "source_hosts"
+  false_positives:
+    - "Legitimate api.anthropic.com usage targets /v1/messages — this rule only matches the bogus /v1/api path"
+    - "Sanctioned IMDS access by cloud-native agents — allowlist known agent processes/hosts via dev_ci_hosts.csv"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 9: Known-Compromised Package Install / Anomalous npm Publish
+# ██████████████████████████████████████████████████████████████████████████████
+#
+#  Supply-side detection. Flags installs of known-compromised package@versions
+#  and anomalous publishes from accounts that do not normally publish — the
+#  worm's self-replication signature.
+#
+#  Confidence : HIGH   Severity : HIGH   FP Rate : Medium (tunable via lookups)
+
+rule_9_compromised_pkg_or_anomalous_publish:
+  name: "Shai-Hulud — Known-Compromised Package Install / Anomalous Publish"
+  description: >
+    Detects (a) installation of a known Shai-Hulud / copycat compromised
+    package@version (via the npm_compromised_packages.csv lookup — e.g.
+    @ctrl/tinycolor, ngx-bootstrap, @tanstack/*, @redhat-cloud-services/*,
+    chalk-tempalte, axois-utils, durabletask), and (b) npm publish events from
+    accounts not in approved_npm_publishers.csv or at a burst rate, which is the
+    worm's self-replication behavior.
+  mitre:
+    tactic: "Initial Access"
+    technique: "T1195.002"
+    technique_name: "Compromise Software Supply Chain"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 87
+  search: >
+    (index=main OR index=endpoint OR index=linux OR index=npm)
+    (sourcetype="npm:registry" OR sourcetype="npm:audit"
+     OR sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+     OR sourcetype="linux:audit" OR sourcetype="auditd")
+    (action=install OR action=publish OR EventCode=1 OR type=EXECVE
+     OR match(CommandLine,"(?i)npm (install|publish)") OR match(command,"(?i)npm (install|publish)"))
+    | eval cmd=coalesce(CommandLine, command, "")
+    | eval pkg=coalesce(package_name, 'package', mvindex(split(cmd," "),-1))
+    | eval pkg_ver=coalesce(version, 'package_version', "")
+    | eval op=case(action=="publish" OR match(cmd,"(?i)npm publish"),"publish",
+                   action=="install" OR match(cmd,"(?i)npm install"),"install", true(),"other")
+    | lookup npm_compromised_packages.csv package AS pkg OUTPUT campaign as known_bad_campaign sha256 as known_bad_sha
+    | lookup approved_npm_publishers.csv publisher AS actor OUTPUT package_scope as approved_scope
+    | eval finding=case(
+        isnotnull(known_bad_campaign), "KNOWN_COMPROMISED_PKG",
+        op=="publish" AND isnull(approved_scope), "UNAPPROVED_PUBLISH",
+        true(), null())
+    | where isnotnull(finding)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(finding) as findings values(pkg) as packages values(pkg_ver) as versions
+      values(known_bad_campaign) as campaigns by host actor
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table host actor findings packages versions campaigns first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "host,actor"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "Shai-Hulud: $findings$ — package $packages$ ($campaigns$) on $host$"
+      severity: high
+      recommended_actions:
+        - For a known-compromised install, quarantine the host and rotate all reachable secrets
+        - For an unapproved publish, freeze the npm token, unpublish/deprecate the malicious version, and audit the package contents
+        - Keep npm_compromised_packages.csv current from vendor IOC feeds (OX, Unit42, ReversingLabs, Socket)
+    risk:
+      score: 87
+      object_type: "system"
+      object_field: "host"
+  false_positives:
+    - "New legitimate publisher not yet in approved_npm_publishers.csv — add and re-run"
+    - "Stale lookup entries after remediation — prune npm_compromised_packages.csv periodically"
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES (run manually during triage)
+# ==============================================================================
+#
+#  IQ1 — Reconstruct an actor's GitHub kill chain (repo create + push + PAT):
+#    index=github sourcetype="github:cloud:audit" actor="<actor>"
+#    | sort _time
+#    | table _time action repo data.ref data.visibility
+#
+#  IQ2 — Full process tree around an install-hook detection on a host:
+#    index=main sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+#    Computer="<host>" (EventCode=1 OR EventCode=3 OR EventCode=11) earliest=-1h
+#    | sort _time | table _time EventCode ParentImage Image CommandLine TargetFilename DestinationHostname
+#
+#  IQ3 — Which secrets staged before exfil (read the staging files' presence):
+#    index=main (EventCode=11 OR type=PATH) Computer="<host>"
+#    (TargetFilename="*truffleSecrets.json" OR TargetFilename="*cloud.json"
+#     OR TargetFilename="*environment.json" OR TargetFilename="*actionsSecrets.json")
+#
+#  IQ4 — Enumerate every host that touched a given C2 domain/IP:
+#    index=network (query="*lhr.life" OR dest_ip="80.200.28.28"
+#     OR cidrmatch("83.142.209.0/24", dest_ip) OR query="*getsession.org")
+#    | stats values(dest_ip) count by src_ip
+#
+# ==============================================================================
+#  RESPONSE PLAYBOOK
+# ==============================================================================
+#
+#  1. CONTAIN   : Suspend implicated GitHub accounts; revoke their PATs/sessions;
+#                 isolate affected dev workstations / CI runners; block C2 (Rule 8).
+#  2. SCOPE     : Use IQ1-IQ4 to enumerate affected repos, hosts, packages, and
+#                 the exact secrets staged (Rule 7 / IQ3).
+#  3. ERADICATE : Remove worm workflows/branches, .claude/.vscode/systemd/LaunchAgent
+#                 persistence, self-hosted runners, and the trojanised packages.
+#  4. ROTATE    : Rotate EVERY exposed secret — npm tokens, GitHub PATs/OIDC, AWS/
+#                 GCP/Azure keys, SSH keys, CI secrets. Assume anything reachable
+#                 by an affected host/runner is burned.
+#  5. RECOVER   : Re-privatize exposed repos; unpublish/deprecate malicious package
+#                 versions; pin/lock dependencies; enforce npm 2FA + provenance and
+#                 disable install scripts (npm config set ignore-scripts true) where feasible.
+#  6. HARDEN    : Restrict GitHub Actions permissions (read-only GITHUB_TOKEN),
+#                 require workflow review, monitor personal_access_token.create,
+#                 and keep npm_compromised_packages.csv fed from IOC sources.
+#
+# ==============================================================================
+#  END OF SHAI-HULUD / TEAMPCP DETECTION RULES
+# ==============================================================================

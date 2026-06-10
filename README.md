@@ -9,7 +9,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Splunk-SPL-dc2626?style=flat-square&logo=splunk&logoColor=white" alt="Splunk SPL"/>
   <img src="https://img.shields.io/badge/MITRE-ATT%26CK-f59e0b?style=flat-square" alt="MITRE ATT&CK"/>
-  <img src="https://img.shields.io/badge/rules-177%2B-22c55e?style=flat-square" alt="177+ Rules"/>
+  <img src="https://img.shields.io/badge/rules-186%2B-22c55e?style=flat-square" alt="186+ Rules"/>
   <img src="https://img.shields.io/badge/platforms-Windows%20AD%20%7C%20RHEL%20%7C%20Apache%20%7C%20SAP-3b82f6?style=flat-square" alt="Windows AD | RHEL | Apache | SAP"/>
   <img src="https://img.shields.io/badge/license-GPL--3.0-orange?style=flat-square" alt="GPL-3.0 License"/>
 </p>
@@ -20,7 +20,7 @@
 
 Security Operation Center (SOC) attack detection and response rules for Splunk SIEM. Each rule includes comprehensive SPL queries, MITRE ATT&CK mapping, false positive tuning guidance, investigation queries, and incident response playbooks.
 
-- **177+ detection rules** across Windows AD, RHEL Linux, Apache Web Server, SAP NetWeaver, and recent threat campaigns
+- **186+ detection rules** across Windows AD, RHEL Linux, Apache Web Server, SAP NetWeaver, npm/GitHub supply-chain, and recent threat campaigns
 - **MITRE ATT&CK mapped** -- every rule tagged with technique IDs and tactics
 - **Investigation queries** -- ready-to-run SPL for SOC analyst triage
 - **Incident response playbooks** -- step-by-step response procedures per attack type
@@ -57,6 +57,8 @@ Detection-Engineering/
     │   └── cve_2026_21509_apt28_operation_neusploit_detection.yml
     ├── sap/
     │   └── cve_2025_31324_sap_netweaver_visual_composer_detection.yml
+    ├── supply_chain/
+    │   └── shai_hulud_teampcp_npm_supply_chain_worm_detection.yml
     └── rhel_linux/
         ├── rhel_privilege_escalation_detection.yml
         ├── rhel_persistence_detection.yml
@@ -67,6 +69,40 @@ Detection-Engineering/
         ├── rhel_discovery_enumeration_detection.yml
         └── rhel_exfiltration_detection.yml
 ```
+
+## Supply Chain — Shai-Hulud / TeamPCP npm & GitHub Worm
+
+**File**: `splunk_rules/supply_chain/shai_hulud_teampcp_npm_supply_chain_worm_detection.yml`
+
+Detects the self-replicating **Shai-Hulud** npm/GitHub supply-chain worm, its
+**"The Second Coming" (v2.0)** variant, the **TeamPCP "Mini Shai-Hulud"** wave,
+and the **post-leak copycats** (Miasma / Red Hat, "Wave Four" / Russian-folklore,
+and the typosquat clones). **9 complementary rules** across GitHub audit log,
+endpoint, and network telemetry, with investigation queries and an IR playbook.
+
+| Rule | Detection Method | Data Source | MITRE | Confidence |
+|------|-----------------|-------------|-------|------------|
+| Rule 1 | Malicious repo/description campaign markers (`Shai-Hulud`, `The Second Coming`, `-migration`, `Miasma`, `A Gift From TeamPCP`, folklore repos) | `github:cloud:audit` | T1567.001 | HIGH |
+| Rule 2 | Worm GitHub Actions workflow / branch pushed (`shai-hulud-workflow.yml`, `discussion.yaml`, Dune branches) | `github:cloud:audit` | T1546 | HIGH |
+| Rule 3 | Private→public flip + PAT/secret burst (mass repo exfil) | `github:cloud:audit` | T1567.001 | MEDIUM |
+| Rule 4 | Commit / C2 dead-drop markers (`FIRESCALE`, `firedalazer`, dead-man's-switch threat, `TeamPCP` author) | `github:cloud:audit` | T1567.001 | MEDIUM |
+| Rule 5 | npm/node/bun install hook spawning TruffleHog/curl/git | Sysmon 1 / auditd | T1552.001 | HIGH |
+| Rule 6 | Worm payload & persistence file artifacts written | Sysmon 11 / auditd | T1546 | HIGH |
+| Rule 7 | Secret-staging JSON files (`truffleSecrets.json`, `cloud.json`, …) | Sysmon 11 / auditd | T1074.001 | MEDIUM |
+| Rule 8 | Exfil/C2 network IOCs + cloud IMDS (webhook.site, `*.lhr.life`, getsession.org, `83.142.209.0/24`, Anthropic `/v1/api` camouflage) | network / proxy / DNS | T1567.002 | HIGH |
+| Rule 9 | Known-compromised package install / anomalous npm publish | `npm:registry` + lookups | T1195.002 | MEDIUM |
+
+### Lookups
+- `npm_compromised_packages.csv` — package, version, ecosystem, campaign, sha256 (feed from OX / Unit42 / ReversingLabs / Socket IOC lists)
+- `approved_npm_publishers.csv` — publisher, package_scope
+
+### Quick Deploy
+1. Stream GitHub Enterprise/Cloud audit logs into Splunk as `github:cloud:audit` and deploy Rules 1–4 first — highest fidelity, near-zero false positives.
+2. Deploy Rule 8 (C2/exfil) immediately — pure IOC match; sinkhole/block on hit.
+3. Deploy Rule 5 (install-hook → TruffleHog) on developer + CI hosts; allowlist any legitimate TruffleHog pipeline via `dev_ci_hosts.csv`.
+4. Populate `npm_compromised_packages.csv` from vendor IOC feeds before enabling Rule 9, and keep it current.
+
+---
 
 ## Detection Rules — Windows Active Directory
 

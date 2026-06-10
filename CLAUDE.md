@@ -27,8 +27,9 @@ Every rule includes SPL search queries, MITRE ATT&CK mapping, severity/confidenc
 | **Network Security** | `splunk_rules/network_security/` | 1 | 6 | TOR traffic, rogue DNS, large uploads/exfiltration, unencrypted sensitive traffic, network share removal, recurring malware |
 | **Recent Attacks** | `splunk_rules/recent_attacks/` | 1 | 12 | CVE-2026-21509, APT28 Operation NeuSploit |
 | **SAP** | `splunk_rules/sap/` | 1 | 7 | CVE-2025-31324 SAP NetWeaver Visual Composer Metadata Uploader RCE (Chaya_004, UNC5221) |
+| **Supply Chain** | `splunk_rules/supply_chain/` | 1 | 9 | Shai-Hulud / TeamPCP npm & GitHub supply-chain worm + copycats (Second Coming, Miasma, Wave Four, typosquats); GitHub audit-log, endpoint, and C2 detection |
 
-**Total: 53 files, 171+ rules, ~43,000 lines of YAML**
+**Total: 54 files, 180+ rules, ~44,000 lines of YAML**
 
 ### ICS/OT Protocol Coverage
 
@@ -125,6 +126,7 @@ rule_N_descriptive_name:
 | Microsoft Defender | `ms:defender:advanced`, `ms:defender:alerts` |
 | Trend Micro | `deepsecurity`, `trendmicro:deep_security` |
 | SAP NetWeaver | `sap:j2ee:httpaccess`, `apache:access`, `nginx:plus:kv`, `f5:bigip:asm:syslog`, `zeek:http` |
+| Supply Chain (npm/GitHub) | `github:cloud:audit`, `npm:registry`, `XmlWinEventLog:Microsoft-Windows-Sysmon/Operational`, `linux:audit`, `zeek:conn`, `zeek:dns`, `zeek:http`, `pan:traffic` |
 
 ### Required Splunk Add-ons
 
@@ -156,6 +158,8 @@ Rules reference these lookup tables (must be created in your environment):
 | `sap_servers` | ip, hostname, sid, environment, criticality | SAP |
 | `sap_known_webshells` | filename, sha256, campaign | SAP |
 | `approved_sap_admin_ips` | ip, username, role | SAP |
+| `npm_compromised_packages` | package, version, ecosystem, campaign, sha256 | Supply Chain |
+| `approved_npm_publishers` | publisher, package_scope | Supply Chain |
 
 ## MITRE ATT&CK Coverage
 
@@ -272,6 +276,8 @@ Detection-Engineering/
 │   │   └── cve_2026_21509_apt28_operation_neusploit_detection.yml
 │   ├── sap/                       # SAP NetWeaver detection (7 rules)
 │   │   └── cve_2025_31324_sap_netweaver_visual_composer_detection.yml
+│   ├── supply_chain/              # npm/GitHub supply-chain worm detection (9 rules)
+│   │   └── shai_hulud_teampcp_npm_supply_chain_worm_detection.yml
 │   ├── rhel_linux/                # RHEL Linux detection (63 rules)
 │   │   ├── rhel_credential_access_detection.yml
 │   │   ├── rhel_defense_evasion_detection.yml
