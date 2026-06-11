@@ -9,7 +9,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Splunk-SPL-dc2626?style=flat-square&logo=splunk&logoColor=white" alt="Splunk SPL"/>
   <img src="https://img.shields.io/badge/MITRE-ATT%26CK-f59e0b?style=flat-square" alt="MITRE ATT&CK"/>
-  <img src="https://img.shields.io/badge/rules-195%2B-22c55e?style=flat-square" alt="195+ Rules"/>
+  <img src="https://img.shields.io/badge/rules-205%2B-22c55e?style=flat-square" alt="205+ Rules"/>
   <img src="https://img.shields.io/badge/platforms-Windows%20AD%20%7C%20RHEL%20%7C%20Apache%20%7C%20SAP-3b82f6?style=flat-square" alt="Windows AD | RHEL | Apache | SAP"/>
   <img src="https://img.shields.io/badge/license-GPL--3.0-orange?style=flat-square" alt="GPL-3.0 License"/>
 </p>
@@ -20,7 +20,7 @@
 
 Security Operation Center (SOC) attack detection and response rules for Splunk SIEM. Each rule includes comprehensive SPL queries, MITRE ATT&CK mapping, false positive tuning guidance, investigation queries, and incident response playbooks.
 
-- **195+ detection rules** across Windows AD, RHEL Linux, Apache Web Server, SAP NetWeaver, npm/GitHub supply-chain, and recent threat campaigns (incl. UAT-8837)
+- **205+ detection rules** across Windows AD, RHEL Linux, Apache Web Server, SAP NetWeaver, npm/GitHub supply-chain, and recent threat campaigns (incl. UAT-8837)
 - **MITRE ATT&CK mapped** -- every rule tagged with technique IDs and tactics
 - **Investigation queries** -- ready-to-run SPL for SOC analyst triage
 - **Incident response playbooks** -- step-by-step response procedures per attack type
@@ -43,6 +43,7 @@ Detection-Engineering/
     │   ├── kerberoasting_attack_detection.yml
     │   ├── lsass_credential_dumping_detection.yml
     │   ├── ntds_dit_extraction_detection.yml
+    │   ├── os_credential_dumping_attack_chain_detection.yml
     │   ├── pass_the_hash_detection.yml
     │   ├── password_spraying_detection.yml
     │   └── privileged_group_membership_modification_detection.yml
@@ -152,6 +153,7 @@ endpoint, and network telemetry, with investigation queries and an IR playbook.
 | `kerberoasting_attack_detection.yml` | Kerberoasting + AS-REP Roasting | T1558.003, T1558.004 | CRITICAL | 7 rules + 5 investigation queries |
 | `lsass_credential_dumping_detection.yml` | LSASS Memory Credential Dumping | T1003.001 | CRITICAL | 7 rules + 5 investigation queries |
 | `ntds_dit_extraction_detection.yml` | NTDS.dit Database Extraction | T1003.003 | CRITICAL | 8 rules + 8 investigation queries |
+| `os_credential_dumping_attack_chain_detection.yml` | OS Credential Dumping — full T1003 chain (SAM, LSA Secrets, Cached Creds, registry-hive theft, secretsdump, DPAPI, kill-chain) | T1003.002, T1003.004, T1003.005 | CRITICAL | 10 rules + 4 investigation queries |
 | `pass_the_hash_detection.yml` | Pass-the-Hash Lateral Movement | T1550.002 | CRITICAL | 6 rules + 5 investigation queries |
 | `password_spraying_detection.yml` | Password Spraying + Brute Force | T1110.003, T1110.001 | HIGH–CRITICAL | 7 rules + 4 investigation queries |
 | `privileged_group_membership_modification_detection.yml` | Privileged AD Group Modification | T1098.001 | CRITICAL | 6 rules + 7 investigation queries |

@@ -18,7 +18,7 @@ Every rule includes SPL search queries, MITRE ATT&CK mapping, severity/confidenc
 |----------|-----------|------:|------:|-------------|
 | **Windows** | `splunk_rules/windows/` | 12 | 100 | Execution, persistence, priv esc, defense evasion, discovery, lateral movement, C2, collection, exfiltration, impact, LOLBin proxy execution, account manipulation, anti-forensics |
 | **Active Directory** | `splunk_rules/active_directory/` | 3 | 23 | BloodHound, AS-REP roasting, PetitPotam, ADIDNS, Silver/Diamond Ticket, DCShadow, SID History, Shadow Credentials, RBCD, AdminSDHolder, Skeleton Key, overpass-the-hash, DPAPI, GPO abuse |
-| **Credential Access** | `splunk_rules/credential_access/` | 11 | 75 | Kerberoasting, Golden Ticket, DCSync, LSASS dumping, PtH, NTLM relay, AD CS attacks, GPO modification, NTDS.dit, password spraying |
+| **Credential Access** | `splunk_rules/credential_access/` | 12 | 85 | Kerberoasting, Golden Ticket, DCSync, LSASS dumping, full T1003 OS credential-dumping chain (SAM/LSA Secrets/Cached creds/registry-hive theft/secretsdump/DPAPI), PtH, NTLM relay, AD CS attacks, GPO modification, NTDS.dit, password spraying |
 | **RHEL Linux** | `splunk_rules/rhel_linux/` | 8 | 63 | Execution, persistence, priv esc, defense evasion, discovery, lateral movement, credential access, exfiltration |
 | **Apache Web Server** | `splunk_rules/apache_webserver/` | 6 | 37 | Brute force, DoS, exploitation, path traversal, SQLi, XSS, web shells |
 | **ICS/OT** | `splunk_rules/ics_ot/` | 3 | 20 | IT-to-OT zone breach, Modbus/DNP3/S7comm/OPC UA, TRITON, Industroyer, PIPEDREAM, safety bypass, rogue devices, process anomalies, alarm manipulation |
@@ -29,7 +29,7 @@ Every rule includes SPL search queries, MITRE ATT&CK mapping, severity/confidenc
 | **SAP** | `splunk_rules/sap/` | 1 | 7 | CVE-2025-31324 SAP NetWeaver Visual Composer Metadata Uploader RCE (Chaya_004, UNC5221) |
 | **Supply Chain** | `splunk_rules/supply_chain/` | 1 | 9 | Shai-Hulud / TeamPCP npm & GitHub supply-chain worm + copycats (Second Coming, Miasma, Wave Four, typosquats); GitHub audit-log, endpoint, and C2 detection |
 
-**Total: 55 files, 189+ rules, ~45,000 lines of YAML**
+**Total: 56 files, 199+ rules, ~46,000 lines of YAML**
 
 ### ICS/OT Protocol Coverage
 
@@ -162,6 +162,8 @@ Rules reference these lookup tables (must be created in your environment):
 | `approved_npm_publishers` | publisher, package_scope | Supply Chain |
 | `uat8837_file_hashes` | sha256, tool | Recent Attacks |
 | `uat8837_c2_ips` | ip | Recent Attacks |
+| `credential_dumping_tools` | sha256, tool | Credential Access |
+| `cred_dump_admin_allowlist` | host, account | Credential Access |
 
 ## MITRE ATT&CK Coverage
 
@@ -249,7 +251,7 @@ Detection-Engineering/
 │   │   ├── apache_reconnaissance_detection.yml
 │   │   ├── apache_sqli_xss_detection.yml
 │   │   └── apache_web_shell_detection.yml
-│   ├── credential_access/         # Credential theft detection (75 rules)
+│   ├── credential_access/         # Credential theft detection (85 rules)
 │   │   ├── adcs_attack_detection.yml
 │   │   ├── dcsync_attack_detection.yml
 │   │   ├── golden_ticket_attack_detection.yml
@@ -257,6 +259,7 @@ Detection-Engineering/
 │   │   ├── kerberoasting_attack_detection.yml
 │   │   ├── lsass_credential_dumping_detection.yml
 │   │   ├── ntds_dit_extraction_detection.yml
+│   │   ├── os_credential_dumping_attack_chain_detection.yml
 │   │   ├── ntlm_relay_detection.yml
 │   │   ├── pass_the_hash_detection.yml
 │   │   ├── password_spraying_detection.yml
