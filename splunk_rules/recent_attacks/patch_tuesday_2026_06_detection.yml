@@ -1,0 +1,986 @@
+# ==============================================================================
+#  Microsoft Patch Tuesday — June 2026 — Highlighted CVE Detection
+#  Splunk Detection Rules
+# ==============================================================================
+#  Description : Detection coverage for the CVEs highlighted in the June 2026
+#                Microsoft Patch Tuesday (Qualys / ZDI / Talos reviews). Most of
+#                these were freshly patched with NO public root-cause or PoC, so
+#                the rules below are BEHAVIORAL — exploit-attempt indicators,
+#                service/host crash (DoS or failed exploit), and post-exploitation
+#                activity — grouped by attack surface. They are NOT precise payload
+#                signatures. Pair with vendor IDS content (Cisco Talos Snort SIDs
+#                for this Patch Tuesday) and the patch/exposure checks noted per rule.
+#
+#  CVE -> RULE COVERAGE MAP (all highlighted CVEs):
+#    R1  HTTP.sys ............ CVE-2026-47291 (RCE 9.8), CVE-2026-49160 (DoS, 0-day)
+#    R2  Office .............. CVE-2026-45461/45463/45472/45474 (RCE), 45460 (InfoDisc)
+#    R3  Outlook/Word ........ CVE-2026-45456/47635/45458 (RCE, preview-pane class)
+#    R4  Hyper-V ............. CVE-2026-45607/47652/45641 (guest->host RCE)
+#    R5  AD Domain Services .. CVE-2026-45648 (RCE)
+#    R6  Windows Kernel ...... CVE-2026-45657 (RCE), 42980 (NT kernel EoP), CVE-2025-10263 (ARM EoP)
+#    R7  Kerberos KDC ........ CVE-2026-47288 (RCE)
+#    R8  RDP Client .......... CVE-2026-47289/47654/42992/44799/44801/42985/48563 (reverse-RDP RCE)
+#    R9  DHCP Client ......... CVE-2026-44815 (RCE 9.8)
+#    R10 WDS ................. CVE-2026-42987 (RCE)
+#    R11 Graphics (win32k) ... CVE-2026-44803/44812 (RCE), 42986 (EoP)
+#    R12 Windows Media ....... CVE-2026-48574 (RCE)
+#    R13 Local EoP (sys proc)  CVE-2026-45586 (CTFMON 0-day), 42905 (DWM), 42989 (Winlogon), 44810 (Crypto Svc)
+#    R14 NTLM ................ CVE-2026-50508 (spoofing/coercion)
+#    R15 SharePoint .......... CVE-2026-47634/45481 (spoofing)
+#    R16 Nuance PowerScribe .. CVE-2026-26142 (RCE)
+#    R17 Posture / limited ... CVE-2026-50507 + 45658 (BitLocker SFB 0-day), 33828 (DHA EoP),
+#                              CVE-2026-45476 (Azure Network Adapter EoP), CVE-2026-32193 (AKS RCE)
+#
+#  MITRE ATT&CK: T1190, T1203, T1566.001, T1187, T1611, T1210, T1068, T1547.006,
+#                T1219, T1557.001, T1134, T1036, T1499 (DoS)
+#  Platform     : Splunk Enterprise / Splunk Cloud (ES compatible)
+#  Data Sources : Sysmon (1 ProcessCreate, 3 NetworkConnect, 6 DriverLoad, 7 ImageLoad,
+#                 11 FileCreate, 13 RegistrySet), Security (4688, 4624/4625/4776, 4673),
+#                 System log (provider HTTP, WER bugcheck 1001, service crash 7031/7034),
+#                 IIS / web / WAF, network / firewall / DNS, Azure / k8s audit (cloud rules)
+#  Author       : Krishnendu
+#  Version      : 1.0.0
+#  Created      : 2026-06-11
+#  License      : MIT
+#
+#  References:
+#    - https://blog.qualys.com/vulnerabilities-threat-research/2026/06/09/microsoft-and-adobe-patch-tuesday-june-2026-security-update-review
+#    - https://blog.talosintelligence.com/microsoft-patch-tuesday-for-june-2026-snort-rules-and-prominent-vulnerabilities/
+#    - https://www.zerodayinitiative.com/blog/2026/6/9/the-june-2026-security-update-review
+#    - https://msrc.microsoft.com/update-guide/  (per-CVE advisories)
+#
+#  NOTE: Apply the June 2026 cumulative updates — patching is the primary control.
+#  These detections catch exploitation attempts and the blast radius, not the patch gap.
+# ==============================================================================
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 1: HTTP.sys Exploit Attempt / Crash (CVE-2026-47291 RCE, CVE-2026-49160 DoS)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Oversized request to an http.sys server (the RCE/DoS trigger) and/or an
+#  http.sys service error or host bugcheck (failed/successful exploit or DoS).
+#  Vulnerable config: MaxRequestBytes >= 65534 (default 16384 is safe).
+#  Confidence : HIGH   Severity : CRITICAL   FP Rate : Low-Medium (tune sizes)
+
+rule_1_httpsys_exploit_or_crash:
+  name: "PT2026-06 — HTTP.sys Oversized Request / Crash (CVE-2026-47291 / CVE-2026-49160)"
+  description: >
+    Detects probable exploitation of the HTTP.sys RCE (CVE-2026-47291) or DoS
+    (CVE-2026-49160): abnormally large HTTP requests (approaching the
+    MaxRequestBytes>=65534 vulnerable threshold) to an http.sys-fronted server,
+    and/or http.sys System-log errors, IIS w3wp.exe crashes, or host bugchecks
+    that accompany a failed or successful trigger.
+  mitre:
+    tactic: "Initial Access"
+    technique: "T1190"
+    technique_name: "Exploit Public-Facing Application"
+  severity: CRITICAL
+  confidence: MEDIUM
+  risk_score: 90
+  search: >
+    (index=web OR index=proxy OR index=windows OR index=main OR index=network)
+    ( (sourcetype IN ("iis","ms:iis:auto","apache:access","nginx:plus:kv") AND (cs_bytes>=65000 OR sc_status=400))
+      OR (sourcetype="XmlWinEventLog:System" AND (SourceName="HTTP" OR Provider_Name="HTTP") AND (Level=2 OR EventCode=15300 OR EventCode=15301))
+      OR (sourcetype="XmlWinEventLog:Application" AND EventCode=1000 AND (Message="*w3wp.exe*" OR Message="*svchost.exe*"))
+      OR (EventCode=1001 AND (Provider_Name="Microsoft-Windows-WER-SystemErrorReporting" OR SourceName="*WER*")) )
+    | eval signal=case(cs_bytes>=65000,"oversized_request", EventCode=1001,"host_bugcheck", EventCode=1000,"w3wp_crash", true(),"httpsys_error")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(signal) as signals values(c_ip) as src_ips values(cs_uri_stem) as uris by host
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table host signals src_ips uris first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "host"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: HTTP.sys exploit/crash signal on $host$ ($signals$)"
+      severity: critical
+      recommended_actions:
+        - Confirm the June 2026 patch on $host$ and that MaxRequestBytes < 65534 (default 16384)
+        - Block the source IP(s); import Cisco Talos' June-2026 Snort SIDs for packet-level coverage
+        - Review HTTPERR logs (C:\\Windows\\System32\\LogFiles\\HTTPERR) around the event
+    risk:
+      score: 90
+      object_type: "system"
+      object_field: "host"
+  false_positives:
+    - "Legitimate large uploads / long query strings — baseline cs_bytes per app and scope to internet-facing http.sys hosts"
+    - "Unrelated w3wp/driver crashes — correlate with an inbound request spike"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 2: Office RCE / Info Disclosure (CVE-2026-45461/45463/45472/45474/45460)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Office document RCE -> the Office app spawns a child process, loads LOLBins, or
+#  beacons out. Classic T1203 post-exploitation behavior.
+#  Confidence : HIGH   Severity : CRITICAL   FP Rate : Low
+
+rule_2_office_rce_child_process:
+  name: "PT2026-06 — Office App Spawning Process / Egress (CVE-2026-454xx Office RCE)"
+  description: >
+    Detects Microsoft Office applications (Word, Excel, PowerPoint, OneNote,
+    Access, Publisher) spawning a command interpreter / LOLBin or making an
+    outbound network connection — the post-exploitation signature of the June 2026
+    Office RCEs (CVE-2026-45461/45463/45472/45474) and info-disclosure (45460).
+  mitre:
+    tactic: "Execution"
+    technique: "T1203"
+    technique_name: "Exploitation for Client Execution"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 90
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security")
+    (EventCode=1 OR EventCode=4688 OR EventCode=3)
+    (ParentImage IN ("*\\winword.exe","*\\excel.exe","*\\powerpnt.exe","*\\onenote.exe","*\\msaccess.exe","*\\mspub.exe","*\\outlook.exe")
+     OR parent_process_name IN ("winword.exe","excel.exe","powerpnt.exe","onenote.exe","msaccess.exe"))
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name, process_name))
+    | eval cmd=coalesce(CommandLine, Process_Command_Line, command)
+    | where match(child,"^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|curl|msbuild|installutil|equation)\.exe$")
+            OR (EventCode=3 AND NOT match(coalesce(DestinationIp,""),"^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.)"))
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(ParentImage) as office_app values(child) as child_proc values(cmd) as command_lines
+      values(DestinationIp) as dst_ips values(User) as users by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer office_app child_proc command_lines dst_ips users first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: Office app spawned process / egress on $Computer$ ($child_proc$)"
+      severity: critical
+      recommended_actions:
+        - Capture the Office process tree and the opened document; confirm June 2026 Office patch
+        - Hunt for the delivery email/file and enable ASR "Block Office child process" rules
+      drilldown_search: >
+        index=main Computer="$Computer$" (EventCode=1 OR EventCode=3 OR EventCode=11) earliest=-1h
+    risk:
+      score: 90
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Office add-ins / macros in trusted automation — allowlist by signed parent + command pattern"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 3: Outlook/Word Preview-Pane RCE + NTLM Leak (CVE-2026-45456/47635/45458)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Confidence : HIGH   Severity : CRITICAL   FP Rate : Low
+
+rule_3_outlook_word_preview_rce:
+  name: "PT2026-06 — Outlook/Word RCE + Outbound SMB/WebDAV (CVE-2026-45456/47635/45458)"
+  description: >
+    Detects the Outlook/Word RCE class (June 2026): outlook.exe/winword.exe
+    spawning a process, or initiating outbound SMB (445) / WebDAV (WebClient) to an
+    external host — the auth-coercion / preview-pane exploitation pattern that also
+    leaks NetNTLM. Pairs process-spawn with anomalous external SMB/WebDAV egress.
+  mitre:
+    tactic: "Initial Access"
+    technique: "T1187"
+    technique_name: "Forced Authentication"
+  severity: CRITICAL
+  confidence: HIGH
+  risk_score: 88
+  search: >
+    (index=main OR index=endpoint OR index=windows OR index=network)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security")
+    ((EventCode=1 OR EventCode=4688) AND (ParentImage IN ("*\\outlook.exe","*\\winword.exe")))
+    OR (EventCode=3 AND Image IN ("*\\outlook.exe","*\\winword.exe","*\\svchost.exe") AND (DestinationPort=445 OR DestinationPort=139)
+        AND NOT match(coalesce(DestinationIp,""),"^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.)"))
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name, process_name))
+    | eval cmd=coalesce(CommandLine, Process_Command_Line, command)
+    | where (EventCode=3) OR match(child,"^(cmd|powershell|pwsh|mshta|rundll32|regsvr32|wscript|cscript)\.exe$")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(child) as child_proc values(cmd) as command_lines values(DestinationIp) as ext_smb_dst
+      values(User) as users by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer child_proc command_lines ext_smb_dst users first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: Outlook/Word RCE/forced-auth signal on $Computer$"
+      severity: critical
+      recommended_actions:
+        - Confirm June 2026 Outlook/Word patch; block outbound SMB/WebDAV to the internet at the perimeter
+        - Hunt the mailbox for the triggering message; consider disabling the WebClient (WebDAV) service
+    risk:
+      score: 88
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Legitimate internal SMB from Office is normal — this rule requires EXTERNAL SMB/WebDAV or a child process"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 4: Hyper-V Guest-to-Host RCE (CVE-2026-45607/47652/45641)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Confidence : MEDIUM   Severity : CRITICAL   FP Rate : Low (limited telemetry)
+
+rule_4_hyperv_guest_to_host:
+  name: "PT2026-06 — Hyper-V Worker Anomaly / Crash (CVE-2026-45607/47652/45641)"
+  description: >
+    Detects a Hyper-V guest-to-host escape attempt: the VM worker (vmwp.exe),
+    host compute service (vmcompute.exe), or management service (vmms.exe)
+    spawning a child process or crashing on the host. A successful escape yields
+    code execution in the host's virtualization stack.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1611"
+    technique_name: "Escape to Host"
+  severity: CRITICAL
+  confidence: MEDIUM
+  risk_score: 92
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security" OR sourcetype="XmlWinEventLog:Application")
+    ( ((EventCode=1 OR EventCode=4688) AND (ParentImage IN ("*\\vmwp.exe","*\\vmcompute.exe","*\\vmms.exe")))
+      OR (EventCode=1000 AND (Message="*vmwp.exe*" OR Message="*vmcompute.exe*" OR Message="*vmms.exe*")) )
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name))
+    | eval cmd=coalesce(CommandLine, Process_Command_Line)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(ParentImage) as hyperv_proc values(child) as child_proc values(cmd) as command_lines by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer hyperv_proc child_proc command_lines first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: Hyper-V worker anomaly/crash on host $Computer$"
+      severity: critical
+      recommended_actions:
+        - Treat the Hyper-V host as potentially compromised by a guest escape; isolate and investigate
+        - Confirm June 2026 Hyper-V patch; review which guest VM was active on vmwp.exe at the time
+    risk:
+      score: 92
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "vmwp/vmms rarely spawn children; validate any hit against Hyper-V maintenance activity"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 5: AD Domain Services RCE (CVE-2026-45648)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Confidence : MEDIUM   Severity : CRITICAL   FP Rate : Low (DC-scoped)
+
+rule_5_adds_rce:
+  name: "PT2026-06 — AD Domain Services RCE Indicator on DC (CVE-2026-45648)"
+  description: >
+    Detects indicators of AD Domain Services RCE (CVE-2026-45648) on a Domain
+    Controller: an LSASS/DS process crash, or the DC spawning an unexpected child
+    process (shell/LOLBin) — DCs should never run interactive shells. Scope to
+    Domain Controllers via the domain_controllers lookup.
+  mitre:
+    tactic: "Lateral Movement"
+    technique: "T1210"
+    technique_name: "Exploitation of Remote Services"
+  severity: CRITICAL
+  confidence: MEDIUM
+  risk_score: 95
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security" OR sourcetype="XmlWinEventLog:Application")
+    | search [| inputlookup domain_controllers | fields host | rename host as Computer | format ] OR (EventCode=1000 Message="*lsass.exe*")
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name))
+    | eval parent=lower(coalesce(mvindex(split(ParentImage,"\\"),-1), parent_process_name))
+    | where (EventCode=1000 AND match(coalesce(Message,""),"(?i)lsass\.exe"))
+            OR ((EventCode=1 OR EventCode=4688) AND match(parent,"^(lsass|services|svchost|wininit)\.exe$")
+                AND match(child,"^(cmd|powershell|pwsh|mshta|rundll32|net|whoami)\.exe$"))
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(parent) as parent_proc values(child) as child_proc values(CommandLine) as command_lines by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer parent_proc child_proc command_lines first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer"
+    period: "15m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: AD DS RCE indicator on DC $Computer$ (CVE-2026-45648)"
+      severity: critical
+      recommended_actions:
+        - Treat the DC as potentially compromised — isolate, snapshot, begin DC IR
+        - Confirm June 2026 patch on all DCs; review LDAP/replication anomalies around the event
+    risk:
+      score: 95
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Requires the domain_controllers lookup to scope to DCs; unrelated lsass crashes need correlation"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 6: Windows Kernel RCE/EoP (CVE-2026-45657, 42980, CVE-2025-10263)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Confidence : MEDIUM   Severity : HIGH   FP Rate : Low-Medium
+
+rule_6_kernel_rce_eop:
+  name: "PT2026-06 — Kernel Exploit Indicators: Bugcheck / Suspicious Driver (CVE-2026-45657/42980 / CVE-2025-10263)"
+  description: >
+    Detects indicators of the June 2026 kernel RCE/EoP bugs: host bugchecks (BSOD)
+    that often follow a failed kernel exploit, and suspicious kernel-mode driver
+    loads (Sysmon Event 6) that are unsigned or load from a user-writable path —
+    a common kernel-EoP/BYOVD precursor.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1068"
+    technique_name: "Exploitation for Privilege Escalation"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 85
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    ( (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" AND EventCode=6)
+      OR (EventCode=1001 AND Provider_Name="Microsoft-Windows-WER-SystemErrorReporting") )
+    | eval img=lower(coalesce(ImageLoaded, ""))
+    | eval signed=coalesce(Signed, "")
+    | where (EventCode=1001)
+            OR (EventCode=6 AND (lower(signed)="false" OR match(img,"\\\\(users|temp|programdata|appdata|downloads)\\\\")))
+    | eval signal=if(EventCode=1001,"host_bugcheck","suspicious_driver_load")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(signal) as signals values(img) as drivers values(signed) as driver_signed by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer signals drivers driver_signed first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: Kernel exploit indicator on $Computer$ ($signals$)"
+      severity: high
+      recommended_actions:
+        - Investigate the driver / crash dump; confirm June 2026 kernel patch
+        - Enable Microsoft vulnerable-driver blocklist (HVCI) to mitigate BYOVD
+    risk:
+      score: 85
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Legitimate unsigned dev/test drivers or unrelated bugchecks — baseline known drivers and correlate"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 7: Kerberos KDC RCE (CVE-2026-47288)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Confidence : MEDIUM   Severity : CRITICAL   FP Rate : Low (DC-scoped)
+
+rule_7_kerberos_kdc_rce:
+  name: "PT2026-06 — Kerberos KDC RCE Indicator on DC (CVE-2026-47288)"
+  description: >
+    Detects indicators of the Kerberos KDC RCE (CVE-2026-47288): an LSASS crash on
+    a Domain Controller and/or a burst of malformed/failed Kerberos AS/TGS
+    operations (4768/4769/4771 failures) preceding it — consistent with exploit
+    attempts against the KDC service that runs inside LSASS.
+  mitre:
+    tactic: "Initial Access"
+    technique: "T1190"
+    technique_name: "Exploit Public-Facing Application"
+  severity: CRITICAL
+  confidence: MEDIUM
+  risk_score: 93
+  search: >
+    (index=main OR index=windows)
+    (sourcetype="XmlWinEventLog:Security" OR sourcetype="XmlWinEventLog:Application")
+    (EventCode=4771 OR EventCode=4768 OR EventCode=4769 OR (EventCode=1000 AND Message="*lsass.exe*"))
+    | eval krb_fail=if(EventCode IN (4771,4768,4769) AND (Status!="0x0" AND isnotnull(Status)),1,0)
+    | stats count sum(krb_fail) as krb_failures values(eval(if(EventCode=1000,"lsass_crash",null()))) as crash
+      min(_time) as first_seen max(_time) as last_seen by Computer
+    | where (krb_failures >= 50) OR isnotnull(crash)
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer krb_failures crash first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: Kerberos KDC exploit indicator on DC $Computer$ (CVE-2026-47288)"
+      severity: critical
+      recommended_actions:
+        - Confirm June 2026 patch on all DCs; investigate the Kerberos error burst source
+        - If LSASS crashed on a DC, treat as potential RCE — isolate and begin DC IR
+    risk:
+      score: 93
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Kerberos error bursts also occur from misconfig / spray — tune the threshold and pair with the crash signal"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 8: RDP Client (Reverse-RDP) RCE (CVE-2026-47289/47654/42992/44799/44801/42985/48563)
+# ██████████████████████████████████████████████████████████████████████████████
+#  A malicious RDP SERVER attacks the connecting CLIENT. Detect mstsc.exe spawning
+#  a child / crashing, or connecting outbound 3389 to an untrusted/external host.
+#  Confidence : MEDIUM   Severity : HIGH   FP Rate : Low-Medium
+
+rule_8_rdp_client_reverse_rce:
+  name: "PT2026-06 — RDP Client Reverse-RCE Indicator (7x CVE, mstsc.exe)"
+  description: >
+    Detects the June 2026 Remote Desktop CLIENT RCE class (CVE-2026-47289/47654/
+    42992/44799/44801/42985/48563), where a malicious RDP server compromises the
+    connecting client: mstsc.exe spawning a child process or crashing, and/or
+    outbound RDP (3389) from a workstation to an external/untrusted server.
+  mitre:
+    tactic: "Execution"
+    technique: "T1203"
+    technique_name: "Exploitation for Client Execution"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 85
+  search: >
+    (index=main OR index=endpoint OR index=windows OR index=network)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security" OR sourcetype="XmlWinEventLog:Application")
+    ( ((EventCode=1 OR EventCode=4688) AND ParentImage="*\\mstsc.exe")
+      OR (EventCode=1000 AND Message="*mstsc.exe*")
+      OR (EventCode=3 AND Image="*\\mstsc.exe" AND DestinationPort=3389
+          AND NOT match(coalesce(DestinationIp,""),"^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)")) )
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name))
+    | eval cmd=coalesce(CommandLine, Process_Command_Line)
+    | eval signal=case(EventCode=3,"external_rdp_server", EventCode=1000,"mstsc_crash", true(),"mstsc_child_proc")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(signal) as signals values(child) as child_proc values(cmd) as command_lines
+      values(DestinationIp) as rdp_server values(User) as users by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer signals child_proc command_lines rdp_server users first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "Computer,signals"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: RDP client reverse-RCE indicator on $Computer$ ($signals$)"
+      severity: high
+      recommended_actions:
+        - Confirm June 2026 RDP client patch; warn users against connecting to untrusted RDP servers
+        - Block outbound 3389 to the internet; investigate the mstsc child/crash
+    risk:
+      score: 85
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Admins using approved external RDP gateways — allowlist those destinations"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 9: DHCP Client RCE (CVE-2026-44815, CVSS 9.8)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Confidence : MEDIUM   Severity : CRITICAL   FP Rate : Low
+
+rule_9_dhcp_client_rce:
+  name: "PT2026-06 — DHCP Client RCE Indicator (CVE-2026-44815)"
+  description: >
+    Detects indicators of the DHCP client RCE (CVE-2026-44815, CVSS 9.8): the
+    svchost.exe hosting the Dhcp client service spawning a child or crashing, and/or
+    a rogue DHCP server (an OFFER from an unauthorized server). The bug triggers on a
+    crafted DHCP response, so a rogue/unexpected DHCP source is a key precursor.
+  mitre:
+    tactic: "Execution"
+    technique: "T1203"
+    technique_name: "Exploitation for Client Execution"
+  severity: CRITICAL
+  confidence: MEDIUM
+  risk_score: 90
+  search: >
+    (index=main OR index=endpoint OR index=windows OR index=network OR index=dns)
+    ( ((EventCode=1 OR EventCode=4688) AND ParentImage="*\\svchost.exe" AND match(coalesce(CommandLine,Process_Command_Line,""),"(?i)-k netsvcs|dhcp"))
+      OR (EventCode=1000 AND Message="*svchost.exe*")
+      OR (sourcetype IN ("pan:traffic","zeek:dhcp","suricata:eve") AND (app="dhcp" OR dest_port=67 OR dhcp_type="offer")) )
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name))
+    | where (sourcetype IN ("pan:traffic","zeek:dhcp","suricata:eve"))
+            OR (EventCode=1000) OR match(child,"^(cmd|powershell|pwsh|rundll32)\.exe$")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(child) as child_proc values(src_ip) as dhcp_server values(CommandLine) as command_lines by host
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table host child_proc dhcp_server command_lines first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: DHCP client RCE indicator on $host$ (CVE-2026-44815)"
+      severity: critical
+      recommended_actions:
+        - Confirm June 2026 patch; enable DHCP snooping to block rogue DHCP servers
+        - Investigate the DHCP server source and the svchost child/crash
+    risk:
+      score: 90
+      object_type: "system"
+      object_field: "host"
+  false_positives:
+    - "Authorized DHCP servers — allowlist them; svchost crashes need correlation with a rogue OFFER"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 10: Windows Deployment Services RCE (CVE-2026-42987)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Confidence : MEDIUM   Severity : HIGH   FP Rate : Low
+
+rule_10_wds_rce:
+  name: "PT2026-06 — WDS Server RCE Indicator (CVE-2026-42987)"
+  description: >
+    Detects indicators of the Windows Deployment Services RCE (CVE-2026-42987):
+    the WDSServer service spawning a child process or crashing on a WDS/PXE host.
+    WDS is reached over PXE/TFTP, so anomalous activity on a deployment server is
+    the signal.
+  mitre:
+    tactic: "Initial Access"
+    technique: "T1190"
+    technique_name: "Exploit Public-Facing Application"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 84
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security" OR sourcetype="XmlWinEventLog:System")
+    ( ((EventCode=1 OR EventCode=4688) AND (ParentImage="*\\wdsserver.exe" OR ParentImage="*\\svchost.exe" AND match(coalesce(CommandLine,Process_Command_Line,""),"(?i)wds")))
+      OR (EventCode IN (7031,7034) AND match(coalesce(Message,param1,""),"(?i)WDSServer")) )
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name))
+    | eval cmd=coalesce(CommandLine, Process_Command_Line)
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(child) as child_proc values(cmd) as command_lines values(EventCode) as events by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer child_proc command_lines events first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: WDS RCE indicator on $Computer$ (CVE-2026-42987)"
+      severity: high
+      recommended_actions:
+        - Confirm June 2026 patch on WDS hosts; restrict PXE/TFTP to trusted VLANs
+        - Investigate the WDSServer child/crash and any unexpected boot-image requests
+    risk:
+      score: 84
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "WDS maintenance / image servicing — validate against deployment activity"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 11: Graphics Component (win32k/GDI) RCE/EoP (CVE-2026-44803/44812/42986)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Confidence : MEDIUM   Severity : HIGH   FP Rate : Low-Medium
+
+rule_11_graphics_rce_eop:
+  name: "PT2026-06 — Graphics Component RCE/EoP Indicator (CVE-2026-44803/44812/42986)"
+  description: >
+    Detects indicators of the June 2026 Windows Graphics (win32k/GDI) RCE
+    (CVE-2026-44803/44812) and EoP (CVE-2026-42986): a crash in a process handling
+    an image/font, or a GUI/graphics process spawning an unexpected child after
+    rendering attacker-controlled content. Often delivered via crafted image/font.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1068"
+    technique_name: "Exploitation for Privilege Escalation"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 82
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Application")
+    ( (EventCode=1000 AND match(coalesce(Message,""),"(?i)(gdi32|gdiplus|win32k|dwrite|windowscodecs|user32)\.dll"))
+      OR ((EventCode=1) AND ParentImage IN ("*\\explorer.exe","*\\dwm.exe","*\\searchapp.exe") AND match(lower(coalesce(Image,"")),"^.*\\\\(cmd|powershell|rundll32|mshta|regsvr32)\.exe$")) )
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name))
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(child) as child_proc values(Message) as crash_module values(CommandLine) as command_lines by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer child_proc crash_module command_lines first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: Graphics component RCE/EoP indicator on $Computer$"
+      severity: high
+      recommended_actions:
+        - Confirm June 2026 graphics patch; capture the faulting image/font and process dump
+    risk:
+      score: 82
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Routine GDI crashes happen — pair with delivery of an untrusted image/font or an EoP token change"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 12: Windows Media RCE (CVE-2026-48574)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Confidence : MEDIUM   Severity : HIGH   FP Rate : Low
+
+rule_12_windows_media_rce:
+  name: "PT2026-06 — Windows Media RCE Indicator (CVE-2026-48574)"
+  description: >
+    Detects indicators of the Windows Media RCE (CVE-2026-48574): a media player /
+    media-handling process (wmplayer.exe, Microsoft.Media.*, mfpmp.exe) spawning a
+    child process or crashing on a crafted media file.
+  mitre:
+    tactic: "Execution"
+    technique: "T1203"
+    technique_name: "Exploitation for Client Execution"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 82
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Application")
+    ( ((EventCode=1 OR EventCode=4688) AND ParentImage IN ("*\\wmplayer.exe","*\\mfpmp.exe","*\\setup_wm.exe","*\\unregmp2.exe"))
+      OR (EventCode=1000 AND match(coalesce(Message,""),"(?i)(wmplayer|mf|mfplat|mfreadwrite|mfcore)")) )
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name))
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(child) as child_proc values(Message) as crash values(CommandLine) as command_lines by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer child_proc crash command_lines first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: Windows Media RCE indicator on $Computer$ (CVE-2026-48574)"
+      severity: high
+      recommended_actions:
+        - Confirm June 2026 patch; capture the media file; hunt the delivery vector
+    risk:
+      score: 82
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Media codec crashes are common — require a child process or pair with untrusted-file delivery"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 13: Local EoP via System-Process Abuse (CTFMON/DWM/Winlogon/Crypto Svc)
+#           CVE-2026-45586 (0-day), 42905, 42989, 44810
+# ██████████████████████████████████████████████████████████████████████████████
+#  Confidence : MEDIUM   Severity : HIGH   FP Rate : Low-Medium
+
+rule_13_local_eop_system_procs:
+  name: "PT2026-06 — Local EoP via System-Process Abuse (CVE-2026-45586/42905/42989/44810)"
+  description: >
+    Detects abuse of the system processes targeted by June 2026 EoP bugs — CTFMON
+    (ctfmon.exe, CVE-2026-45586 zero-day), DWM Core (dwm.exe, 42905), Winlogon
+    (winlogon.exe, 42989), and Cryptographic Services (cryptsvc in svchost, 44810):
+    these processes spawning an unexpected child (cmd/powershell/LOLBin) or a child
+    running with SYSTEM after the parent — a privilege-escalation signature.
+  mitre:
+    tactic: "Privilege Escalation"
+    technique: "T1068"
+    technique_name: "Exploitation for Privilege Escalation"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 84
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security")
+    (EventCode=1 OR EventCode=4688)
+    (ParentImage IN ("*\\ctfmon.exe","*\\dwm.exe","*\\winlogon.exe")
+     OR (ParentImage="*\\svchost.exe" AND match(coalesce(CommandLine,Process_Command_Line,""),"(?i)cryptsvc")))
+    | eval parent=lower(coalesce(mvindex(split(ParentImage,"\\"),-1), parent_process_name))
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name))
+    | eval cmd=coalesce(CommandLine, Process_Command_Line)
+    | where match(child,"^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|net|whoami)\.exe$")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(parent) as parent_proc values(child) as child_proc values(cmd) as command_lines values(User) as users by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer parent_proc child_proc command_lines users first_seen last_seen count
+  schedule:
+    cron: "*/5 * * * *"
+    window: "-6m@m"
+  throttle:
+    field: "Computer,parent_proc"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: Local EoP via $parent_proc$ on $Computer$"
+      severity: high
+      recommended_actions:
+        - Confirm June 2026 patch; capture the process tree; ctfmon/dwm/winlogon rarely spawn shells
+    risk:
+      score: 84
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Rare legitimate spawns from these processes — baseline per host and require a shell/LOLBin child"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 14: NTLM Spoofing / Coercion (CVE-2026-50508)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Confidence : MEDIUM   Severity : HIGH   FP Rate : Medium (correlate with ntlm_relay_detection.yml)
+
+rule_14_ntlm_spoofing_coercion:
+  name: "PT2026-06 — NTLM Spoofing / Coercion Indicator (CVE-2026-50508)"
+  description: >
+    Detects indicators of the NTLM spoofing vulnerability (CVE-2026-50508):
+    anomalous NTLM authentication consistent with relay/coercion — NTLM Type-3
+    logons (4624 LogonType 3, NtlmSsp) with a null/empty workstation or anonymous
+    source, and bursts of NTLM auth (4776) to multiple targets. Correlate with the
+    existing credential_access/ntlm_relay_detection.yml.
+  mitre:
+    tactic: "Credential Access"
+    technique: "T1557.001"
+    technique_name: "LLMNR/NBT-NS Poisoning and SMB Relay"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 80
+  search: >
+    (index=main OR index=windows)
+    sourcetype="XmlWinEventLog:Security" (EventCode=4624 OR EventCode=4776)
+    | eval is_ntlm=if(match(coalesce(AuthenticationPackageName,""),"(?i)NTLM") OR match(coalesce(LmPackageName,""),"(?i)NTLM"),1,0)
+    | where (EventCode=4624 AND LogonType=3 AND is_ntlm=1 AND (WorkstationName="" OR WorkstationName="-" OR isnull(WorkstationName)))
+            OR (EventCode=4776 AND Status!="0x0")
+    | stats count dc(Computer) as targets values(IpAddress) as src_ips values(TargetUserName) as users
+      min(_time) as first_seen max(_time) as last_seen by IpAddress
+    | where count >= 20 OR targets >= 5
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table IpAddress targets users count first_seen last_seen
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-15m@m"
+  throttle:
+    field: "IpAddress"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: NTLM spoofing/coercion indicator from $IpAddress$ (CVE-2026-50508)"
+      severity: high
+      recommended_actions:
+        - Confirm June 2026 patch; enforce SMB signing + EPA; restrict NTLM where possible
+        - Correlate with ntlm_relay_detection.yml; identify the coercion source
+    risk:
+      score: 80
+      object_type: "user"
+      object_field: "IpAddress"
+  false_positives:
+    - "Legacy NTLM consumers create baseline noise — tune thresholds and allowlist known NTLM sources"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 15: SharePoint Server Spoofing (CVE-2026-47634 / CVE-2026-45481)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Confidence : MEDIUM   Severity : MEDIUM   FP Rate : Medium
+
+rule_15_sharepoint_spoofing:
+  name: "PT2026-06 — SharePoint Server Spoofing Indicator (CVE-2026-47634/45481)"
+  description: >
+    Detects indicators of the SharePoint Server spoofing bugs (CVE-2026-47634/
+    45481): the SharePoint IIS worker (w3wp.exe under the SharePoint app pool)
+    spawning a process, and anomalous requests to SharePoint endpoints (open-
+    redirect / spoofed-URL patterns, ToolPane/_layouts abuse). Pair with web logs.
+  mitre:
+    tactic: "Initial Access"
+    technique: "T1190"
+    technique_name: "Exploit Public-Facing Application"
+  severity: MEDIUM
+  confidence: MEDIUM
+  risk_score: 72
+  search: >
+    (index=main OR index=web OR index=windows OR index=proxy)
+    ( ((EventCode=1 OR EventCode=4688) AND ParentImage="*\\w3wp.exe" AND match(coalesce(CommandLine,Process_Command_Line,""),"(?i)sharepoint|SPTimer|owstimer"))
+      OR (sourcetype IN ("iis","ms:iis:auto","apache:access") AND match(coalesce(cs_uri_stem,uri_path,""),"(?i)/_layouts/|/_vti_bin/|ToolPane|/_api/")
+          AND match(coalesce(cs_uri_query,uri_query,""),"(?i)(redirect|returnurl|source=https?%3a%2f%2f)")) )
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name))
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(child) as child_proc values(c_ip) as src_ips values(cs_uri_stem) as uris by host
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table host child_proc src_ips uris first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "host"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: SharePoint spoofing indicator on $host$ (CVE-2026-47634/45481)"
+      severity: medium
+      recommended_actions:
+        - Confirm June 2026 SharePoint patch; review the flagged requests for spoofed/redirect URLs
+    risk:
+      score: 72
+      object_type: "system"
+      object_field: "host"
+  false_positives:
+    - "Legitimate _layouts/_api traffic is heavy on SharePoint — the redirect/returnurl + external URL combo is the signal"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 16: Nuance PowerScribe RCE (CVE-2026-26142)
+# ██████████████████████████████████████████████████████████████████████████████
+#  Confidence : MEDIUM   Severity : HIGH   FP Rate : Low (niche; healthcare)
+
+rule_16_nuance_powerscribe_rce:
+  name: "PT2026-06 — Nuance PowerScribe RCE Indicator (CVE-2026-26142)"
+  description: >
+    Detects indicators of RCE in Nuance PowerScribe (CVE-2026-26142, used in
+    healthcare radiology dictation): a PowerScribe / Nuance service process
+    spawning a shell or LOLBin, consistent with exploitation of the application
+    server. Highly relevant for healthcare environments.
+  mitre:
+    tactic: "Initial Access"
+    technique: "T1190"
+    technique_name: "Exploit Public-Facing Application"
+  severity: HIGH
+  confidence: MEDIUM
+  risk_score: 84
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security")
+    (EventCode=1 OR EventCode=4688)
+    (ParentImage="*\\PowerScribe*" OR ParentImage="*\\Nuance*" OR ParentImage="*\\w3wp.exe" AND match(coalesce(CommandLine,Process_Command_Line,""),"(?i)powerscribe|nuance"))
+    | eval child=lower(coalesce(mvindex(split(Image,"\\"),-1), New_Process_Name))
+    | eval cmd=coalesce(CommandLine, Process_Command_Line)
+    | where match(child,"^(cmd|powershell|pwsh|mshta|rundll32|regsvr32|wscript|cscript|certutil)\.exe$")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(ParentImage) as ps_proc values(child) as child_proc values(cmd) as command_lines by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer ps_proc child_proc command_lines first_seen last_seen count
+  schedule:
+    cron: "*/10 * * * *"
+    window: "-12m@m"
+  throttle:
+    field: "Computer"
+    period: "30m"
+  actions:
+    notable:
+      rule_title: "PT2026-06: Nuance PowerScribe RCE indicator on $Computer$ (CVE-2026-26142)"
+      severity: high
+      recommended_actions:
+        - Confirm the Nuance/PowerScribe vendor patch; isolate the application server; begin IR
+    risk:
+      score: 84
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Vendor maintenance scripts — allowlist by host + command pattern (rare for this app to shell out)"
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+#  RULE 17: Posture / Limited-Telemetry CVEs (BitLocker, DHA, Azure NA, AKS)
+#           CVE-2026-50507 (0-day), 45658, 33828, 45476, 32193
+# ██████████████████████████████████████████████████████████████████████████████
+#  These are not behaviorally detectable from standard Windows/network logs.
+#  This rule catches the few host-side tamper signals; the rest is patch/posture +
+#  cloud-audit hunting (see recommended_actions).
+#  Confidence : LOW   Severity : MEDIUM   FP Rate : Low
+
+rule_17_posture_limited_telemetry:
+  name: "PT2026-06 — Posture/Tamper Signals: BitLocker/DHA/Azure (CVE-2026-50507/45658/33828/45476/32193)"
+  description: >
+    Coverage for June 2026 CVEs that are NOT behaviorally detectable in a standard
+    SIEM — BitLocker Security Feature Bypass (CVE-2026-50507 zero-day, 45658),
+    Device Health Attestation EoP (33828), Azure Network Adapter EoP (45476), and
+    Azure Kubernetes Service RCE (32193). It alerts on the host-side tamper signals
+    that ARE observable: BitLocker/boot-config tampering via manage-bde / bcdedit /
+    reagentc / repurposing WinRE. For the Azure/AKS items, see recommended_actions
+    (these require Azure Activity / AKS control-plane audit logs, not Windows logs).
+  mitre:
+    tactic: "Defense Evasion"
+    technique: "T1562.001"
+    technique_name: "Impair Defenses"
+  severity: MEDIUM
+  confidence: LOW
+  risk_score: 70
+  search: >
+    (index=main OR index=endpoint OR index=windows)
+    (sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR sourcetype="XmlWinEventLog:Security")
+    (EventCode=1 OR EventCode=4688)
+    | eval cmd=lower(coalesce(CommandLine, Process_Command_Line))
+    | where match(cmd,"(manage-bde.*(-off|-disable|protectors -disable))|(bcdedit.*(bootstatuspolicy|recoveryenabled|safeboot))|(reagentc.*(/disable|/setreimage))|(bdehdcfg)")
+    | eval signal=case(match(cmd,"manage-bde"),"bitlocker_tamper", match(cmd,"reagentc|bcdedit.*recovery"),"winre_boot_tamper", true(),"boot_config_change")
+    | stats count min(_time) as first_seen max(_time) as last_seen
+      values(signal) as signals values(cmd) as command_lines values(User) as users by Computer
+    | eval first_seen=strftime(first_seen,"%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen,"%Y-%m-%d %H:%M:%S")
+    | table Computer signals command_lines users first_seen last_seen count
+  schedule:
+    cron: "*/15 * * * *"
+    window: "-18m@m"
+  throttle:
+    field: "Computer"
+    period: "1h"
+  actions:
+    notable:
+      rule_title: "PT2026-06: BitLocker/boot tamper or posture signal on $Computer$"
+      severity: medium
+      recommended_actions:
+        - "BitLocker (CVE-2026-50507/45658): apply June 2026 patch; audit manage-bde/bcdedit/WinRE changes; enforce TPM+PIN"
+        - "Device Health Attestation (CVE-2026-33828): patch; this is not SIEM-observable behaviorally"
+        - "Azure Network Adapter (CVE-2026-45476): patch; hunt Azure Activity logs for the adapter resource"
+        - "AKS (CVE-2026-32193): patch node images; hunt AKS control-plane / k8s audit logs for anomalous exec/pod-create"
+    risk:
+      score: 70
+      object_type: "system"
+      object_field: "Computer"
+  false_positives:
+    - "Legitimate admin BitLocker/boot maintenance — allowlist change windows; this rule is a posture aid, not high-fidelity"
+
+
+# ==============================================================================
+#  INVESTIGATION QUERIES (triage)
+# ==============================================================================
+#  IQ1 — Crash/bugcheck sweep across the fleet (failed-exploit signal):
+#    index=wineventlog (EventCode=1001 OR EventCode=1000) earliest=-24h
+#    | stats count values(Message) by host | sort - count
+#  IQ2 — Client-app spawning processes (Office/Outlook/mstsc/media), last 24h:
+#    index=main (EventCode=1 OR EventCode=4688)
+#    (ParentImage IN ("*\\winword.exe","*\\excel.exe","*\\outlook.exe","*\\mstsc.exe","*\\wmplayer.exe"))
+#    | table _time Computer ParentImage Image CommandLine User
+#  IQ3 — Patch verification (run on hosts): Get-HotFix | ? InstalledOn -ge '2026-06-01'
+#
+# ==============================================================================
+#  RESPONSE PLAYBOOK
+# ==============================================================================
+#  1. PATCH FIRST — the June 2026 cumulative update is the primary control; these
+#     rules detect exploitation/blast-radius, not the missing patch.
+#  2. On a hit: isolate the host, capture the process tree / crash dump, identify
+#     the delivery vector (email, file, RDP server, DHCP/PXE source, web request).
+#  3. Import Cisco Talos' June-2026 Snort SIDs for packet-level network coverage.
+#  4. For server RCEs (HTTP.sys, AD DS, KDC, WDS, SharePoint, PowerScribe): treat the
+#     host as compromised, rotate exposed credentials, begin IR.
+#  5. For client RCEs (Office/Outlook/RDP/Media/Graphics): enable ASR rules, block
+#     external SMB/WebDAV and untrusted RDP egress, and user-awareness.
+#  6. For BitLocker/DHA/Azure/AKS: patch + posture; hunt cloud/boot telemetry.
+#
+# ==============================================================================
+#  END OF JUNE 2026 PATCH TUESDAY DETECTION RULES
+# ==============================================================================

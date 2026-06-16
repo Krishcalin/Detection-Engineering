@@ -25,11 +25,11 @@ Every rule includes SPL search queries, MITRE ATT&CK mapping, severity/confidenc
 | **Network Firewalls** | `splunk_rules/network_firewalls/` | 4 | 30 | Palo Alto (PAN-OS CVEs, GlobalProtect), Cisco ASA/FTD (ArcaneDoor), Fortinet (FortiJump, SSL-VPN), Check Point (SmartConsole, blades) |
 | **EDR Detection** | `splunk_rules/edr_detection/` | 3 | 24 | CrowdStrike Falcon (sensor tamper, C2, ransomware), Microsoft Defender (AMSI, ASR, macros), Trend Micro (agent tamper, IPS, integrity monitoring) |
 | **Network Security** | `splunk_rules/network_security/` | 1 | 6 | TOR traffic, rogue DNS, large uploads/exfiltration, unencrypted sensitive traffic, network share removal, recurring malware |
-| **Recent Attacks** | `splunk_rules/recent_attacks/` | 2 | 21 | CVE-2026-21509 / APT28 Operation NeuSploit; UAT-8837 China-nexus critical-infrastructure intrusion (Sitecore CVE-2025-53690, Earthworm, Rubeus/Certipy) |
+| **Recent Attacks** | `splunk_rules/recent_attacks/` | 3 | 38 | CVE-2026-21509 / APT28 Operation NeuSploit; UAT-8837 China-nexus critical-infrastructure intrusion (Sitecore CVE-2025-53690, Earthworm, Rubeus/Certipy); June 2026 Patch Tuesday (~45 CVEs: HTTP.sys, Office, Outlook/Word, Hyper-V, AD DS, Kernel, Kerberos KDC, RDP client, DHCP, WDS, Graphics, NTLM, SharePoint) |
 | **SAP** | `splunk_rules/sap/` | 1 | 7 | CVE-2025-31324 SAP NetWeaver Visual Composer Metadata Uploader RCE (Chaya_004, UNC5221) |
 | **Supply Chain** | `splunk_rules/supply_chain/` | 1 | 9 | Shai-Hulud / TeamPCP npm & GitHub supply-chain worm + copycats (Second Coming, Miasma, Wave Four, typosquats); GitHub audit-log, endpoint, and C2 detection |
 
-**Total: 56 files, 199+ rules, ~46,000 lines of YAML**
+**Total: 57 files, 216+ rules, ~47,000 lines of YAML**
 
 ### ICS/OT Protocol Coverage
 
@@ -277,8 +277,9 @@ Detection-Engineering/
 │   │   ├── cisco_asa_ftd_detection.yml
 │   │   ├── fortinet_fortigate_detection.yml
 │   │   └── checkpoint_detection.yml
-│   ├── recent_attacks/            # Threat campaign detection (21 rules)
+│   ├── recent_attacks/            # Threat campaign detection (38 rules)
 │   │   ├── cve_2026_21509_apt28_operation_neusploit_detection.yml
+│   │   ├── patch_tuesday_2026_06_detection.yml
 │   │   └── uat_8837_critical_infrastructure_detection.yml
 │   ├── sap/                       # SAP NetWeaver detection (7 rules)
 │   │   └── cve_2025_31324_sap_netweaver_visual_composer_detection.yml

@@ -9,7 +9,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Splunk-SPL-dc2626?style=flat-square&logo=splunk&logoColor=white" alt="Splunk SPL"/>
   <img src="https://img.shields.io/badge/MITRE-ATT%26CK-f59e0b?style=flat-square" alt="MITRE ATT&CK"/>
-  <img src="https://img.shields.io/badge/rules-205%2B-22c55e?style=flat-square" alt="205+ Rules"/>
+  <img src="https://img.shields.io/badge/rules-222%2B-22c55e?style=flat-square" alt="222+ Rules"/>
   <img src="https://img.shields.io/badge/platforms-Windows%20AD%20%7C%20RHEL%20%7C%20Apache%20%7C%20SAP-3b82f6?style=flat-square" alt="Windows AD | RHEL | Apache | SAP"/>
   <img src="https://img.shields.io/badge/license-GPL--3.0-orange?style=flat-square" alt="GPL-3.0 License"/>
 </p>
@@ -20,7 +20,7 @@
 
 Security Operation Center (SOC) attack detection and response rules for Splunk SIEM. Each rule includes comprehensive SPL queries, MITRE ATT&CK mapping, false positive tuning guidance, investigation queries, and incident response playbooks.
 
-- **205+ detection rules** across Windows AD, RHEL Linux, Apache Web Server, SAP NetWeaver, npm/GitHub supply-chain, and recent threat campaigns (incl. UAT-8837)
+- **222+ detection rules** across Windows AD, RHEL Linux, Apache Web Server, SAP NetWeaver, npm/GitHub supply-chain, and recent threat campaigns (incl. UAT-8837 and the June 2026 Patch Tuesday set)
 - **MITRE ATT&CK mapped** -- every rule tagged with technique IDs and tactics
 - **Investigation queries** -- ready-to-run SPL for SOC analyst triage
 - **Incident response playbooks** -- step-by-step response procedures per attack type
@@ -56,6 +56,7 @@ Detection-Engineering/
     │   └── apache_exploitation_detection.yml
     ├── recent_attacks/
     │   ├── cve_2026_21509_apt28_operation_neusploit_detection.yml
+    │   ├── patch_tuesday_2026_06_detection.yml
     │   └── uat_8837_critical_infrastructure_detection.yml
     ├── sap/
     │   └── cve_2025_31324_sap_netweaver_visual_composer_detection.yml
@@ -871,6 +872,39 @@ Detection rules for active threat campaigns and recently disclosed CVEs.
 | Rule File | Threat Actor / CVE | MITRE ID | Severity | Detection Vectors |
 |-----------|-------------------|----------|----------|-------------------|
 | `cve_2026_21509_apt28_operation_neusploit_detection.yml` | UAC-0001 (APT28) / CVE-2026-21509 | T1203, T1559.001, T1547.012, T1071.001 | CRITICAL | 12 rules + 7 investigation queries + IR playbook |
+| `patch_tuesday_2026_06_detection.yml` | June 2026 Patch Tuesday (~45 highlighted CVEs) | T1190, T1203, T1187, T1611, T1068, T1219, T1557.001 | CRITICAL–MEDIUM | 17 grouped rules + investigation queries + IR playbook |
+
+### June 2026 Patch Tuesday -- Highlighted CVE Coverage
+
+**File**: `splunk_rules/recent_attacks/patch_tuesday_2026_06_detection.yml`
+
+Behavioral detection for the CVEs highlighted in the June 2026 Microsoft Patch Tuesday
+(Qualys / ZDI / Talos). Most were freshly patched with **no public PoC**, so the 17
+rules are exploit-attempt / crash / post-exploitation **behavioral** signals grouped by
+attack surface (not precise payload signatures); a header table maps every CVE to its
+rule. **Patch first** — these detect exploitation and blast radius, not the patch gap.
+
+| Rule | Surface | CVEs | Key signal |
+|------|---------|------|------------|
+| R1 | HTTP.sys | 47291 (RCE), 49160 (DoS) | oversized request + http.sys/host crash |
+| R2 | Office | 45461/45463/45472/45474/45460 | Office app spawns process / egress |
+| R3 | Outlook/Word | 45456/47635/45458 | app spawn + external SMB/WebDAV (NTLM leak) |
+| R4 | Hyper-V | 45607/47652/45641 | vmwp/vmcompute/vmms child or crash |
+| R5 | AD DS | 45648 | DC lsass crash / DC spawns shell |
+| R6 | Kernel | 45657/42980 + CVE-2025-10263 | bugcheck + suspicious driver load |
+| R7 | Kerberos KDC | 47288 | DC lsass crash + Kerberos error burst |
+| R8 | RDP client | 47289/47654/42992/44799/44801/42985/48563 | mstsc child/crash + external 3389 |
+| R9 | DHCP client | 44815 (9.8) | svchost(dhcp) crash + rogue DHCP |
+| R10 | WDS | 42987 | WDSServer child/crash |
+| R11 | Graphics (win32k) | 44803/44812/42986 | image/font crash + GUI-proc child |
+| R12 | Windows Media | 48574 | media app child/crash |
+| R13 | Local EoP | 45586 (CTFMON 0-day)/42905/42989/44810 | system proc spawns shell |
+| R14 | NTLM | 50508 | NTLM relay/coercion auth anomaly |
+| R15 | SharePoint | 47634/45481 | spoofed-redirect requests / SP worker child |
+| R16 | Nuance PowerScribe | 26142 | PowerScribe/Nuance spawns shell |
+| R17 | Posture (limited telemetry) | 50507/45658 (BitLocker), 33828 (DHA), 45476 (Azure NA), 32193 (AKS) | BitLocker/boot tamper + patch/cloud-audit notes |
+
+---
 
 ### CVE-2026-21509 -- APT28 Operation Neusploit
 
